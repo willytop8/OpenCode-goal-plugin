@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-06-14
+
 - **Add `/goal edit <new objective>`.** Revise the active goal's objective in place while preserving its turn/token/time budget and lifecycle history. Any pause/blocked state is cleared and `noProgressTurns` resets so the revised goal can continue; a goal already at a hard limit re-pauses on the next idle (use `/goal resume` for a fresh budget window). Ported from prevalentWare/opencode-goal-plugin's `update_goal_objective` tool, adapted to the marker-based command model.
 - **Preserve the goal across session compaction.** A new `experimental.session.compacting` hook injects the goal objective, status, budget usage, elapsed time, and latest checkpoint into the compaction context so a compaction no longer drops the goal thread mid-run. Ported from prevalentWare/opencode-goal-plugin's `compactionContext` injection.
 - **Disable generic post-compaction auto-continue while a goal is active.** A new `experimental.compaction.autocontinue` hook sets `enabled = false` whenever an active (non-stopped) goal is present, so OpenCode's native post-compaction continuation does not race the plugin's own idle-triggered continuation. Paused/stopped goals leave the native behavior untouched. Ported from prevalentWare/opencode-goal-plugin.
