@@ -172,6 +172,27 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 
 **Wrap-up vs. hard stop.** When a limit is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step — rather than stopping silently. Use `/goal resume` to continue after any stop, including limit stops and no-progress pauses.
 
+### Polling / watch mode
+
+For monitoring or polling tasks where the assistant checks periodically but often finds nothing to do (e.g. "review commits as they come in", "watch for failing CI"), set `--watch` to add an **idle backoff** that grows the wait time after each consecutive no-change turn:
+
+```
+/goal review commits --watch
+/goal review commits --watch 10m
+```
+
+A turn is "no-change" when the assistant produces no tool calls and no new text. Each consecutive no-change turn adds another backoff increment (`idleBackoffMs`) to the `minDelayMs` cooldown. The first check waits `minDelayMs` (30s with `--watch`), the second waits `minDelayMs + backoffMs` (5m30s), the third `minDelayMs + 2×backoffMs` (10m30s), and so on. A turn that finds work and uses tools resets the chain.
+
+The `--watch` duration controls the backoff interval: `--watch 10m` = 10 minutes between idle checks, `--watch 1h` = 1 hour. The cooldown between continues is set to 1/10th of the watch interval (capped at 30s).
+
+For finer control, set the two flags separately:
+
+```
+/goal monitor ci --cooldown-ms 60000 --backoff-ms 600000
+```
+
+Both flags are also available as plugin-level defaults (`minDelayMs`, `idleBackoffMs`).
+
 Goal state is persisted by default to a **project-local** path, `.opencode/goals/state.json` relative to the working directory, so goals follow the project rather than your home directory. It is only a local workflow checkpoint and is not synchronized across machines or OpenCode instances. You may want to add `.opencode/goals/` to your `.gitignore`.
 
 The state-file location is resolved with this precedence:
@@ -202,6 +223,8 @@ Override any limit for a single goal:
 | `--max-tokens <n>` | Context token limit |
 | `--budget <n>` | Context token limit shorthand; accepts a `k`/`m` suffix (e.g. `100k`, `1.5m`) |
 | `--cooldown-ms <n>` | Minimum delay between continues |
+| `--backoff-ms <n>` | Additional delay per consecutive no-change turn (see Polling / watch mode below) |
+| `--watch [5m\|10m\|1h\|...]` | Polling mode: sets cooldown + backoff for monitoring tasks (default 5m between checks; accepts `s`/`m`/`h` suffix) |
 | `--no-progress-threshold <n>` | Output token floor before pausing |
 | `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
 | `--success <text>` | Success criteria that define when the goal is satisfied (quote multi-word text) |
@@ -216,6 +239,9 @@ Examples:
 /goal fix tests --max-turns=20 --max-tokens=400000
 /goal fix tests --no-progress-threshold 50 --no-progress-turns 2
 /goal fix tests --budget 100k
+/goal review commits --watch
+/goal review commits --watch 10m
+/goal monitor deployments --cooldown-ms 60000 --backoff-ms 600000
 ```
 
 ### Plugin-level defaults
@@ -232,6 +258,7 @@ Pass options when registering the plugin to change the defaults for all goals. T
         "maxDurationMs": 900000,
         "maxTokens": 200000,
         "minDelayMs": 1500,
+        "idleBackoffMs": 0,
         "maxRecentMessages": 50,
         "noProgressTokenThreshold": 50,
         "noProgressTurnsBeforePause": 2,

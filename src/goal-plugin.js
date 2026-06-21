@@ -27,6 +27,7 @@ const DEFAULT_OPTIONS = {
   maxDurationMs: 15 * 60 * 1000,
   maxTokens: 200000,
   minDelayMs: 1500,
+  idleBackoffMs: 0,
   maxRecentMessages: 50,
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
@@ -81,6 +82,10 @@ const GOAL_FLAG_SPECS = {
     optionKey: "minDelayMs",
     parse: (value, options) => toPositiveInteger(value, options.minDelayMs),
   },
+  "--backoff-ms": {
+    optionKey: "idleBackoffMs",
+    parse: (value, options) => toPositiveInteger(value, options.idleBackoffMs),
+  },
   "--no-progress-threshold": {
     optionKey: "noProgressTokenThreshold",
     parse: (value, options) =>
@@ -104,6 +109,7 @@ const GOAL_FLAG_SPECS = {
     parse: (value, options) =>
       toPositiveInteger(value, options.noToolCallTurnsBeforePause),
   },
+  "--watch": { type: "watch" },
 }
 
 // OpenCode message parts are a discriminated union tagged by `type`. A tool
@@ -517,6 +523,7 @@ function resetGoalBudget(goal) {
   goal.lastProgressAt = 0
   goal.noProgressTurns = 0
   goal.noToolCallTurns = 0
+  goal.noChangeTurns = 0
   goal.budgetWrapupSent = false
   goal.messageIDs = new Set()
   goal.promptFailures = 0
@@ -551,6 +558,19 @@ function parsePositiveIntegerStrict(value) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
+// Parse a duration string like "5m", "10m", "1h", "90s" into milliseconds.
+// Returns a positive safe integer or null when the value is invalid.
+function parseDurationMs(value) {
+  const raw = String(value).trim().toLowerCase()
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*(s|m|h)$/)
+  if (!match) return null
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const multipliers = { s: 1000, m: 60000, h: 3600000 }
+  const result = Math.round(amount * multipliers[match[2]])
+  return Number.isSafeInteger(result) && result > 0 ? result : null
+}
+
 // Parse a token budget that may use a `k` (×1000) or `m` (×1,000,000) suffix,
 // e.g. "100k" -> 100000, "1.5m" -> 1500000, "200000" -> 200000. Returns a
 // positive safe integer or null when the value is not a positive number.
@@ -580,6 +600,7 @@ function normalizeOptions(options = {}) {
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
+    idleBackoffMs: toPositiveInteger(options.idleBackoffMs, DEFAULT_OPTIONS.idleBackoffMs),
     maxRecentMessages: toPositiveInteger(
       options.maxRecentMessages,
       DEFAULT_OPTIONS.maxRecentMessages,
@@ -1084,6 +1105,11 @@ function parseGoalArguments(args, defaults) {
       if (inlineValue === undefined && value !== undefined) i += 1
 
       if (value === undefined) {
+        if (flagSpec.type === "watch") {
+          options.minDelayMs = 30000
+          options.idleBackoffMs = 300000
+          continue
+        }
         errors.push(`Missing value for ${flagName}`)
         continue
       }
@@ -1119,6 +1145,17 @@ function parseGoalArguments(args, defaults) {
           continue
         }
         meta[flagSpec.metaKey] = mode
+        continue
+      }
+
+      if (flagSpec.type === "watch") {
+        const durationMs = parseDurationMs(rawValue)
+        if (durationMs === null) {
+          errors.push(`Invalid watch duration for ${flagName}: ${value} (use e.g. 5m, 10m, 1h, 90s)`)
+          continue
+        }
+        options.minDelayMs = Math.min(30000, Math.round(durationMs / 10))
+        options.idleBackoffMs = durationMs
         continue
       }
 
@@ -1402,7 +1439,7 @@ function formatArgumentErrors(errors) {
     "Goal flags could not be parsed.",
     ...errors.map((error) => `- ${error}`),
     "",
-    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode.",
+    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --backoff-ms, --watch [5m|10m|1h|...], --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode.",
     "You can pass them as `--flag value` or `--flag=value`. Quote multi-word values, e.g. --success \"tests pass and docs updated\".",
   ].join("\n")
 }
@@ -1578,6 +1615,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     lastProgressAt: 0,
     noProgressTurns: 0,
     noToolCallTurns: 0,
+    noChangeTurns: 0,
     blockedReason: "",
     budgetWrapupSent: false,
     stopped: false,
@@ -2426,12 +2464,28 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           activeGoalAfterMessages.noToolCallTurns = 0
         }
 
+        const noChangeTurn =
+          activeGoalAfterMessages.turnCount > 0 &&
+          Boolean(latestAssistant) &&
+          !latestHasToolCall &&
+          !assistantChanged
+        const backoffEnabled = activeGoalAfterMessages.options.idleBackoffMs > 0
+        if (noChangeTurn && backoffEnabled) {
+          activeGoalAfterMessages.noChangeTurns += 1
+        } else if (!noChangeTurn) {
+          activeGoalAfterMessages.noChangeTurns = 0
+        }
+        const backoffDelayMs = backoffEnabled
+          ? activeGoalAfterMessages.options.idleBackoffMs * activeGoalAfterMessages.noChangeTurns
+          : 0
+        const effectiveDelayMs = activeGoalAfterMessages.options.minDelayMs + backoffDelayMs
+
         const elapsedSinceLastContinue = Date.now() - activeGoalAfterMessages.lastContinueAt
         if (
           activeGoalAfterMessages.lastContinueAt &&
-          elapsedSinceLastContinue < activeGoalAfterMessages.options.minDelayMs
+          elapsedSinceLastContinue < effectiveDelayMs
         ) {
-          await sleep(activeGoalAfterMessages.options.minDelayMs - elapsedSinceLastContinue)
+          await sleep(effectiveDelayMs - elapsedSinceLastContinue)
         }
 
         const activeGoalBeforePrompt = activeGoal(sessionID, goalID)
