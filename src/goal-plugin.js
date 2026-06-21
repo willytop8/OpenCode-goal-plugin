@@ -1108,6 +1108,8 @@ function parseGoalArguments(args, defaults) {
         if (flagSpec.type === "watch") {
           options.minDelayMs = 30000
           options.idleBackoffMs = 300000
+          options.noToolCallTurnsBeforePause = 999
+          options.noProgressTurnsBeforePause = 999
           continue
         }
         errors.push(`Missing value for ${flagName}`)
@@ -1156,6 +1158,8 @@ function parseGoalArguments(args, defaults) {
         }
         options.minDelayMs = Math.min(30000, Math.round(durationMs / 10))
         options.idleBackoffMs = durationMs
+        options.noToolCallTurnsBeforePause = 999
+        options.noProgressTurnsBeforePause = 999
         continue
       }
 
