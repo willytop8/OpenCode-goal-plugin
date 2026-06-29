@@ -520,6 +520,7 @@ function resetGoalBudget(goal) {
   goal.budgetWrapupSent = false
   goal.messageIDs = new Set()
   goal.promptFailures = 0
+  goal.formatFailures = 0
   goal.lastAssistantMessageID = ""
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
 }
@@ -1583,6 +1584,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     stopped: false,
     stopReason: "",
     promptFailures: 0,
+    formatFailures: 0,
     messageIDs: new Set(),
     history: [],
     checkpoints: [],
@@ -2694,13 +2696,34 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         activeGoalBeforePrompt.lastContinueAt = Date.now()
         if (!budgetWrapup) {
           if (completionUnverified) {
+            activeGoalBeforePrompt.formatFailures += 1
             activeGoalBeforePrompt.lastStatus = `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`
           } else if (blockerUnstated) {
+            activeGoalBeforePrompt.formatFailures += 1
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
           } else {
+            activeGoalBeforePrompt.formatFailures = 0
             activeGoalBeforePrompt.lastStatus = latestText
               ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.`
               : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`
+          }
+
+          // Pause after too many consecutive format-validation failures. Unlike
+          // promptFailures (which counts network/protocol errors), this counts turns
+          // where the model signalled completion or a blocker but omitted the required
+          // evidence or concrete-blocker line. The same maxPromptFailures cap applies;
+          // resume resets the counter via resetGoalBudget.
+          if (activeGoalBeforePrompt.formatFailures >= activeGoalBeforePrompt.options.maxPromptFailures) {
+            activeGoalBeforePrompt.stopped = true
+            activeGoalBeforePrompt.stopReason = "format validation failures"
+            activeGoalBeforePrompt.lastStatus = `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s) (missing [goal:evidence] or concrete blocker). Run /${commandName} resume to retry.`
+            pushHistory(
+              activeGoalBeforePrompt,
+              "paused",
+              `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s).`,
+            )
+            await persist()
+            return
           }
         }
 
