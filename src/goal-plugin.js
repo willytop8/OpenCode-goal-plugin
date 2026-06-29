@@ -2602,12 +2602,23 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           return
         }
 
+        // Hoist tool-call check so both the noProgress and noToolCall gates can
+        // use it. A tool call is evidence of real work even when prose output
+        // is tiny (e.g. a thinking model that calls a tool with < 50 output
+        // tokens), so it resets noProgressTurns the same way the noToolCall
+        // gate already resets noToolCallTurns.
+        const latestHasToolCall = messageHasToolCall(latestAssistant)
+
         const lowOutputTurn =
           activeGoalAfterMessages.turnCount > 0 &&
           latestOutputTokens !== null &&
           latestOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold
+        // A turn that used a tool is never stalled even with low output tokens:
+        // reasoning-heavy models often produce small prose output while doing
+        // real work via tool calls. Excluding tool-call turns prevents false
+        // noProgress pauses on thinking models.
         const lowOutputLooksStalled =
-          lowOutputTurn && (assistantRepeated || !latestText || !assistantChanged)
+          lowOutputTurn && !latestHasToolCall && (assistantRepeated || !latestText || !assistantChanged)
         if (lowOutputLooksStalled) {
           activeGoalAfterMessages.noProgressTurns += 1
           if (
@@ -2642,7 +2653,6 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // configured grace window. Complements the low-output check above:
         // a turn can be high-output yet still make no real progress because it
         // never touched a tool.
-        const latestHasToolCall = messageHasToolCall(latestAssistant)
         const noToolCallContinuation =
           activeGoalAfterMessages.turnCount > 0 && Boolean(latestAssistant) && !latestHasToolCall
         if (noToolCallContinuation) {

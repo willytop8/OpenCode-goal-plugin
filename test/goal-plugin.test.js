@@ -811,6 +811,54 @@ test("short assistant updates that change content do not immediately count as st
   assert.equal(currentGoal("session-changing").noProgressTurns, 0)
 })
 
+test("tool-calling turns with low output tokens are not counted as stalled", async () => {
+  // Regression: lowOutputLooksStalled fired when output < noProgressTokenThreshold AND
+  // latestText was empty, even if the turn used tool calls. Thinking models often call
+  // tools with very little prose output (< 50 tokens, no text body), so two consecutive
+  // such turns would incorrectly pause the goal. The fix: !latestHasToolCall is now
+  // a required condition for lowOutputLooksStalled.
+  let callCount = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => {
+      callCount += 1
+      return {
+        data: [
+          {
+            info: {
+              id: `msg-tool-${callCount}`,
+              role: "assistant",
+              sessionID: "session-tool-stall",
+              tokens: { input: 1, output: 5, reasoning: 50000 },
+            },
+            // No prose body — pure tool call with only reasoning tokens.
+            parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }],
+          },
+        ],
+      }
+    },
+    options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-tool-stall", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const fireIdle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-tool-stall", status: { type: "idle" } } },
+    })
+
+  await fireIdle()
+  await fireIdle()
+
+  // Despite two consecutive turns with < 50 output tokens and no prose, the goal
+  // must NOT be paused because each turn called a tool.
+  const goal = currentGoal("session-tool-stall")
+  assert.equal(goal.stopped, false, "tool-using turns must not trigger noProgress pause")
+  assert.equal(goal.noProgressTurns, 0, "noProgressTurns must stay 0 when tool calls are present")
+  assert.equal(calls.length, 2)
+})
+
 test("missing recent assistant message does not trigger a false no-progress stop", async () => {
   const calls = []
   const client = {
