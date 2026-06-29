@@ -1863,6 +1863,54 @@ test("buildLimitWarning reports remaining seconds when duration is nearly exhaus
   assert.match(warning, /s remaining/)
 })
 
+test("system transform output is byte-stable across turns even when limit thresholds are crossed", async () => {
+  // Regression test for issue #13: buildLimitWarning was injected into the
+  // system prompt via system.transform, making the system prompt volatile once
+  // any warning threshold was crossed. system.transform fires on every provider
+  // request including tool-call sub-requests; volatile content there invalidates
+  // the provider-side prefix cache from byte 0 on every sub-request, causing
+  // O(turns * tool_calls) full-context cache misses. The fix: only static
+  // content in the system prompt. Limit warnings live in buildContinueMessage.
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-cache-stable", arguments: "implement the feature" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal("session-cache-stable")
+
+  // Put the goal near its limits so buildLimitWarning would previously have fired
+  // (warnTurnsRemaining=3 → fires when turnCount >= maxTurns - 3 = 7)
+  // (warnTokensRemaining=25000 → fires when totalTokens >= maxTokens - 25000 = 175000)
+  goal.turnCount = 8
+  goal.totalTokens = 180_000
+
+  const output1 = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-cache-stable" }, output1)
+  const snapshot1 = output1.system[0]
+
+  // Advance counters further (different turn, different remaining tokens)
+  goal.turnCount = 9
+  goal.totalTokens = 195_000
+
+  const output2 = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-cache-stable" }, output2)
+  const snapshot2 = output2.system[0]
+
+  assert.equal(
+    snapshot1,
+    snapshot2,
+    "system transform must produce byte-identical output across turns — any per-turn drift invalidates the provider prefix cache",
+  )
+
+  // Also confirm the goal objective is present (sanity)
+  assert.match(snapshot1, /<goal_objective>\nimplement the feature\n<\/goal_objective>/)
+
+  // And confirm no limit-warning text leaked into the system prompt
+  assert.doesNotMatch(snapshot1, /Limits are near/)
+  assert.doesNotMatch(snapshot2, /Limits are near/)
+})
+
 test("duration limit requests a final handoff and stops the goal", async () => {
   const { calls, hooks } = await createHooks({
     options: { minDelayMs: 1, maxDurationMs: 10_000, noProgressTokenThreshold: 1 },
