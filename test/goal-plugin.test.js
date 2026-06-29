@@ -1613,6 +1613,94 @@ test("[goal:blocked] without a concrete blocker is rejected and continues", asyn
   assert.match(calls[0].body.parts[0].text, /no concrete blocker/)
 })
 
+test("repeated [goal:complete]-without-evidence re-prompts pause the goal after maxPromptFailures", async () => {
+  // Regression: completionUnverified re-prompts never counted toward promptFailures,
+  // so a model that consistently omits [goal:evidence] would loop until a hard limit.
+  // formatFailures counter now caps this at maxPromptFailures consecutive format failures.
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [message("All done!\n\n[goal:complete]")] }),
+    options: { minDelayMs: 1, maxPromptFailures: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-fmt-complete", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const fireIdle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-fmt-complete", status: { type: "idle" } } },
+    })
+
+  await fireIdle() // formatFailures → 1; re-prompt sent
+  const goal = currentGoal("session-fmt-complete")
+  assert.equal(goal.stopped, false, "should still be running after first format failure")
+  assert.equal(goal.formatFailures, 1)
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].body.parts[0].text, /<evidence_required>/)
+
+  await fireIdle() // formatFailures → 2 >= maxPromptFailures; goal paused, no extra call
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "format validation failures")
+  assert.match(goal.lastStatus, /format-validation failure/)
+  assert.equal(calls.length, 1, "no additional promptAsync call after pause")
+})
+
+test("repeated [goal:blocked]-without-blocker re-prompts pause the goal after maxPromptFailures", async () => {
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [message("[goal:blocked]")] }),
+    options: { minDelayMs: 1, maxPromptFailures: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-fmt-blocked", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const fireIdle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-fmt-blocked", status: { type: "idle" } } },
+    })
+
+  await fireIdle() // formatFailures → 1
+  assert.equal(currentGoal("session-fmt-blocked").stopped, false)
+  assert.equal(calls.length, 1)
+
+  await fireIdle() // formatFailures → 2 >= maxPromptFailures; pause
+  const goal = currentGoal("session-fmt-blocked")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "format validation failures")
+  assert.equal(calls.length, 1)
+})
+
+test("formatFailures resets to zero when the model produces a valid response", async () => {
+  let turnCount = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => {
+      turnCount += 1
+      // Turn 1: invalid (no evidence); Turn 2: valid response
+      return {
+        data: [turnCount < 2 ? message("All done!\n\n[goal:complete]") : message("Still working on it.")],
+      }
+    },
+    options: { minDelayMs: 1, maxPromptFailures: 3 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-fmt-reset", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const fireIdle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-fmt-reset", status: { type: "idle" } } },
+    })
+
+  await fireIdle() // turn 1: completionUnverified → formatFailures = 1
+  assert.equal(currentGoal("session-fmt-reset").formatFailures, 1)
+
+  await fireIdle() // turn 2: valid response → formatFailures resets to 0
+  assert.equal(currentGoal("session-fmt-reset").formatFailures, 0)
+  assert.equal(currentGoal("session-fmt-reset").stopped, false)
+})
+
 test("/goal clear removes completed goal status", async () => {
   const { hooks } = await createHooks({
     messages: async () => ({ data: [message("All done!\n[goal:evidence] ran npm test, 83 pass\n[goal:complete]")] }),
