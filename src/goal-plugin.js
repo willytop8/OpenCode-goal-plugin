@@ -2776,13 +2776,21 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
       if (systemBlocks.some(systemBlockContainsGoal)) return
 
+      // Only static content here — volatile fields (limit warnings, turn counters,
+      // token counts, wall-clock values) must not appear in the system prompt.
+      // system.transform fires on every provider request including tool-call
+      // sub-requests; any per-turn drift in the system prompt invalidates the
+      // provider-side prefix cache from byte 0, turning O(1) cache hits into
+      // O(N*turns) full-context misses. Limit warnings are already delivered
+      // on every continuation turn via buildContinueMessage (buildLimitWarning
+      // and <progress_budget>), which is sufficient — the model doesn't need
+      // them in the system prompt mid-turn.
       const goalBlock = [
         buildGoalBlock(goal),
         "Keep working until the goal is fully satisfied.",
         "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
         "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
-        buildLimitWarning(goal),
-      ].filter(Boolean).join("\n")
+      ].join("\n")
 
       if (systemBlocks.length === 0) {
         output.system = [goalBlock]
