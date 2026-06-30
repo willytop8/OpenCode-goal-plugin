@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.2 — 2026-06-29
+
+### Bug fixes
+
+- **Guard against stale `message.updated` re-deliveries re-inflating `totalTokens` after `/goal resume`.** After `/goal resume`, OpenCode replays the streaming `message.updated` event for the last assistant message. Previously `resetGoalBudget` deleted those message IDs from `seenTokens`, so the replayed event looked new and added its tokens to the freshly-zeroed counter — incorrectly inflating the resumed goal's token total from the first turn. Fix: `resetGoalBudget` no longer deletes IDs from `seenTokens`. The `message.updated` handler now skips any message whose ID is already in `seenTokens` but is absent from the current `goal.messageIDs` (i.e. belongs to a prior budget epoch), so stale re-deliveries are silently ignored.
+- **Guard against stale `message.updated` re-deliveries inflating a replacement goal's `totalTokens`.** When a goal is replaced via `/goal <new>`, the old goal's `cleanupGoal` path previously deleted its message IDs from `seenTokens`. If OpenCode then re-delivered a streaming event for one of those old IDs (e.g. a buffered duplicate), the new goal object had no record of it, so the guard could not fire and the event inflated the new goal's counter. Fix: `cleanupGoal` also leaves `seenTokens` entries in place. Entries accumulate across the process lifetime (O(turns × messages_per_turn)) and are cleared in bulk by `clearRuntimeState` on teardown.
+- **Reset `totalTokens` to zero after session compaction.** `totalTokens` is tracked with `Math.max` semantics (peak context size), so it never decreases on its own. A goal that crossed the 80 % budget-wrapup threshold before compaction would permanently remain above it even after the context shrank to a fraction of its prior size. Fix: the `experimental.session.compacting` hook now resets `totalTokens = 0` and rotates `messageIDs` into `priorMessageIDs` after injecting the compaction context, then calls `persist()`. Post-compaction turns re-establish the token baseline from scratch.
+
 ## 0.4.1 — 2026-06-29
 
 ### Bug fixes
