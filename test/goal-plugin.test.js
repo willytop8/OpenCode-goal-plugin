@@ -4414,3 +4414,81 @@ test("approved completion that is lost while auditor runs produces an announceme
   )
   assert.equal(currentGoal("lost-completion-s1"), null, "goal must be gone (was cleared)")
 })
+
+// ── PR G: Low-severity cleanups ───────────────────────────────────────────────
+
+test("agent updateGoal status='resumed' does not leak a stale registry entry on later clear", async () => {
+  // resetGoalBudget always rotates goalId; the registry must be re-keyed
+  // unconditionally (rank 42 fix — removed dead if-conditional in agent path).
+  const { handlers } = makeAgentHandlers()
+  const sid = "agent-resume-leak"
+
+  await handlers.setGoal(sid, { objective: "ship it" })
+  assert.equal(listSessionGoals(sid).length, 1)
+
+  await handlers.updateGoal(sid, { status: "paused" })
+  await handlers.updateGoal(sid, { status: "resumed" })
+  assert.equal(listSessionGoals(sid).length, 1, "registry must have exactly one entry after resume")
+
+  await handlers.clearGoal(sid)
+  // Before the fix a stale pre-resume goalId entry remained.
+  assert.equal(listSessionGoals(sid).length, 0, "registry must be empty after clear")
+  assert.equal(currentGoal(sid), null)
+})
+
+test("null-assistant idle does not accumulate noToolCallTurns", async () => {
+  // When messages() returns only a user message (latestAssistant === null),
+  // the noToolCallTurns counter must be reset, not incremented (rank 43 fix).
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [{ info: { id: "msg-user-only", role: "user", sessionID: "null-asst-notool" }, parts: [textPart("hi")] }],
+    }),
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "null-asst-notool", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal("null-asst-notool")
+  goal.turnCount = 2 // simulate we are past the first idle
+  goal.lastContinueAt = Date.now() - 10
+  goal.noToolCallTurns = 1 // pre-existing count
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "null-asst-notool", status: { type: "idle" } } },
+  })
+
+  // Must have been reset to 0 rather than incremented to 2.
+  assert.equal(currentGoal("null-asst-notool").noToolCallTurns, 0, "noToolCallTurns must reset on null-assistant idle")
+  assert.equal(currentGoal("null-asst-notool").stopped, false, "must not be stopped")
+})
+
+test("null-assistant idle does not accumulate noProgressTurns", async () => {
+  // When messages() returns only a user message (latestAssistant === null,
+  // latestOutputTokens === null), the noProgressTurns counter must be reset,
+  // not incremented (rank 44 fix).
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [{ info: { id: "msg-user-only2", role: "user", sessionID: "null-asst-noprog" }, parts: [textPart("hi")] }],
+    }),
+    options: { minDelayMs: 1, noProgressTokenThreshold: 10, noProgressTurnsBeforePause: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "null-asst-noprog", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal("null-asst-noprog")
+  goal.turnCount = 2
+  goal.lastContinueAt = Date.now() - 10
+  goal.noProgressTurns = 1
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "null-asst-noprog", status: { type: "idle" } } },
+  })
+
+  // Must have been reset to 0 rather than incremented to 2.
+  assert.equal(currentGoal("null-asst-noprog").noProgressTurns, 0, "noProgressTurns must reset on null-assistant idle")
+  assert.equal(currentGoal("null-asst-noprog").stopped, false, "must not be stopped")
+})

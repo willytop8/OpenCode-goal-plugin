@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.4.7 — 2026-06-29
+
+### Bug fixes (low-severity cleanups)
+
+- **Dead `if (goal.goalId !== previousGoalId)` conditional removed from both resume paths.** `resetGoalBudget` always rotates `goalId` via `randomUUID()`, so the conditional was always `true`. The misleading branch could never be taken, masking the intent (unconditional registry re-key on resume). Both the agent-tool `updateGoal {status: "resumed"}` path and the `/goal resume` command path are now unconditional.
+- **`noToolCallTurns` no longer stales on null-assistant idles.** When `messages()` returns no assistant message (only a user turn), `latestAssistant` is `null` and `latestHasToolCall` is `false`. Previously the counter incremented unconditionally; a user-only idle turn could push the goal toward a no-tool-call pause even though the model hadn't spoken. The reset condition now includes `|| !latestAssistant`, matching the intent of the stall detector.
+- **`noProgressTurns` no longer stales on null-assistant idles.** Same scenario as above: when `latestOutputTokens === null` and there is no assistant message, the counter now resets instead of incrementing, consistent with the gate's purpose of detecting stalled model output.
+- **Updated ledger-durability comment near `pushHistory("completed")`.** The previous comment implied the ledger was the primary recovery mechanism. The corrected comment clarifies that ledger write failures are silent (bare `catch`), and that a present state file always takes precedence over the ledger — making the ledger relevant only when the state file is absent.
+- **`buildAgentToolHandlers` accepts a `persistTerminalState` option.** Terminal state transitions (`status='complete'` and `clearGoal`) now call `persistTerminalState` if provided, falling back to the regular `persist` function. The `GoalPlugin` factory passes its own `persistTerminalState` closure through, so agent-triggered completions and clears get the same durable flush semantics as the event-handler paths.
+
 ## 0.4.6 — 2026-06-29
 
 ### Bug fixes (counters, compaction, and auditor)

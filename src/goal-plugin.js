@@ -1673,7 +1673,11 @@ const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed
 // result. Goal creation/replacement routes through the multi-goal registry
 // (buildGoalState + registerSessionGoal + focusGoal) exactly like the command
 // path, so tool-created goals persist and are driven by the idle handler.
-function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor = null }) {
+function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState = null, completionAuditor = null }) {
+  // Use persistTerminalState (which logs on failure) for terminal operations when
+  // available; fall back to plain persist for callers that don't wire it up (e.g.
+  // tests using buildAgentToolHandlers directly).
+  const persistFinal = persistTerminalState || persist
   async function getGoal(sessionID) {
     const goal = goalStates.get(sessionID)
     if (goal) return formatStatus(goal)
@@ -1829,7 +1833,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
         cleanupGoal(sessionID)
         // Advance an ordered (sisyphus) sequence just like the marker path does.
         if (sessionOrdered.has(sessionID)) promoteNextOrderedGoal(sessionID)
-        await persist()
+        await persistFinal("completion")
         return "Goal marked complete and archived."
       }
       if (status === "blocked") {
@@ -1853,13 +1857,11 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
           return "Goal is already running. Pause or stop it first if you want to reset the budget window."
         const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget rotates goalId; re-key the registry so the goal stays
-        // findable by its new id (the focused pointer holds the same object).
-        if (goal.goalId !== previousGoalId) {
-          removeSessionGoal(sessionID, previousGoalId)
-          registerSessionGoal(goal)
-          focusGoal(sessionID, goal)
-        }
+        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
+        // re-key the registry so the goal stays findable by its new id.
+        removeSessionGoal(sessionID, previousGoalId)
+        registerSessionGoal(goal)
+        focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
         goal.blockedReason = ""
@@ -1887,7 +1889,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
     sessionGoals.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
-    await persist()
+    await persistFinal("clear")
     return "Goal cleared."
   }
 
@@ -2183,7 +2185,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
     await persist()
   }
 
-  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor })
+  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState, completionAuditor })
 
   const hooks = {
     "command.execute.before": async (input, output) => {
@@ -2281,14 +2283,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
         const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget rotates goalId; re-key the multi-goal registry to the
-        // new id so a later clear/replace removes the goal instead of leaking a
-        // stale entry (the focused pointer holds the same object reference).
-        if (goal.goalId !== previousGoalId) {
-          removeSessionGoal(sessionID, previousGoalId)
-          registerSessionGoal(goal)
-          focusGoal(sessionID, goal)
-        }
+        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
+        // re-key the registry so a later clear/replace removes the right entry.
+        removeSessionGoal(sessionID, previousGoalId)
+        registerSessionGoal(goal)
+        focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
         goal.blockedReason = ""
@@ -2724,8 +2723,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
               )
             }
             activeGoalAfterMessages.lastStatus = "Goal completed."
-            // pushHistory writes the terminal event to the durable ledger first,
-            // so the completion survives even if the state write below fails.
+            // pushHistory attempts to append the terminal event to the ledger before
+            // the state write below. Note: ledger write failures are silent (bare
+            // catch in emitLedgerEvent), and the ledger only enables recovery when
+            // the state file is absent — a stale state file always takes precedence.
             pushHistory(
               activeGoalAfterMessages,
               "completed",
@@ -2861,7 +2862,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             "warning",
             `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`,
           )
-        } else if (latestOutputTokens !== null || assistantChanged) {
+        } else if (latestOutputTokens !== null || assistantChanged || !latestAssistant) {
           activeGoalAfterMessages.noProgressTurns = 0
         }
 
@@ -2902,7 +2903,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             "warning",
             `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`,
           )
-        } else if (latestHasToolCall) {
+        } else if (latestHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0
         }
 
