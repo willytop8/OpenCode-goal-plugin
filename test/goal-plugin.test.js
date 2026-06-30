@@ -3724,3 +3724,201 @@ test("goal cleared during announceAudit is not archived (liveness re-check after
   // No goal means no "achieved" status — the status reply should say no goal is set.
   assert.ok(!statusOutput.parts[0]?.text?.includes("achieved"))
 })
+
+// ── PR C: State machine + security fixes ──────────────────────────────────────
+
+test("formatFailures is preserved through a persistence round-trip", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ff-"))
+  const stateFilePath = join(dir, "state.json")
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [message("All done!\n[goal:complete]")], // missing evidence → formatFailures++
+      }),
+      promptAsync: async () => ({}),
+    },
+  }
+  try {
+    const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "ff-persist", arguments: "ship it" },
+      { parts: [] },
+    )
+    // Fire idle: [goal:complete] with no evidence increments formatFailures.
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "ff-persist", status: { type: "idle" } } },
+    })
+    const goalMid = currentGoal("ff-persist")
+    assert.ok(goalMid)
+    assert.equal(goalMid.formatFailures, 1)
+
+    // State file must include formatFailures.
+    const raw = JSON.parse(await readFile(stateFilePath, "utf8"))
+    assert.equal(raw.goals.find((g) => g.sessionID === "ff-persist").formatFailures, 1)
+
+    // Reload: formatFailures must be restored, not reset to zero.
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const goalReloaded = currentGoal("ff-persist")
+    assert.ok(goalReloaded)
+    assert.equal(goalReloaded.formatFailures, 1)
+  } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("/goal edit resets noToolCallTurns to zero", async () => {
+  // noToolCallTurns only increments when turnCount > 0, so the very first idle
+  // (turnCount=0) doesn't count. We need 3 idles to reach noToolCallTurns=2.
+  // Use a counter to give each message a unique ID so assistantRepeated stays
+  // false and each idle cycle increments the turn counter.
+  let msgCounter = 0
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [{
+        info: { id: `msg-notool-${++msgCounter}`, role: "assistant", sessionID: "edit-notoolcall", tokens: { input: 1, output: 100, reasoning: 0 } },
+        parts: [{ type: "text", text: `thinking pass ${msgCounter}` }],
+      }],
+    }),
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+  })
+  const run = (args) =>
+    hooks["command.execute.before"]({ command: "goal", sessionID: "edit-notoolcall", arguments: args }, { parts: [] })
+
+  await run("ship it")
+  const idle = () =>
+    hooks.event({ event: { type: "session.status", properties: { sessionID: "edit-notoolcall", status: { type: "idle" } } } })
+  // First idle: turnCount 0→1, noToolCallTurns stays 0.
+  // Second and third idles: each increments noToolCallTurns.
+  await idle()
+  await idle()
+  await idle()
+  assert.equal(currentGoal("edit-notoolcall").noToolCallTurns, 2)
+
+  // Edit the objective: noToolCallTurns must be reset.
+  await run("edit ship faster")
+  assert.equal(currentGoal("edit-notoolcall").noToolCallTurns, 0)
+})
+
+test("agent update_goal complete invokes the auditor before archiving", async () => {
+  let auditorCalled = false
+  const rejectingAuditor = async () => {
+    auditorCalled = true
+    return { approved: false, reason: "not done yet" }
+  }
+  // GoalPlugin sets up the auditor; agent handlers receive it via buildAgentToolHandlers.
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  await GoalPlugin({ client }, { persistState: false, minDelayMs: 1, auditor: rejectingAuditor })
+
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+    completionAuditor: rejectingAuditor,
+  })
+  await handlers.setGoal("auditor-bypass", { objective: "ship it" })
+  assert.ok(currentGoal("auditor-bypass"))
+
+  const result = await handlers.updateGoal("auditor-bypass", { status: "complete", evidence: "done" })
+  assert.ok(auditorCalled, "auditor must be called")
+  assert.match(result, /rejected/)
+  // Goal must remain active (not archived).
+  const goal = currentGoal("auditor-bypass")
+  assert.ok(goal)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "audit rejected")
+})
+
+test("createChildSessionAuditor returns a rejected verdict on timeout", async () => {
+  const client = {
+    session: {
+      create: async () => ({ id: "child-1" }),
+      // prompt never resolves, simulating a hang
+      prompt: () => new Promise(() => {}),
+    },
+  }
+  const auditor = createChildSessionAuditor(client, { timeoutMs: 50 })
+  const verdict = await auditor({ goal: { condition: "x" }, sessionID: "s1", latestText: "" })
+  assert.equal(verdict.approved, false)
+  assert.match(verdict.reason, /timed out/)
+})
+
+test("ledger cross-check removes completed goals still active in a stale state file on restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ledger-xcheck-"))
+  const stateFilePath = join(dir, "state.json")
+  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [message("All done!\n[goal:evidence] verified\n[goal:complete]")],
+      }),
+      promptAsync: async () => ({}),
+    },
+  }
+  try {
+    // Phase 1: set and complete a goal so the ledger records "completed".
+    const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "xcheck-s1", arguments: "ship it" },
+      { parts: [] },
+    )
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "xcheck-s1", status: { type: "idle" } } },
+    })
+    // Goal should be gone after completion.
+    assert.equal(currentGoal("xcheck-s1"), null)
+
+    // Phase 2: manually corrupt the state file to put the goal back as active,
+    // simulating a state file that missed the terminal persist.
+    const completedLedger = await readLedgerEntries(ledgerFilePath)
+    assert.ok(completedLedger.some((e) => e.type === "completed"))
+
+    const stateRaw = JSON.parse(await readFile(stateFilePath, "utf8"))
+    // Inject a stale active copy of the goal into the state file.
+    stateRaw.goals.push({
+      sessionID: "xcheck-s1",
+      goalId: completedLedger.find((e) => e.type === "set")?.goalId || "stale-goal-id",
+      condition: "ship it",
+      stopped: false,
+    })
+    await writeFile(stateFilePath, JSON.stringify(stateRaw))
+
+    // Phase 3: reload. The cross-check must remove the stale active goal.
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    assert.equal(currentGoal("xcheck-s1"), null)
+  } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a thinking-only turn (reasoning tokens > 0, no prose, no tool calls) does not increment noProgressTurns", async () => {
+  // Build a message with reasoning tokens but no prose output and no tool calls.
+  const thinkingMsg = {
+    info: { id: "msg-thinking-1", role: "assistant", sessionID: "thinking-stall", tokens: { input: 1, output: 0, reasoning: 5000 } },
+    parts: [], // no text, no tool parts
+  }
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [thinkingMsg] }),
+    options: { minDelayMs: 1, noProgressTokenThreshold: 50 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "thinking-stall", arguments: "ship it" },
+    { parts: [] },
+  )
+  // Fire idle: the thinking turn has 0 prose tokens but > 0 reasoning tokens.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "thinking-stall", status: { type: "idle" } } },
+  })
+  // noProgressTurns must NOT be incremented — it's a thinking turn, not a stall.
+  const goal = currentGoal("thinking-stall")
+  assert.ok(goal)
+  assert.equal(goal.noProgressTurns, 0)
+})

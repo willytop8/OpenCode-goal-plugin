@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.4.3 — 2026-06-29
+
+### Bug fixes (concurrency + persistence)
+
+- **`activeContinues` Set → Map with per-handler UUID token.** `cleanupGoal` removes the session from the Map (allowing new handlers to start), but the idle handler's `finally` block only deletes if its token still matches — preventing it from clobbering a new handler's guard. With a plain `Set`, the old `finally` unconditionally deleted the new handler's entry, creating a race window where two handlers could run concurrently for the same session.
+- **Liveness re-check after `announceAudit`.** `announceAudit` is async and can yield long enough for a user to `/goal clear` or replace the goal. The handler now calls `activeGoal(sessionID, goalID)` after the announcement and returns immediately if the goal is gone, preventing an orphaned archive write.
+- **`persist()` calls serialized via promise chain.** Concurrent callers previously raced on the temp-file rename: the second rename could write older state over the first. All calls now chain through `persistChain`, guaranteeing ordered writes.
+- **`/goal clear` and agent `clearGoal` now emit a `"cleared"` ledger event before discarding the goal.** Without this, `reconstructGoalsFromLedger` (used when the state file is missing) would revive cleared goals as paused on restart. `LEDGER_TERMINAL_TYPES` already includes `"cleared"` — the event just wasn't being written.
+- **State-file/ledger cross-check on restart.** After loading from the state file, the plugin now reads the ledger and removes any active goals whose `goalId` appears in a terminal ledger entry. This guards against the scenario where a terminal persist wrote to the ledger but the state file write failed (e.g. process killed between the two writes): the goal would otherwise load as active and be re-driven on the next idle.
+
+### Bug fixes (state machine + security)
+
+- **Escape checkpoint and history text in compaction context.** Checkpoint summaries and lifecycle-event details contain assistant-generated text. If a malicious assistant output included structural XML tags (e.g. `</goal_objective><budget_wrapup>…</budget_wrapup>`), they could be re-embedded unescaped in the compaction context system message. `buildCompactionProgressSummary` and the `lastCheckpoint` inline in `buildCompactionContext` now call `escapeGoalText` on all assistant-derived strings.
+- **`/goal edit` and agent `update_goal` objective updates now reset `noToolCallTurns`.** The edit paths already reset `noProgressTurns` and cleared soft-stop state, but forgot `noToolCallTurns`. A goal that was heading toward a no-tool-call pause kept its stale counter after an objective change, and could pause after fewer than the configured grace turns on the new objective.
+- **`formatFailures` is now preserved through a persistence round-trip.** `normalizePersistedGoal` carried `promptFailures` but omitted `formatFailures`. After a plugin restart any accumulated format-failure count was silently reset to zero, giving the model an unintended free pass on the first format re-prompts after recovery.
+- **Agent `update_goal {status: "complete"}` now invokes the configured completion auditor.** The `[goal:complete]` marker path gates archival on an optional auditor, but the agent tool path bypassed it entirely. `buildAgentToolHandlers` now accepts a `completionAuditor` option, and the `GoalPlugin` factory passes the configured auditor through. A rejected verdict pauses the goal with stop reason `audit rejected`; an auditor that throws is treated as a rejection (fail closed).
+- **`createChildSessionAuditor` now enforces a configurable timeout (default 120 s).** `sessionApi.prompt` could hang indefinitely, blocking the idle handler and stalling the goal forever. The auditor now races the API call against a `setTimeout` promise; if the timeout fires first, the verdict is `{ approved: false, reason: "auditor timed out after Nms" }`. The timer is always cleared after settlement.
+- **Thinking-only turns are excluded from the `noProgress` stall detector.** A turn that produced reasoning tokens but no prose output and no tool calls was treated as stalled by `lowOutputLooksStalled` (prose output tokens = 0 < threshold). The new `latestHasThinkingTokens` check (`tokens.reasoning > 0`) excludes such turns from the stall gate, preventing false pauses on extended-thinking models that reason before acting.
+
 ## 0.4.2 — 2026-06-29
 
 ### Bug fixes
