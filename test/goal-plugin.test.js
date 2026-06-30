@@ -4076,3 +4076,148 @@ test("update_goal status='blocked' requires a non-empty blocker argument", async
   assert.equal(currentGoal(sid).stopReason, "blocked")
   assert.equal(currentGoal(sid).blockedReason, "Need credentials for the staging env.")
 })
+
+test("set_goal rejects non-positive budget arguments and unrecognized modes", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+  })
+  const sid = "budget-validation-s1"
+
+  // Non-positive maxTurns.
+  assert.match(await handlers.setGoal(sid, { objective: "x", maxTurns: 0 }), /Invalid maxTurns/)
+  assert.equal(currentGoal(sid), null)
+  assert.match(await handlers.setGoal(sid, { objective: "x", maxTurns: -5 }), /Invalid maxTurns/)
+
+  // Non-positive maxTokens.
+  assert.match(await handlers.setGoal(sid, { objective: "x", maxTokens: 0 }), /Invalid maxTokens/)
+
+  // Non-positive maxDurationMs.
+  assert.match(await handlers.setGoal(sid, { objective: "x", maxDurationMs: -1 }), /Invalid maxDurationMs/)
+
+  // Unrecognized mode.
+  assert.match(
+    await handlers.setGoal(sid, { objective: "x", mode: "odered" }),
+    /Invalid mode.*expected.*normal.*or.*ordered|Invalid mode.*expected.*ordered.*or.*normal/i,
+  )
+
+  // Valid positive values succeed.
+  assert.match(await handlers.setGoal(sid, { objective: "go", maxTurns: 1 }), /New active goal/)
+  assert.equal(currentGoal(sid)?.options.maxTurns, 1)
+})
+
+test("update_goal cannot combine an objective update with status='complete' in one call", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+  })
+  const sid = "atomic-complete-s1"
+  await handlers.setGoal(sid, { objective: "implement auth" })
+
+  const result = await handlers.updateGoal(sid, {
+    objective: "write unit tests",
+    status: "complete",
+    evidence: "all passing",
+  })
+  // Must reject — the completion would archive under a condition never executed.
+  assert.match(result, /Cannot combine|two separate calls/i)
+  // Original condition must be preserved (no mutation occurred).
+  assert.equal(currentGoal(sid)?.condition, "implement auth")
+  assert.equal(currentGoal(sid)?.stopped, false)
+})
+
+test("update_goal status='resumed' on a running goal returns an error without resetting budgets", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+  })
+  const sid = "resume-running-s1"
+  await handlers.setGoal(sid, { objective: "ship it" })
+  const goalBefore = currentGoal(sid)
+  const originalGoalId = goalBefore.goalId
+  goalBefore.turnCount = 5 // simulate partial progress
+
+  // Goal is not stopped — resume must be rejected.
+  const result = await handlers.updateGoal(sid, { status: "resumed" })
+  assert.match(result, /already running/i)
+  // Budget must NOT have been reset (turnCount still 5, goalId unchanged).
+  const goalAfter = currentGoal(sid)
+  assert.equal(goalAfter.turnCount, 5)
+  assert.equal(goalAfter.goalId, originalGoalId)
+})
+
+test("/goal edit resets formatFailures so the revised objective starts with a clean violation count", async () => {
+  const { hooks } = await createHooks()
+  const sid = "edit-format-reset-s1"
+
+  await runGoal(hooks, sid, "original objective")
+  const goal = currentGoal(sid)
+  goal.formatFailures = 2 // simulate prior violations
+
+  await runGoal(hooks, sid, "edit revised objective")
+  // formatFailures must be reset on edit.
+  assert.equal(currentGoal(sid).formatFailures, 0)
+  assert.equal(currentGoal(sid).condition, "revised objective")
+})
+
+test("/goal replace clears sessionOrdered so old sisyphus sequence does not auto-promote", async () => {
+  const { hooks } = await createHooks()
+  const sid = "replace-ordered-s1"
+
+  // Start an ordered sequence via sisyphus.
+  await runGoal(hooks, sid, "sisyphus 'alpha'; 'beta'")
+  // sessionOrdered should now be set for this session.
+  // Replace with a standalone goal.
+  await runGoal(hooks, sid, "standalone goal")
+  // The standalone goal is now focused.
+  assert.equal(currentGoal(sid)?.condition, "standalone goal")
+  // Background goals from the sequence (beta) should not auto-promote on clear.
+  await runGoal(hooks, sid, "clear")
+  // If sessionOrdered was cleared on replace, listSessionGoals should be empty now.
+  // (beta was registered but would normally promote — clearing sessionOrdered stops that)
+  assert.equal(currentGoal(sid), null)
+})
+
+test("set_goal tool result escapes XML metacharacters in the goal condition", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+  })
+  const sid = "escape-result-s1"
+  // Objective with a structural closing tag that should be escaped in the result.
+  const result = await handlers.setGoal(sid, { objective: "fix </goal_objective> leak" })
+  // The returned string must NOT contain the raw closing tag.
+  assert.ok(!result.includes("</goal_objective>"), `Expected escaped result, got: ${result}`)
+  assert.match(result, /New active goal/)
+  // The stored goal.condition remains raw (unescaped) for use by buildGoalBlock.
+  assert.equal(currentGoal(sid).condition, "fix </goal_objective> leak")
+})
+
+test("promptFailures decrements by 1 on a successful prompt instead of resetting to 0", async () => {
+  // Accumulate 2 prompt failures by injecting them directly on the goal object,
+  // then fire an idle that results in a successful promptAsync call.
+  let promptCount = 0
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [
+        {
+          info: { id: `msg-pf-${++promptCount}`, role: "assistant", sessionID: "pf-decrement-s1", tokens: { input: 1, output: 200, reasoning: 0 } },
+          parts: [textPart("Still working.")],
+        },
+      ],
+    }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "pf-decrement-s1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("pf-decrement-s1")
+  goal.promptFailures = 2
+
+  // Fire idle — promptAsync succeeds, so promptFailures should decrement to 1.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "pf-decrement-s1", status: { type: "idle" } } },
+  })
+  assert.equal(currentGoal("pf-decrement-s1").promptFailures, 1)
+})

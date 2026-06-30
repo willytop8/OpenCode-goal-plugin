@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.4.5 — 2026-06-29
+
+### Bug fixes (input validation + counter correctness)
+
+- **`set_goal` now validates budget arguments and mode.** Previously `set_goal({maxTurns: 0})` silently used the global default; a typo in `mode` silently became `"normal"`. Both now return explicit errors, matching the `/goal` command's validation behavior.
+- **`update_goal` cannot combine an objective update with `status='complete'` in the same call.** The completion would be archived under a condition that was never executed, falsifying the audit trail. The tool now requires two separate calls: first update the objective, then mark complete after the revised work is done.
+- **`update_goal {status: 'resumed'}` on a running goal returns an error.** The slash-command path rejected this; the agent tool path silently reset all budget counters — turnCount, totalTokens, startedAt, etc. — on a goal that never stopped, enabling indefinite budget circumvention. The agent tool now rejects the call when the goal is not stopped.
+- **`/goal edit` and `update_goal` objective updates now reset `formatFailures` to 0.** The edit paths already reset `noProgressTurns` and `noToolCallTurns` but omitted `formatFailures`. A goal with accumulated format-failure violations had less tolerance than a freshly-resumed goal after an objective change.
+- **`/goal <condition>` replace command now clears `sessionOrdered`.** The agent `setGoal` path called `sessionOrdered.delete()` on replacement, but the slash-command path did not. A user replacing a sisyphus sequence with a standalone goal would get unexpected auto-promotion of the sequence's remaining goals after the replacement completed.
+- **`set_goal` and `update_goal` tool result strings now escape XML metacharacters.** The `goal.condition` is stored raw (for use by `buildGoalBlock`/`buildContinueMessage`), but the tool result returned to the model now calls `escapeGoalText` to prevent XML metacharacters from breaking tool-result boundaries in XML-serialized formats.
+- **`promptFailures` decrements by 1 on a successful prompt instead of resetting to 0.** This mirrors the `formatFailures` fix: an alternating error/success pattern previously bypassed the circuit-breaker cap indefinitely. Decrementing allows gradual recovery while still accumulating toward the cap over time.
+
 ## 0.4.4 — 2026-06-29
 
 ### Bug fixes (state machine + injection prevention)

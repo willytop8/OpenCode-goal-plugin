@@ -1703,6 +1703,17 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
     const objective = typeof args.objective === "string" ? args.objective.trim() : ""
     if (!objective) return "No objective provided. Pass a non-empty `objective`."
 
+    // Validate budget args before normalizing: normalizeOptions silently substitutes
+    // defaults for non-positive values, giving no feedback to the caller.
+    if (Number.isFinite(args.maxTurns) && args.maxTurns <= 0)
+      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer.`
+    if (Number.isFinite(args.maxTokens) && args.maxTokens <= 0)
+      return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
+    if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
+      return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
+    if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
+      return `Invalid mode: ${args.mode} (expected ${[...GOAL_MODES].join(" or ")}).`
+
     const options = normalizeOptions({
       ...defaultGoalOptions,
       ...(Number.isFinite(args.maxTurns) ? { maxTurns: args.maxTurns } : {}),
@@ -1729,12 +1740,31 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
     registerSessionGoal(goal)
     focusGoal(sessionID, goal)
     await persist()
-    return `New active goal: ${goal.condition}`
+    // Escape in the tool result only: goal.condition is stored raw so callers
+    // that build XML (buildGoalBlock, buildContinueMessage) can apply escaping
+    // themselves. Escaping here prevents XML metacharacters in user-supplied
+    // objectives from breaking tool-result boundaries in XML-serialized formats.
+    return `New active goal: ${escapeGoalText(goal.condition)}`
   }
 
   async function updateGoal(sessionID, args = {}) {
     const goal = goalStates.get(sessionID)
     if (!goal) return "No active goal to update. Use set_goal first."
+
+    // Reject the combination of an objective update with status='complete': the
+    // completion would be archived under a condition that was never executed,
+    // falsifying the audit trail. Require two separate calls.
+    if (
+      typeof args.objective === "string" &&
+      args.objective.trim() &&
+      String(args.status || "").trim().toLowerCase() === "complete"
+    ) {
+      return (
+        "Cannot combine an objective update with status='complete'. " +
+        "Use two separate calls: first update the objective (which revises the goal), " +
+        "then mark it complete after completing the revised work."
+      )
+    }
 
     const messages = []
 
@@ -1748,9 +1778,10 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
       goal.budgetWrapupSent = false
       goal.noProgressTurns = 0
       goal.noToolCallTurns = 0
+      goal.formatFailures = 0
       goal.lastStatus = "Goal objective updated."
       pushHistory(goal, "edited", `Objective updated to: ${summarizeText(goal.condition, 400)}`)
-      messages.push(`Objective updated: ${goal.condition}`)
+      messages.push(`Objective updated: ${escapeGoalText(goal.condition)}`)
     }
 
     if (args.status !== undefined) {
@@ -1811,6 +1842,8 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
         pushHistory(goal, "paused", "Paused via agent tool.")
         messages.push("Goal paused.")
       } else if (status === "resumed") {
+        if (!goal.stopped)
+          return "Goal is already running. Pause or stop it first if you want to reset the budget window."
         const previousGoalId = goal.goalId
         resetGoalBudget(goal)
         // resetGoalBudget rotates goalId; re-key the registry so the goal stays
@@ -2286,6 +2319,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         goal.budgetWrapupSent = false
         goal.noProgressTurns = 0
         goal.noToolCallTurns = 0
+        goal.formatFailures = 0
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
         await persist()
@@ -2488,7 +2522,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
       // Replace the focused goal (cleanupGoal discards it); backgrounded goals
       // for this session are preserved. Use `/goal add` to keep the current
-      // goal and add another.
+      // goal and add another. Clear any ordered-sequence flag so the new
+      // standalone goal does not trigger sisyphus auto-promotion of old sequence
+      // goals that may still be in the registry (matches the agent setGoal path).
+      sessionOrdered.delete(sessionID)
       cleanupGoal(sessionID)
       lastGoalResults.delete(sessionID)
       registerSessionGoal(goal)
@@ -2930,7 +2967,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         } else {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
           if (activeGoalAfterPrompt) {
-            activeGoalAfterPrompt.promptFailures = 0
+            // Decrement rather than reset: an alternating error/success pattern
+            // should still accumulate toward the circuit-breaker cap over time,
+            // matching the formatFailures approach for the same reason.
+            activeGoalAfterPrompt.promptFailures = Math.max(0, activeGoalAfterPrompt.promptFailures - 1)
             pushHistory(
               activeGoalAfterPrompt,
               budgetWrapup ? "budget-wrapup" : "auto-continue",
