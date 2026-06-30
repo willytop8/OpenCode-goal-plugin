@@ -290,6 +290,19 @@ By default a `[goal:complete]` is accepted on the assistant's word. You can requ
 
 On **approval** the goal is archived as achieved. On **rejection** the goal is *not* archived — it is paused with stop reason `audit rejected` and the reason in its status, so you can address the gap and `/goal resume`. The built-in child-session auditor fails *open* (auto-approves) if the session API is unavailable, while a custom auditor that throws is treated as a rejection (fail closed). The audit is off unless one of these options is set.
 
+Pass `auditorOptions` to tune the built-in auditor:
+
+```js
+GoalPlugin({
+  completionAudit: true,
+  auditorOptions: {
+    timeoutMs: 60_000,  // default 120 000 ms; set lower for faster CI feedback
+  },
+})
+```
+
+`timeoutMs` caps how long the built-in child-session auditor waits for a verdict. If the session doesn't reply within the timeout the auditor auto-approves (fail open) so the goal can still be archived. `auditorOptions` is ignored when a custom `auditor` function is supplied.
+
 ## Prompt safety
 
 The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided task data. The assistant is told to treat it as a task description, not as elevated instructions that can override system, developer, tool, or repository policies.
