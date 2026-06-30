@@ -56,7 +56,13 @@ const MAX_ARCHIVED_PER_SESSION = 10
 const lastGoalResults = new Map()
 const seenTokens = new Map()
 const seenOutputTokens = new Map()
-const activeContinues = new Set()
+// Map<sessionID, token> rather than Set so the idle handler's finally block can
+// detect whether its entry has been superseded by a new handler: if cleanupGoal
+// deletes the sessionID (allowing a new handler to start and set a fresh token)
+// before the old handler's finally fires, the old finally skips the delete
+// because the token no longer matches. With a plain Set, the old finally would
+// unconditionally delete the new handler's guard, exposing a race window.
+const activeContinues = new Map()
 const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
 const PAUSE_COMMANDS = new Set(["pause"])
 const GOAL_FLAG_SPECS = {
@@ -1750,6 +1756,9 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist }) {
 
   async function clearGoal(sessionID) {
     // Mirror `/goal clear`: drop the ordered flag and the focused goal + result.
+    // Record the clear in the ledger before cleanupGoal removes the goal object.
+    const goalBeforeClear = goalStates.get(sessionID)
+    if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "Cleared via agent tool.")
     sessionOrdered.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
@@ -1965,7 +1974,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
     cwd: pluginOptions.cwd,
   })
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
-  const persist = async () => persistState(persistenceOptions, client)
+  // Serialize all persist() calls through a promise chain so concurrent callers
+  // never race on the temp-file rename. persistState returns a boolean and never
+  // rejects, so the chain cannot stall on a thrown error.
+  let persistChain = Promise.resolve(true)
+  const persist = () => {
+    persistChain = persistChain.then(() => persistState(persistenceOptions, client))
+    return persistChain
+  }
 
   // Fail-closed (item 2.5): when persisting a terminal state (complete/blocked)
   // fails, surface it loudly. The terminal event is already in the append-only
@@ -2080,6 +2096,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       }
 
       if (CLEAR_COMMANDS.has(args)) {
+        // Record the clear in the ledger before cleanupGoal removes the goal
+        // object, so reconstructFromLedger can identify cleared goals and skip
+        // them rather than reconstructing them after a missing state file.
+        const goalBeforeClear = goalStates.get(sessionID)
+        if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "User cleared the goal.")
         sessionOrdered.delete(sessionID)
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
@@ -2450,7 +2471,8 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       if (!goal || goal.stopped || activeContinues.has(sessionID)) return
       const goalID = goal.goalId
 
-      activeContinues.add(sessionID)
+      const continueToken = randomUUID()
+      activeContinues.set(sessionID, continueToken)
       try {
         const messages = await client.session.messages({
           path: { id: sessionID },
@@ -2506,6 +2528,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
               sessionID,
               `Auditing goal completion: verifying "${summarizeText(activeGoalAfterMessages.condition, 120)}" is satisfied before archiving.`,
             )
+            // Re-check liveness: announceAudit is async and can yield long enough
+            // for the user to /goal clear or replace the goal. If it's gone,
+            // bail out without archiving — archiving a cleared goal would resurrect
+            // it in memory and potentially in the persisted state.
+            if (!activeGoal(sessionID, goalID)) return
             // Optional independent auditor (item 2.2): an approved verdict
             // archives; a rejected verdict restores (pauses) the goal instead.
             if (completionAuditor) {
@@ -2808,7 +2835,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         }
         await logPluginError(client, "Auto-continue failed", error)
       } finally {
-        activeContinues.delete(sessionID)
+        // Only delete our own entry. If cleanupGoal already removed it (because
+        // the goal completed) and a new handler has since set a fresh token,
+        // we must not clobber the new handler's guard.
+        if (activeContinues.get(sessionID) === continueToken) activeContinues.delete(sessionID)
       }
     },
 

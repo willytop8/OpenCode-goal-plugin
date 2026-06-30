@@ -3610,3 +3610,117 @@ test("/goal resume does not leak a stale registry entry on later clear", async (
   assert.equal(listSessionGoals("resume-leak").length, 0)
   assert.equal(currentGoal("resume-leak"), null)
 })
+
+// ── PR B: Concurrency + Persistence fixes ─────────────────────────────────────
+
+test("/goal clear records a 'cleared' ledger event so cleared goals are not reconstructed after restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-clear-ledger-"))
+  const stateFilePath = join(dir, "state.json")
+  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  try {
+    const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "clear-ledger-1", arguments: "ship the code" },
+      { parts: [] },
+    )
+    // Clear the goal.
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "clear-ledger-1", arguments: "clear" },
+      { parts: [] },
+    )
+
+    // Ledger must contain a "cleared" terminal event.
+    const entries = await readLedgerEntries(ledgerFilePath)
+    assert.ok(entries.some((e) => e.type === "cleared"))
+
+    // Simulate a missing state file: reconstructFromLedger must NOT revive a
+    // cleared goal (LEDGER_TERMINAL_TYPES includes "cleared").
+    await rm(stateFilePath, { force: true })
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    assert.equal(currentGoal("clear-ledger-1"), null)
+  } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("agent clearGoal tool records a 'cleared' ledger event", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-agent-clear-ledger-"))
+  const stateFilePath = join(dir, "state.json")
+  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  try {
+    // GoalPlugin sets the global ledger sink to write to ledgerFilePath.
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+
+    // Create handlers that share the global goalStates (same module) so
+    // pushHistory writes to the ledger sink set by GoalPlugin above.
+    const handlers = buildAgentToolHandlers({
+      defaultGoalOptions: normalizeOptions(),
+      persist: async () => true,
+    })
+    await handlers.setGoal("agent-clear-ledger", { objective: "ship the code" })
+    assert.ok(currentGoal("agent-clear-ledger"))
+
+    await handlers.clearGoal("agent-clear-ledger")
+    assert.equal(currentGoal("agent-clear-ledger"), null)
+
+    const entries = await readLedgerEntries(ledgerFilePath)
+    assert.ok(entries.some((e) => e.type === "cleared"))
+  } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("goal cleared during announceAudit is not archived (liveness re-check after audit announcement)", async () => {
+  // The announceAudit call is async. If the goal is cleared while it awaits,
+  // the handler must detect the absence and bail out without archiving.
+  let hooks
+  const auditMessenger = async (sessionID) => {
+    // Clear the goal from inside the announcer, simulating a concurrent /goal clear.
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID, arguments: "clear" },
+      { parts: [] },
+    )
+  }
+  hooks = (
+    await createHooks({
+      messages: async () => ({
+        data: [message("All done!\n[goal:evidence] tests passed\n[goal:complete]")],
+      }),
+      options: { minDelayMs: 1, auditMessenger },
+    })
+  ).hooks
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "announce-liveness", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "announce-liveness", status: { type: "idle" } } },
+  })
+
+  // Goal was cleared by the announcer and must not have been re-archived.
+  assert.equal(currentGoal("announce-liveness"), null)
+  const statusOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "announce-liveness", arguments: "status" },
+    statusOutput,
+  )
+  // No goal means no "achieved" status — the status reply should say no goal is set.
+  assert.ok(!statusOutput.parts[0]?.text?.includes("achieved"))
+})
