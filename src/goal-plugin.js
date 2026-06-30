@@ -775,6 +775,7 @@ function normalizePersistedGoal(rawGoal) {
     stopped: rawGoal.stopped === true,
     stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
     promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
+    formatFailures: toNonNegativeInteger(rawGoal.formatFailures),
     messageIDs: Array.isArray(rawGoal.messageIDs)
       ? rawGoal.messageIDs.filter((messageID) => typeof messageID === "string" && messageID)
       : [],
@@ -1331,14 +1332,17 @@ function buildCompactionProgressSummary(goal, { maxCheckpoints = 3, maxEvents = 
   if (checkpoints.length) {
     lines.push("Recent checkpoints (oldest first):")
     for (const checkpoint of checkpoints) {
-      lines.push(`- ${summarizeText(checkpoint.summary, 200)}`)
+      // Escape: checkpoint summaries contain assistant-generated text; an
+      // adversarial model output could inject structural tags into this string,
+      // which would be re-embedded in the compaction context system message.
+      lines.push(`- ${escapeGoalText(summarizeText(checkpoint.summary, 200))}`)
     }
   }
   const events = Array.isArray(goal.history) ? goal.history.slice(-maxEvents) : []
   if (events.length) {
     lines.push("Recent lifecycle events (oldest first):")
     for (const event of events) {
-      lines.push(`- ${event.type}: ${summarizeText(event.detail, 160)}`)
+      lines.push(`- ${event.type}: ${escapeGoalText(summarizeText(event.detail, 160))}`)
     }
   }
   return lines
@@ -1356,7 +1360,7 @@ function buildCompactionContext(goal) {
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
     `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
-    goal.lastCheckpoint ? `Latest checkpoint: ${goal.lastCheckpoint.summary}` : null,
+    goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(goal.lastCheckpoint.summary)}` : null,
     ...buildCompactionProgressSummary(goal),
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
   ]
@@ -1611,7 +1615,7 @@ const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed
 // result. Goal creation/replacement routes through the multi-goal registry
 // (buildGoalState + registerSessionGoal + focusGoal) exactly like the command
 // path, so tool-created goals persist and are driven by the idle handler.
-function buildAgentToolHandlers({ defaultGoalOptions, persist }) {
+function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor = null }) {
   async function getGoal(sessionID) {
     const goal = goalStates.get(sessionID)
     if (goal) return formatStatus(goal)
@@ -1690,6 +1694,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist }) {
       goal.blockedReason = ""
       goal.budgetWrapupSent = false
       goal.noProgressTurns = 0
+      goal.noToolCallTurns = 0
       goal.lastStatus = "Goal objective updated."
       pushHistory(goal, "edited", `Objective updated to: ${summarizeText(goal.condition, 400)}`)
       messages.push(`Objective updated: ${goal.condition}`)
@@ -1702,6 +1707,27 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist }) {
       }
       if (status === "complete") {
         const evidence = typeof args.evidence === "string" ? args.evidence.trim() : ""
+        // If a completion auditor is configured, run it before archiving so the
+        // agent tool path has the same integrity gate as the [goal:complete] marker
+        // path. Without this, an autonomous agent could bypass the auditor by
+        // calling update_goal({status:"complete"}) instead of using the marker.
+        if (completionAuditor) {
+          let verdict
+          try {
+            verdict = await completionAuditor({ goal, sessionID, latestText: evidence })
+          } catch (error) {
+            verdict = { approved: false, reason: "auditor error" }
+          }
+          if (!verdict || verdict.approved !== true) {
+            const reason = (verdict && verdict.reason) || "completion not substantiated"
+            goal.stopped = true
+            goal.stopReason = "audit rejected"
+            goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /goal resume.`
+            pushHistory(goal, "audit-rejected", `Agent tool completion audit rejected: ${summarizeText(reason, 300)}`)
+            await persist()
+            return `Completion audit rejected: ${summarizeText(reason, 200)}. Goal paused; use /goal resume after addressing the issue.`
+          }
+        }
         goal.lastStatus = "Goal completed."
         pushHistory(
           goal,
@@ -1938,9 +1964,9 @@ function extractAuditVerdictText(response) {
 // so a missing/broken auditor pipeline never blocks legitimate completions.
 // NOTE: the exact child-session SDK shape should be confirmed against a live
 // OpenCode; the orchestration around it is what the tests cover.
-function createChildSessionAuditor(client, { agent = "build" } = {}) {
+function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120_000 } = {}) {
   return async ({ goal, sessionID, latestText }) => {
-    try {
+    const run = async () => {
       const sessionApi = client?.session
       if (!sessionApi?.create || !sessionApi?.prompt) {
         return { approved: true, reason: "child-session API unavailable; auto-approved" }
@@ -1961,8 +1987,23 @@ function createChildSessionAuditor(client, { agent = "build" } = {}) {
         verdictText = getText(findLatestAssistantMessage(messages?.data)?.parts)
       }
       return parseAuditVerdict(verdictText)
+    }
+
+    let timerID
+    const timeout = new Promise((resolve) => {
+      timerID = setTimeout(
+        () => resolve({ approved: false, reason: `auditor timed out after ${timeoutMs}ms` }),
+        timeoutMs,
+      )
+    })
+
+    try {
+      const result = await Promise.race([run(), timeout])
+      return result
     } catch (error) {
       return { approved: true, reason: `auditor error (auto-approved): ${error?.message || error}` }
+    } finally {
+      clearTimeout(timerID)
     }
   }
 }
@@ -2043,7 +2084,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
     await persist()
   }
 
-  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist })
+  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor })
 
   const hooks = {
     "command.execute.before": async (input, output) => {
@@ -2181,6 +2222,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         goal.blockedReason = ""
         goal.budgetWrapupSent = false
         goal.noProgressTurns = 0
+        goal.noToolCallTurns = 0
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
         await persist()
@@ -2647,6 +2689,13 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // tokens), so it resets noProgressTurns the same way the noToolCall
         // gate already resets noToolCallTurns.
         const latestHasToolCall = messageHasToolCall(latestAssistant)
+        // A turn that produced only reasoning tokens (no prose, no tool calls)
+        // is an extended-thinking pass, not a stall. latestOutputTokens counts
+        // prose output only; reasoning tokens are tracked separately. Without
+        // this guard a pure-thinking turn matches lowOutputTurn (output=0 < threshold)
+        // and latestText is empty, so it would false-positively look stalled.
+        const latestHasThinkingTokens =
+          toNonNegativeInteger(messageTokens(latestAssistant).reasoning) > 0
 
         const lowOutputTurn =
           activeGoalAfterMessages.turnCount > 0 &&
@@ -2657,7 +2706,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // real work via tool calls. Excluding tool-call turns prevents false
         // noProgress pauses on thinking models.
         const lowOutputLooksStalled =
-          lowOutputTurn && !latestHasToolCall && (assistantRepeated || !latestText || !assistantChanged)
+          lowOutputTurn &&
+          !latestHasToolCall &&
+          !latestHasThinkingTokens &&
+          (assistantRepeated || !latestText || !assistantChanged)
         if (lowOutputLooksStalled) {
           activeGoalAfterMessages.noProgressTurns += 1
           if (
