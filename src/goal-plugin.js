@@ -117,7 +117,9 @@ const GOAL_FLAG_SPECS = {
 // shapes count as tool-using turns too). A continuation turn with none of these
 // is "talk only" — a signal of a self-chat loop the auto-continue should not
 // keep feeding.
-const TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask"])
+// Covers both normalized OpenCode types and raw provider-specific part types
+// (some adapters forward the provider's original shape without normalizing).
+const TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask", "tool_use", "function_call", "tool-call"])
 
 function messageHasToolCall(message) {
   const parts = Array.isArray(message?.parts) ? message.parts : []
@@ -1230,6 +1232,17 @@ const STRUCTURAL_TAGS = [
   "next_step",
   "completion_audit",
   "evidence_required",
+  // Role-like names that model providers treat as elevated context (second-order
+  // injection: a goal could guide the model to emit these in output captured by
+  // recordCheckpoint, then re-injected via compaction or buildGoalBlock).
+  "system",
+  "instructions",
+  "human",
+  "assistant",
+  "anthropic",
+  "claude",
+  "context",
+  "prompt",
 ]
 const STRUCTURAL_OPEN_TAG_RE = new RegExp(`<(${STRUCTURAL_TAGS.join("|")})\\b`, "gi")
 
@@ -1393,7 +1406,12 @@ function buildCompactionContext(goal) {
   // this, a compaction can drop the goal objective and budget state from the
   // working context, so the assistant loses the thread mid-run even though the
   // plugin still re-injects via system.transform afterward.
-  const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000)
+  // Use goal.lastContinueAt (set on each persist cycle) rather than Date.now()
+  // so buildCompactionContext is deterministic. If OpenCode calls the compacting
+  // hook more than once, each invocation produces the same elapsedSeconds and
+  // therefore the same string — preserving the prefix cache from this point on.
+  const snapshotAt = goal.lastContinueAt || goal.startedAt || 0
+  const elapsedSeconds = Math.round((snapshotAt - goal.startedAt) / 1000)
   return [
     "An OpenCode goal is active for this session. Preserve it across compaction.",
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
@@ -1655,7 +1673,11 @@ const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed
 // result. Goal creation/replacement routes through the multi-goal registry
 // (buildGoalState + registerSessionGoal + focusGoal) exactly like the command
 // path, so tool-created goals persist and are driven by the idle handler.
-function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor = null }) {
+function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState = null, completionAuditor = null }) {
+  // Use persistTerminalState (which logs on failure) for terminal operations when
+  // available; fall back to plain persist for callers that don't wire it up (e.g.
+  // tests using buildAgentToolHandlers directly).
+  const persistFinal = persistTerminalState || persist
   async function getGoal(sessionID) {
     const goal = goalStates.get(sessionID)
     if (goal) return formatStatus(goal)
@@ -1692,6 +1714,17 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
     const objective = typeof args.objective === "string" ? args.objective.trim() : ""
     if (!objective) return "No objective provided. Pass a non-empty `objective`."
 
+    // Validate budget args before normalizing: normalizeOptions silently substitutes
+    // defaults for non-positive values, giving no feedback to the caller.
+    if (Number.isFinite(args.maxTurns) && args.maxTurns <= 0)
+      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer.`
+    if (Number.isFinite(args.maxTokens) && args.maxTokens <= 0)
+      return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
+    if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
+      return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
+    if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
+      return `Invalid mode: ${args.mode} (expected ${[...GOAL_MODES].join(" or ")}).`
+
     const options = normalizeOptions({
       ...defaultGoalOptions,
       ...(Number.isFinite(args.maxTurns) ? { maxTurns: args.maxTurns } : {}),
@@ -1718,26 +1751,48 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
     registerSessionGoal(goal)
     focusGoal(sessionID, goal)
     await persist()
-    return `New active goal: ${goal.condition}`
+    // Escape in the tool result only: goal.condition is stored raw so callers
+    // that build XML (buildGoalBlock, buildContinueMessage) can apply escaping
+    // themselves. Escaping here prevents XML metacharacters in user-supplied
+    // objectives from breaking tool-result boundaries in XML-serialized formats.
+    return `New active goal: ${escapeGoalText(goal.condition)}`
   }
 
   async function updateGoal(sessionID, args = {}) {
     const goal = goalStates.get(sessionID)
     if (!goal) return "No active goal to update. Use set_goal first."
 
+    // Reject the combination of an objective update with status='complete': the
+    // completion would be archived under a condition that was never executed,
+    // falsifying the audit trail. Require two separate calls.
+    if (
+      typeof args.objective === "string" &&
+      args.objective.trim() &&
+      String(args.status || "").trim().toLowerCase() === "complete"
+    ) {
+      return (
+        "Cannot combine an objective update with status='complete'. " +
+        "Use two separate calls: first update the objective (which revises the goal), " +
+        "then mark it complete after completing the revised work."
+      )
+    }
+
     const messages = []
 
     if (typeof args.objective === "string" && args.objective.trim()) {
       goal.condition = args.objective.trim()
-      goal.stopped = false
-      goal.stopReason = ""
+      // Deliberately NOT clearing goal.stopped or goal.stopReason: updating the
+      // objective does not un-stop a goal. Use status='resumed' to explicitly
+      // restart a stopped goal; silently un-stopping would resurrect audit-rejected
+      // or user-paused goals without the user's knowledge.
       goal.blockedReason = ""
       goal.budgetWrapupSent = false
       goal.noProgressTurns = 0
       goal.noToolCallTurns = 0
+      goal.formatFailures = 0
       goal.lastStatus = "Goal objective updated."
       pushHistory(goal, "edited", `Objective updated to: ${summarizeText(goal.condition, 400)}`)
-      messages.push(`Objective updated: ${goal.condition}`)
+      messages.push(`Objective updated: ${escapeGoalText(goal.condition)}`)
     }
 
     if (args.status !== undefined) {
@@ -1778,15 +1833,18 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
         cleanupGoal(sessionID)
         // Advance an ordered (sisyphus) sequence just like the marker path does.
         if (sessionOrdered.has(sessionID)) promoteNextOrderedGoal(sessionID)
-        await persist()
+        await persistFinal("completion")
         return "Goal marked complete and archived."
       }
       if (status === "blocked") {
-        goal.blockedReason = typeof args.blocker === "string" ? args.blocker.trim() : ""
+        const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : ""
+        if (!blockerText)
+          return "status 'blocked' requires a non-empty 'blocker' argument describing what is needed."
+        goal.blockedReason = blockerText
         goal.stopped = true
         goal.stopReason = "blocked"
         goal.lastStatus = "Assistant reported blocked."
-        pushHistory(goal, "blocked", goal.blockedReason || "Marked blocked via agent tool.")
+        pushHistory(goal, "blocked", goal.blockedReason)
         messages.push("Goal marked blocked.")
       } else if (status === "paused") {
         goal.stopped = true
@@ -1795,15 +1853,15 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
         pushHistory(goal, "paused", "Paused via agent tool.")
         messages.push("Goal paused.")
       } else if (status === "resumed") {
+        if (!goal.stopped)
+          return "Goal is already running. Pause or stop it first if you want to reset the budget window."
         const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget rotates goalId; re-key the registry so the goal stays
-        // findable by its new id (the focused pointer holds the same object).
-        if (goal.goalId !== previousGoalId) {
-          removeSessionGoal(sessionID, previousGoalId)
-          registerSessionGoal(goal)
-          focusGoal(sessionID, goal)
-        }
+        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
+        // re-key the registry so the goal stays findable by its new id.
+        removeSessionGoal(sessionID, previousGoalId)
+        registerSessionGoal(goal)
+        focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
         goal.blockedReason = ""
@@ -1821,14 +1879,17 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
   }
 
   async function clearGoal(sessionID) {
-    // Mirror `/goal clear`: drop the ordered flag and the focused goal + result.
+    // Mirror `/goal clear`: drop the ordered flag, ALL backgrounded goals, and the
+    // focused goal + result. Without sessionGoals.delete, background goals added via
+    // `/goal add` survive clear and resurrect as the focused goal on restart.
     // Record the clear in the ledger before cleanupGoal removes the goal object.
     const goalBeforeClear = goalStates.get(sessionID)
     if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "Cleared via agent tool.")
     sessionOrdered.delete(sessionID)
+    sessionGoals.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
-    await persist()
+    await persistFinal("clear")
     return "Goal cleared."
   }
 
@@ -2124,7 +2185,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
     await persist()
   }
 
-  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor })
+  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState, completionAuditor })
 
   const hooks = {
     "command.execute.before": async (input, output) => {
@@ -2180,9 +2241,13 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // Record the clear in the ledger before cleanupGoal removes the goal
         // object, so reconstructFromLedger can identify cleared goals and skip
         // them rather than reconstructing them after a missing state file.
+        // sessionGoals.delete clears ALL backgrounded goals so they do not
+        // resurrect as the focused goal on restart (cleanupGoal only removes the
+        // focused one; background goals from `/goal add` would survive otherwise).
         const goalBeforeClear = goalStates.get(sessionID)
         if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "User cleared the goal.")
         sessionOrdered.delete(sessionID)
+        sessionGoals.delete(sessionID)
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
         await persist()
@@ -2218,14 +2283,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
         const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget rotates goalId; re-key the multi-goal registry to the
-        // new id so a later clear/replace removes the goal instead of leaking a
-        // stale entry (the focused pointer holds the same object reference).
-        if (goal.goalId !== previousGoalId) {
-          removeSessionGoal(sessionID, previousGoalId)
-          registerSessionGoal(goal)
-          focusGoal(sessionID, goal)
-        }
+        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
+        // re-key the registry so a later clear/replace removes the right entry.
+        removeSessionGoal(sessionID, previousGoalId)
+        registerSessionGoal(goal)
+        focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
         goal.blockedReason = ""
@@ -2263,6 +2325,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         goal.budgetWrapupSent = false
         goal.noProgressTurns = 0
         goal.noToolCallTurns = 0
+        goal.formatFailures = 0
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
         await persist()
@@ -2465,7 +2528,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
       // Replace the focused goal (cleanupGoal discards it); backgrounded goals
       // for this session are preserved. Use `/goal add` to keep the current
-      // goal and add another.
+      // goal and add another. Clear any ordered-sequence flag so the new
+      // standalone goal does not trigger sisyphus auto-promotion of old sequence
+      // goals that may still be in the registry (matches the agent setGoal path).
+      sessionOrdered.delete(sessionID)
       cleanupGoal(sessionID)
       lastGoalResults.delete(sessionID)
       registerSessionGoal(goal)
@@ -2626,7 +2692,18 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
                 verdict = { approved: false, reason: "auditor error" }
               }
               const auditedGoal = activeGoal(sessionID, goalID)
-              if (!auditedGoal) return
+              if (!auditedGoal) {
+                // The goal was cleared or replaced while the auditor was running.
+                // If the verdict was approved, surface the loss so the user knows
+                // the completion was verified but not recorded — they can re-engage.
+                if (verdict && verdict.approved === true) {
+                  await announceAudit(
+                    sessionID,
+                    "Audit result: completion was approved but the goal was modified while the audit ran — completion not recorded.",
+                  )
+                }
+                return
+              }
               if (!verdict || verdict.approved !== true) {
                 const reason = (verdict && verdict.reason) || "completion not substantiated"
                 auditedGoal.stopped = true
@@ -2646,8 +2723,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
               )
             }
             activeGoalAfterMessages.lastStatus = "Goal completed."
-            // pushHistory writes the terminal event to the durable ledger first,
-            // so the completion survives even if the state write below fails.
+            // pushHistory attempts to append the terminal event to the ledger before
+            // the state write below. Note: ledger write failures are silent (bare
+            // catch in emitLedgerEvent), and the ledger only enables recovery when
+            // the state file is absent — a stale state file always takes precedence.
             pushHistory(
               activeGoalAfterMessages,
               "completed",
@@ -2756,6 +2835,15 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             activeGoalAfterMessages.noProgressTurns >=
             activeGoalAfterMessages.options.noProgressTurnsBeforePause
           ) {
+            // Accumulate format-validation failures even when the stall gate fires
+            // first and returns early, so the formatFailures cap remains reachable
+            // for low-output unverified completions. Without this, a model that
+            // repeatedly emits bare [goal:complete] with low output tokens causes
+            // the stall gate to fire before formatFailures can accumulate, and
+            // /goal resume resets it to zero, making the cap permanently unreachable.
+            if (completionUnverified || blockerUnstated) {
+              activeGoalAfterMessages.formatFailures += 1
+            }
             activeGoalAfterMessages.stopped = true
             activeGoalAfterMessages.stopReason = "no progress"
             activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${latestOutputTokens} output token(s). Run /${commandName} resume to continue.`
@@ -2774,7 +2862,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             "warning",
             `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`,
           )
-        } else if (latestOutputTokens !== null || assistantChanged) {
+        } else if (latestOutputTokens !== null || assistantChanged || !latestAssistant) {
           activeGoalAfterMessages.noProgressTurns = 0
         }
 
@@ -2784,9 +2872,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // configured grace window. Complements the low-output check above:
         // a turn can be high-output yet still make no real progress because it
         // never touched a tool.
+        // Guard on !lowOutputLooksStalled: if the noProgress gate already fired
+        // for this turn, the noToolCall counter must NOT also increment. Without
+        // this guard, the effective grace window is min(noProgress, noToolCall)
+        // rather than two independent limits — the user's higher noProgress
+        // threshold gets silently overridden by the lower noToolCall threshold.
         const noToolCallContinuation =
           activeGoalAfterMessages.turnCount > 0 && Boolean(latestAssistant) && !latestHasToolCall
-        if (noToolCallContinuation) {
+        if (noToolCallContinuation && !lowOutputLooksStalled) {
           activeGoalAfterMessages.noToolCallTurns += 1
           if (
             activeGoalAfterMessages.noToolCallTurns >=
@@ -2810,7 +2903,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             "warning",
             `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`,
           )
-        } else if (latestHasToolCall) {
+        } else if (latestHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0
         }
 
@@ -2831,6 +2924,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           activeGoalBeforePrompt.stopped = true
           activeGoalBeforePrompt.stopReason = "budget wrap-up requested"
           activeGoalBeforePrompt.lastStatus = "Budget threshold reached; requested final handoff."
+          // Persist before sending the wrapup prompt so that a crash during
+          // promptAsync doesn't cause a duplicate wrapup on resume. This mirrors
+          // the hard-limit path which also persists before its promptAsync call.
+          pushHistory(activeGoalBeforePrompt, "budget-wrapup", "Budget threshold reached; sending final handoff prompt.")
+          await persist()
         }
 
         activeGoalBeforePrompt.turnCount += 1
@@ -2843,7 +2941,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             activeGoalBeforePrompt.formatFailures += 1
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
           } else {
-            activeGoalBeforePrompt.formatFailures = 0
+            // Decrement rather than reset: an alternating bad/good/bad pattern
+            // should not indefinitely bypass the consecutive-failure cap. A model
+            // that produces one clean turn for every violation keeps formatFailures
+            // pinned near 1, which still accumulates toward the cap over time.
+            activeGoalBeforePrompt.formatFailures = Math.max(
+              0,
+              activeGoalBeforePrompt.formatFailures - 1,
+            )
             activeGoalBeforePrompt.lastStatus = latestText
               ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.`
               : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`
@@ -2900,7 +3005,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         } else {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
           if (activeGoalAfterPrompt) {
-            activeGoalAfterPrompt.promptFailures = 0
+            // Decrement rather than reset: an alternating error/success pattern
+            // should still accumulate toward the circuit-breaker cap over time,
+            // matching the formatFailures approach for the same reason.
+            activeGoalAfterPrompt.promptFailures = Math.max(0, activeGoalAfterPrompt.promptFailures - 1)
             pushHistory(
               activeGoalAfterPrompt,
               budgetWrapup ? "budget-wrapup" : "auto-continue",

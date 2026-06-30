@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## 0.4.7 — 2026-06-29
+
+### Bug fixes (low-severity cleanups)
+
+- **Dead `if (goal.goalId !== previousGoalId)` conditional removed from both resume paths.** `resetGoalBudget` always rotates `goalId` via `randomUUID()`, so the conditional was always `true`. The misleading branch could never be taken, masking the intent (unconditional registry re-key on resume). Both the agent-tool `updateGoal {status: "resumed"}` path and the `/goal resume` command path are now unconditional.
+- **`noToolCallTurns` no longer stales on null-assistant idles.** When `messages()` returns no assistant message (only a user turn), `latestAssistant` is `null` and `latestHasToolCall` is `false`. Previously the counter incremented unconditionally; a user-only idle turn could push the goal toward a no-tool-call pause even though the model hadn't spoken. The reset condition now includes `|| !latestAssistant`, matching the intent of the stall detector.
+- **`noProgressTurns` no longer stales on null-assistant idles.** Same scenario as above: when `latestOutputTokens === null` and there is no assistant message, the counter now resets instead of incrementing, consistent with the gate's purpose of detecting stalled model output.
+- **Updated ledger-durability comment near `pushHistory("completed")`.** The previous comment implied the ledger was the primary recovery mechanism. The corrected comment clarifies that ledger write failures are silent (bare `catch`), and that a present state file always takes precedence over the ledger — making the ledger relevant only when the state file is absent.
+- **`buildAgentToolHandlers` accepts a `persistTerminalState` option.** Terminal state transitions (`status='complete'` and `clearGoal`) now call `persistTerminalState` if provided, falling back to the regular `persist` function. The `GoalPlugin` factory passes its own `persistTerminalState` closure through, so agent-triggered completions and clears get the same durable flush semantics as the event-handler paths.
+
+## 0.4.6 — 2026-06-29
+
+### Bug fixes (counters, compaction, and auditor)
+
+- **`noToolCallTurns` is now independent of `noProgressTurns`.** On a turn that qualifies for the noProgress stall gate (low output, no tool call, stalled text), the noToolCall counter no longer also increments. Without this guard, the effective grace window was `min(noProgress, noToolCall)` rather than two independent limits — a configured higher `noProgressTurnsBeforePause` threshold was silently overridden by the lower `noToolCallTurnsBeforePause`.
+- **`formatFailures` is now incremented when the stall gate fires and returns early.** Stall detection previously returned before the format-failure accumulator could run. A model that repeatedly emitted bare `[goal:complete]` with low output triggered the stall gate rather than accumulating toward the `maxPromptFailures` cap; the cap was permanently unreachable because `/goal resume` reset `formatFailures` to zero each time. The counter now increments inside the stall-gate early-return path when `completionUnverified` or `blockerUnstated` is true.
+- **Budget-wrapup state is persisted before the wrapup prompt is sent.** Previously `budgetWrapupSent = true` and `stopped = true` were set in memory but not persisted before `promptAsync`. A crash during the prompt would result in `budgetWrapupSent: false` in the state file and a duplicate wrapup on the next resume cycle. The fix adds `pushHistory("budget-wrapup")` + `persist()` before the prompt call, mirroring the hard-limit path.
+- **`TOOL_PART_TYPES` now covers raw provider part type names.** Some OpenCode adapters forward the provider's original message part shape without normalizing to `"tool"`. Added `"tool_use"`, `"function_call"`, and `"tool-call"` to the set so `messageHasToolCall` (and both stall gates) correctly recognize tool-using turns from non-normalized adapters.
+- **Approved completion that is lost while the auditor is in flight now produces an announcement.** If the goal is cleared or replaced while a completion auditor runs, and the auditor returns `approved: true`, the plugin now announces "completion was approved but the goal was modified while the audit ran — completion not recorded." Previously the approved result was silently discarded with no visible trace.
+- **`buildCompactionContext` is now deterministic.** The function previously called `Date.now()` to compute elapsed seconds, so two calls during the same compaction event produced different strings, busting the prefix cache from that byte position. The elapsed time is now derived from `goal.lastContinueAt` (set during each persist cycle), making the output stable and matching the function's own claim of being "reconstructed deterministically from the plugin's persisted goal record."
+
+## 0.4.5 — 2026-06-29
+
+### Bug fixes (input validation + counter correctness)
+
+- **`set_goal` now validates budget arguments and mode.** Previously `set_goal({maxTurns: 0})` silently used the global default; a typo in `mode` silently became `"normal"`. Both now return explicit errors, matching the `/goal` command's validation behavior.
+- **`update_goal` cannot combine an objective update with `status='complete'` in the same call.** The completion would be archived under a condition that was never executed, falsifying the audit trail. The tool now requires two separate calls: first update the objective, then mark complete after the revised work is done.
+- **`update_goal {status: 'resumed'}` on a running goal returns an error.** The slash-command path rejected this; the agent tool path silently reset all budget counters — turnCount, totalTokens, startedAt, etc. — on a goal that never stopped, enabling indefinite budget circumvention. The agent tool now rejects the call when the goal is not stopped.
+- **`/goal edit` and `update_goal` objective updates now reset `formatFailures` to 0.** The edit paths already reset `noProgressTurns` and `noToolCallTurns` but omitted `formatFailures`. A goal with accumulated format-failure violations had less tolerance than a freshly-resumed goal after an objective change.
+- **`/goal <condition>` replace command now clears `sessionOrdered`.** The agent `setGoal` path called `sessionOrdered.delete()` on replacement, but the slash-command path did not. A user replacing a sisyphus sequence with a standalone goal would get unexpected auto-promotion of the sequence's remaining goals after the replacement completed.
+- **`set_goal` and `update_goal` tool result strings now escape XML metacharacters.** The `goal.condition` is stored raw (for use by `buildGoalBlock`/`buildContinueMessage`), but the tool result returned to the model now calls `escapeGoalText` to prevent XML metacharacters from breaking tool-result boundaries in XML-serialized formats.
+- **`promptFailures` decrements by 1 on a successful prompt instead of resetting to 0.** This mirrors the `formatFailures` fix: an alternating error/success pattern previously bypassed the circuit-breaker cap indefinitely. Decrementing allows gradual recovery while still accumulating toward the cap over time.
+
+## 0.4.4 — 2026-06-29
+
+### Bug fixes (state machine + injection prevention)
+
+- **`escapeGoalText` now neutralizes role-like tag openings.** The previous `STRUCTURAL_TAGS` set only covered plugin-defined tags. Tags like `<system>`, `<assistant>`, `<human>`, `<anthropic>`, `<claude>`, `<context>`, `<instructions>`, and `<prompt>` could survive unescaped in compacted system messages, creating second-order injection opportunities where model output captured by `recordCheckpoint` re-appeared as an elevated-privilege block after compaction.
+- **`update_goal` objective update no longer un-stops a stopped goal.** Calling `update_goal({objective: "…"})` previously cleared `goal.stopped` and `goal.stopReason`, silently resurrecting a goal that was audit-rejected, user-paused, or blocked for any reason. Objective updates now preserve the stopped state; only an explicit `status: "resumed"` call resets it.
+- **`/goal clear` and agent `clearGoal` now delete all backgrounded goals.** Previously only the focused goal was removed from the session registry (`cleanupGoal` → `removeSessionGoal`). Background goals added via `/goal add` remained alive and would promote themselves to focused on restart. Both clear paths now call `sessionGoals.delete(sessionID)` first, wiping the entire per-session goal map.
+- **`formatFailures` decrements by 1 on a clean turn instead of resetting to 0.** A reset-to-zero on every non-violation turn allowed an alternating bad/good/bad pattern to bypass the consecutive-failure cap indefinitely. Decrementing by 1 means repeated violations accumulate toward the cap even when interspersed with good turns.
+- **`update_goal {status: "blocked"}` requires a non-empty `blocker` argument.** The event-handler path already rejects a `[goal:blocked]` marker with no concrete blocker, but the agent tool path accepted an empty `blocker` (recording an empty `blockedReason`). The agent tool now returns an error when `blocker` is missing or whitespace-only, consistent with the auto-continue guard.
+
 ## 0.4.3 — 2026-06-29
 
 ### Bug fixes (concurrency + persistence)
