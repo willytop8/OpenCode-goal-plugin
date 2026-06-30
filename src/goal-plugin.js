@@ -442,10 +442,13 @@ function promoteNextOrderedGoal(sessionID) {
 function cleanupGoal(sessionID) {
   const goal = goalStates.get(sessionID)
   if (goal) {
-    for (const messageID of goal.messageIDs) {
-      seenTokens.delete(messageID)
-      seenOutputTokens.delete(messageID)
-    }
+    // seenTokens entries for this goal's message IDs are intentionally NOT deleted
+    // here. resetGoalBudget also leaves them in place. The message.updated handler
+    // uses the presence of an ID in seenTokens combined with its absence from the
+    // current goal.messageIDs to detect and skip stale re-deliveries — deleting
+    // entries here would break that guard for post-replacement stale events.
+    // Entries are cleared in bulk by clearRuntimeState on plugin teardown; the
+    // per-process accumulation is small (O(turns × messages_per_turn)).
     removeSessionGoal(sessionID, goal.goalId)
   }
   goalStates.delete(sessionID)
@@ -505,10 +508,11 @@ function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") 
 }
 
 function resetGoalBudget(goal) {
-  for (const messageID of goal.messageIDs) {
-    seenTokens.delete(messageID)
-    seenOutputTokens.delete(messageID)
-  }
+  // Do NOT delete old message IDs from seenTokens here. The message.updated
+  // handler guards against stale re-deliveries by checking whether the message ID
+  // is in seenTokens but NOT in the current goal.messageIDs — keeping the entries
+  // alive is what makes that check reliable. cleanupGoal removes them when the
+  // goal is fully discarded, so seenTokens entries are bounded to active goals.
   goal.goalId = randomUUID()
   goal.startedAt = Date.now()
   goal.turnCount = 0
@@ -2398,6 +2402,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         const currentMessageID = messageID(message)
         if (!currentMessageID) return
 
+        // Skip stale re-deliveries from a prior budget window or a replaced goal.
+        // resetGoalBudget and cleanupGoal both leave seenTokens entries in place
+        // so this guard can fire: if an ID is already recorded in seenTokens but
+        // is absent from the current goal.messageIDs, it belongs to a previous
+        // budget epoch or a different goal that was replaced, and the event must
+        // not re-inflate totalTokens.
+        if (seenTokens.has(currentMessageID) && !goal.messageIDs.has(currentMessageID)) return
+
         let changed = false
         const currentOutputTokens = outputTokensForMessage(message)
         const previousOutputTokens = seenOutputTokens.get(currentMessageID) || 0
@@ -2849,6 +2861,18 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       } else {
         output.context = [context]
       }
+      // Reset the token high-water mark so the remaining budget reflects the
+      // compacted context size, not the pre-compaction peak. Without this,
+      // Math.max semantics mean totalTokens never decreases: a goal that crossed
+      // the 80% wrapup threshold before compaction would permanently stay above it
+      // even after the context shrinks to a fraction of its prior size.
+      // Move current message IDs to priorMessageIDs so the message.updated guard
+      // ignores stale events for pre-compaction messages.
+      if (!goal.priorMessageIDs) goal.priorMessageIDs = new Set()
+      for (const id of goal.messageIDs) goal.priorMessageIDs.add(id)
+      goal.messageIDs = new Set()
+      goal.totalTokens = 0
+      await persist()
     },
 
     "experimental.compaction.autocontinue": async (input, output) => {

@@ -1187,6 +1187,147 @@ test("token tracking uses context window size, not cumulative API consumption", 
   assert.equal(goal.totalTokens, 9500)
 })
 
+test("stale message.updated events after /goal resume do not re-inflate totalTokens", async () => {
+  // Regression: resetGoalBudget clears seenTokens for old message IDs, so when a
+  // queued message.updated event for that same ID arrives after resume, previousTokens
+  // is 0 and totalTokens = Math.max(0, oldValue) re-inflates to the pre-resume peak.
+  const { hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 1000, budgetWrapupRatio: 0.8 },
+  })
+  const session = "session-resume-stale"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  // Simulate a large pre-resume turn accumulating 900 tokens.
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-old", role: "assistant", sessionID: session, tokens: { input: 800, output: 100, reasoning: 0 } },
+      },
+    },
+  })
+  assert.equal(currentGoal(session).totalTokens, 900)
+
+  // Pause the goal so resume has something to act on (resume is a no-op on
+  // a running goal; the real trigger is a budget stop or explicit pause).
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "pause" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal(session).stopped, true)
+
+  // /goal resume calls resetGoalBudget, zeroing totalTokens.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "resume" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal(session).totalTokens, 0)
+
+  // Stale event for the old message ID arrives after resume (queued in OpenCode).
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-old", role: "assistant", sessionID: session, tokens: { input: 800, output: 100, reasoning: 0 } },
+      },
+    },
+  })
+
+  // totalTokens must remain 0, not jump back to 900.
+  assert.equal(currentGoal(session).totalTokens, 0, "stale event must not re-inflate totalTokens")
+})
+
+test("stale message.updated events after goal replacement do not inflate the new goal's totalTokens", async () => {
+  // Regression: when a goal is replaced mid-stream, cleanupGoal clears seenTokens
+  // for the old goal's message IDs. Subsequent streaming events for those same IDs
+  // see previousTokens=0 and re-inflate the new goal's totalTokens to the old peak.
+  const { hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 5000 },
+  })
+  const session = "session-replace-stale"
+
+  // Goal-A accumulates tokens from a streaming message.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "goal A" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-streaming", role: "assistant", sessionID: session, tokens: { input: 3000, output: 500, reasoning: 0 } },
+      },
+    },
+  })
+  assert.equal(currentGoal(session).totalTokens, 3500)
+
+  // Replace with Goal-B.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "goal B" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal(session).totalTokens, 0, "new goal starts with zero tokens")
+
+  // Stale streaming event for the old message arrives after replacement.
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-streaming", role: "assistant", sessionID: session, tokens: { input: 3000, output: 600, reasoning: 0 } },
+      },
+    },
+  })
+
+  // Goal-B's totalTokens must remain 0.
+  assert.equal(currentGoal(session).totalTokens, 0, "old goal's streaming event must not inflate new goal's budget")
+})
+
+test("totalTokens resets to zero after session compaction", async () => {
+  // Regression: Math.max semantics mean totalTokens never decreases, so after a
+  // compaction that shrinks the context the goal permanently acts as if it is at
+  // the pre-compaction token peak, even with a fresh small context.
+  const { hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 200_000, budgetWrapupRatio: 0.8 },
+  })
+  const session = "session-compact-reset"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "build the feature" },
+    { parts: [] },
+  )
+
+  // Accumulate tokens near the 80% wrapup threshold (160k out of 200k).
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-precompact", role: "assistant", sessionID: session, tokens: { input: 155_000, output: 10_000, reasoning: 0 } },
+      },
+    },
+  })
+  assert.equal(currentGoal(session).totalTokens, 165_000)
+
+  // Session compacts: context shrinks to a much smaller window.
+  const compactOutput = {}
+  await hooks["experimental.session.compacting"]({ sessionID: session }, compactOutput)
+
+  // totalTokens must reset so the post-compaction budget reflects the fresh context.
+  assert.equal(currentGoal(session).totalTokens, 0, "compaction must reset totalTokens high-water mark")
+
+  // A post-compaction message.updated for a new message should accumulate normally.
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-postcompact", role: "assistant", sessionID: session, tokens: { input: 40_000, output: 5_000, reasoning: 0 } },
+      },
+    },
+  })
+  assert.equal(currentGoal(session).totalTokens, 45_000, "post-compaction tokens accumulate from zero")
+})
+
 test("parses --max-duration-ms flag directly", () => {
   const parsed = parseGoalArguments("fix tests --max-duration-ms 90000", normalizeOptions())
   assert.equal(parsed.condition, "fix tests")
