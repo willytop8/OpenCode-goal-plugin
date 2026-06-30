@@ -10,6 +10,7 @@
 - **Liveness re-check after `announceAudit`.** `announceAudit` is async and can yield long enough for a user to `/goal clear` or replace the goal. The handler now calls `activeGoal(sessionID, goalID)` after the announcement and returns immediately if the goal is gone, preventing an orphaned archive write.
 - **`persist()` calls serialized via promise chain.** Concurrent callers previously raced on the temp-file rename: the second rename could write older state over the first. All calls now chain through `persistChain`, guaranteeing ordered writes.
 - **`/goal clear` and agent `clearGoal` now emit a `"cleared"` ledger event before discarding the goal.** Without this, `reconstructGoalsFromLedger` (used when the state file is missing) would revive cleared goals as paused on restart. `LEDGER_TERMINAL_TYPES` already includes `"cleared"` — the event just wasn't being written.
+- **State-file/ledger cross-check on restart.** After loading from the state file, the plugin now reads the ledger and removes any active goals whose `goalId` appears in a terminal ledger entry. This guards against the scenario where a terminal persist wrote to the ledger but the state file write failed (e.g. process killed between the two writes): the goal would otherwise load as active and be re-driven on the next idle.
 
 ### Bug fixes (state machine + security)
 

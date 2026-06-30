@@ -3849,6 +3849,56 @@ test("createChildSessionAuditor returns a rejected verdict on timeout", async ()
   assert.match(verdict.reason, /timed out/)
 })
 
+test("ledger cross-check removes completed goals still active in a stale state file on restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ledger-xcheck-"))
+  const stateFilePath = join(dir, "state.json")
+  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [message("All done!\n[goal:evidence] verified\n[goal:complete]")],
+      }),
+      promptAsync: async () => ({}),
+    },
+  }
+  try {
+    // Phase 1: set and complete a goal so the ledger records "completed".
+    const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "xcheck-s1", arguments: "ship it" },
+      { parts: [] },
+    )
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "xcheck-s1", status: { type: "idle" } } },
+    })
+    // Goal should be gone after completion.
+    assert.equal(currentGoal("xcheck-s1"), null)
+
+    // Phase 2: manually corrupt the state file to put the goal back as active,
+    // simulating a state file that missed the terminal persist.
+    const completedLedger = await readLedgerEntries(ledgerFilePath)
+    assert.ok(completedLedger.some((e) => e.type === "completed"))
+
+    const stateRaw = JSON.parse(await readFile(stateFilePath, "utf8"))
+    // Inject a stale active copy of the goal into the state file.
+    stateRaw.goals.push({
+      sessionID: "xcheck-s1",
+      goalId: completedLedger.find((e) => e.type === "set")?.goalId || "stale-goal-id",
+      condition: "ship it",
+      stopped: false,
+    })
+    await writeFile(stateFilePath, JSON.stringify(stateRaw))
+
+    // Phase 3: reload. The cross-check must remove the stale active goal.
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    assert.equal(currentGoal("xcheck-s1"), null)
+  } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("a thinking-only turn (reasoning tokens > 0, no prose, no tool calls) does not increment noProgressTurns", async () => {
   // Build a message with reasoning tokens but no prose output and no tool calls.
   const thinkingMsg = {

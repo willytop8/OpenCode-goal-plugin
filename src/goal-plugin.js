@@ -936,6 +936,38 @@ async function applyParsedStateFile(raw, client) {
   return "loaded"
 }
 
+// After applyParsedStateFile loads goals into goalStates, check the ledger for
+// terminal events. If a goal has a "completed" or "cleared" entry in the ledger
+// but still appears active in the state file (because the state write failed
+// after the terminal ledger write), remove it so it is not re-driven.
+async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
+  const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath)
+  if (!entries.length) return
+
+  const terminalGoalIds = new Set()
+  for (const entry of entries) {
+    if (LEDGER_TERMINAL_TYPES.has(entry.type) && typeof entry.goalId === "string" && entry.goalId) {
+      terminalGoalIds.add(entry.goalId)
+    }
+  }
+  if (!terminalGoalIds.size) return
+
+  let removed = 0
+  for (const [sessionID, goal] of goalStates.entries()) {
+    if (terminalGoalIds.has(goal.goalId)) {
+      removeSessionGoal(sessionID, goal.goalId)
+      goalStates.delete(sessionID)
+      removed++
+    }
+  }
+  if (removed > 0) {
+    await logPluginError(
+      client,
+      `Ledger cross-check: removed ${removed} goal(s) whose terminal state was recorded in the ledger but not yet reflected in the state file (likely a failed terminal persist).`,
+    )
+  }
+}
+
 async function loadPersistedState(persistenceOptions, client) {
   if (!persistenceOptions.persistState) return "disabled"
 
@@ -966,7 +998,15 @@ async function loadPersistedState(persistenceOptions, client) {
       continue
     }
 
-    if (status === "loaded") return primary ? "loaded" : "migrated"
+    if (status === "loaded") {
+      // Cross-check: the ledger is written before the state file for terminal
+      // events (completed, cleared). If the terminal persist succeeded in the
+      // ledger but the state file write failed (e.g. process killed between the
+      // two writes), the reloaded state may still have the goal as active. Remove
+      // any loaded active goals whose goalId has a terminal ledger entry.
+      await reconcileLoadedStateWithLedger(persistenceOptions, client)
+      return primary ? "loaded" : "migrated"
+    }
     // status === "invalid": preserve a present-but-corrupt primary; for a
     // fallback, keep trying the next candidate.
     if (primary) return "invalid"
