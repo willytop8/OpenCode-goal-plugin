@@ -117,7 +117,9 @@ const GOAL_FLAG_SPECS = {
 // shapes count as tool-using turns too). A continuation turn with none of these
 // is "talk only" — a signal of a self-chat loop the auto-continue should not
 // keep feeding.
-const TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask"])
+// Covers both normalized OpenCode types and raw provider-specific part types
+// (some adapters forward the provider's original shape without normalizing).
+const TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask", "tool_use", "function_call", "tool-call"])
 
 function messageHasToolCall(message) {
   const parts = Array.isArray(message?.parts) ? message.parts : []
@@ -1404,7 +1406,12 @@ function buildCompactionContext(goal) {
   // this, a compaction can drop the goal objective and budget state from the
   // working context, so the assistant loses the thread mid-run even though the
   // plugin still re-injects via system.transform afterward.
-  const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000)
+  // Use goal.lastContinueAt (set on each persist cycle) rather than Date.now()
+  // so buildCompactionContext is deterministic. If OpenCode calls the compacting
+  // hook more than once, each invocation produces the same elapsedSeconds and
+  // therefore the same string — preserving the prefix cache from this point on.
+  const snapshotAt = goal.lastContinueAt || goal.startedAt || 0
+  const elapsedSeconds = Math.round((snapshotAt - goal.startedAt) / 1000)
   return [
     "An OpenCode goal is active for this session. Preserve it across compaction.",
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
@@ -2686,7 +2693,18 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
                 verdict = { approved: false, reason: "auditor error" }
               }
               const auditedGoal = activeGoal(sessionID, goalID)
-              if (!auditedGoal) return
+              if (!auditedGoal) {
+                // The goal was cleared or replaced while the auditor was running.
+                // If the verdict was approved, surface the loss so the user knows
+                // the completion was verified but not recorded — they can re-engage.
+                if (verdict && verdict.approved === true) {
+                  await announceAudit(
+                    sessionID,
+                    "Audit result: completion was approved but the goal was modified while the audit ran — completion not recorded.",
+                  )
+                }
+                return
+              }
               if (!verdict || verdict.approved !== true) {
                 const reason = (verdict && verdict.reason) || "completion not substantiated"
                 auditedGoal.stopped = true
@@ -2816,6 +2834,15 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             activeGoalAfterMessages.noProgressTurns >=
             activeGoalAfterMessages.options.noProgressTurnsBeforePause
           ) {
+            // Accumulate format-validation failures even when the stall gate fires
+            // first and returns early, so the formatFailures cap remains reachable
+            // for low-output unverified completions. Without this, a model that
+            // repeatedly emits bare [goal:complete] with low output tokens causes
+            // the stall gate to fire before formatFailures can accumulate, and
+            // /goal resume resets it to zero, making the cap permanently unreachable.
+            if (completionUnverified || blockerUnstated) {
+              activeGoalAfterMessages.formatFailures += 1
+            }
             activeGoalAfterMessages.stopped = true
             activeGoalAfterMessages.stopReason = "no progress"
             activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${latestOutputTokens} output token(s). Run /${commandName} resume to continue.`
@@ -2844,9 +2871,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // configured grace window. Complements the low-output check above:
         // a turn can be high-output yet still make no real progress because it
         // never touched a tool.
+        // Guard on !lowOutputLooksStalled: if the noProgress gate already fired
+        // for this turn, the noToolCall counter must NOT also increment. Without
+        // this guard, the effective grace window is min(noProgress, noToolCall)
+        // rather than two independent limits — the user's higher noProgress
+        // threshold gets silently overridden by the lower noToolCall threshold.
         const noToolCallContinuation =
           activeGoalAfterMessages.turnCount > 0 && Boolean(latestAssistant) && !latestHasToolCall
-        if (noToolCallContinuation) {
+        if (noToolCallContinuation && !lowOutputLooksStalled) {
           activeGoalAfterMessages.noToolCallTurns += 1
           if (
             activeGoalAfterMessages.noToolCallTurns >=
@@ -2891,6 +2923,11 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           activeGoalBeforePrompt.stopped = true
           activeGoalBeforePrompt.stopReason = "budget wrap-up requested"
           activeGoalBeforePrompt.lastStatus = "Budget threshold reached; requested final handoff."
+          // Persist before sending the wrapup prompt so that a crash during
+          // promptAsync doesn't cause a duplicate wrapup on resume. This mirrors
+          // the hard-limit path which also persists before its promptAsync call.
+          pushHistory(activeGoalBeforePrompt, "budget-wrapup", "Budget threshold reached; sending final handoff prompt.")
+          await persist()
         }
 
         activeGoalBeforePrompt.turnCount += 1

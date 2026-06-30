@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.4.6 — 2026-06-29
+
+### Bug fixes (counters, compaction, and auditor)
+
+- **`noToolCallTurns` is now independent of `noProgressTurns`.** On a turn that qualifies for the noProgress stall gate (low output, no tool call, stalled text), the noToolCall counter no longer also increments. Without this guard, the effective grace window was `min(noProgress, noToolCall)` rather than two independent limits — a configured higher `noProgressTurnsBeforePause` threshold was silently overridden by the lower `noToolCallTurnsBeforePause`.
+- **`formatFailures` is now incremented when the stall gate fires and returns early.** Stall detection previously returned before the format-failure accumulator could run. A model that repeatedly emitted bare `[goal:complete]` with low output triggered the stall gate rather than accumulating toward the `maxPromptFailures` cap; the cap was permanently unreachable because `/goal resume` reset `formatFailures` to zero each time. The counter now increments inside the stall-gate early-return path when `completionUnverified` or `blockerUnstated` is true.
+- **Budget-wrapup state is persisted before the wrapup prompt is sent.** Previously `budgetWrapupSent = true` and `stopped = true` were set in memory but not persisted before `promptAsync`. A crash during the prompt would result in `budgetWrapupSent: false` in the state file and a duplicate wrapup on the next resume cycle. The fix adds `pushHistory("budget-wrapup")` + `persist()` before the prompt call, mirroring the hard-limit path.
+- **`TOOL_PART_TYPES` now covers raw provider part type names.** Some OpenCode adapters forward the provider's original message part shape without normalizing to `"tool"`. Added `"tool_use"`, `"function_call"`, and `"tool-call"` to the set so `messageHasToolCall` (and both stall gates) correctly recognize tool-using turns from non-normalized adapters.
+- **Approved completion that is lost while the auditor is in flight now produces an announcement.** If the goal is cleared or replaced while a completion auditor runs, and the auditor returns `approved: true`, the plugin now announces "completion was approved but the goal was modified while the audit ran — completion not recorded." Previously the approved result was silently discarded with no visible trace.
+- **`buildCompactionContext` is now deterministic.** The function previously called `Date.now()` to compute elapsed seconds, so two calls during the same compaction event produced different strings, busting the prefix cache from that byte position. The elapsed time is now derived from `goal.lastContinueAt` (set during each persist cycle), making the output stable and matching the function's own claim of being "reconstructed deterministically from the plugin's persisted goal record."
+
 ## 0.4.5 — 2026-06-29
 
 ### Bug fixes (input validation + counter correctness)
