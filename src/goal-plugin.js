@@ -1230,6 +1230,17 @@ const STRUCTURAL_TAGS = [
   "next_step",
   "completion_audit",
   "evidence_required",
+  // Role-like names that model providers treat as elevated context (second-order
+  // injection: a goal could guide the model to emit these in output captured by
+  // recordCheckpoint, then re-injected via compaction or buildGoalBlock).
+  "system",
+  "instructions",
+  "human",
+  "assistant",
+  "anthropic",
+  "claude",
+  "context",
+  "prompt",
 ]
 const STRUCTURAL_OPEN_TAG_RE = new RegExp(`<(${STRUCTURAL_TAGS.join("|")})\\b`, "gi")
 
@@ -1729,8 +1740,10 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
 
     if (typeof args.objective === "string" && args.objective.trim()) {
       goal.condition = args.objective.trim()
-      goal.stopped = false
-      goal.stopReason = ""
+      // Deliberately NOT clearing goal.stopped or goal.stopReason: updating the
+      // objective does not un-stop a goal. Use status='resumed' to explicitly
+      // restart a stopped goal; silently un-stopping would resurrect audit-rejected
+      // or user-paused goals without the user's knowledge.
       goal.blockedReason = ""
       goal.budgetWrapupSent = false
       goal.noProgressTurns = 0
@@ -1782,11 +1795,14 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
         return "Goal marked complete and archived."
       }
       if (status === "blocked") {
-        goal.blockedReason = typeof args.blocker === "string" ? args.blocker.trim() : ""
+        const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : ""
+        if (!blockerText)
+          return "status 'blocked' requires a non-empty 'blocker' argument describing what is needed."
+        goal.blockedReason = blockerText
         goal.stopped = true
         goal.stopReason = "blocked"
         goal.lastStatus = "Assistant reported blocked."
-        pushHistory(goal, "blocked", goal.blockedReason || "Marked blocked via agent tool.")
+        pushHistory(goal, "blocked", goal.blockedReason)
         messages.push("Goal marked blocked.")
       } else if (status === "paused") {
         goal.stopped = true
@@ -1821,11 +1837,14 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, completionAuditor
   }
 
   async function clearGoal(sessionID) {
-    // Mirror `/goal clear`: drop the ordered flag and the focused goal + result.
+    // Mirror `/goal clear`: drop the ordered flag, ALL backgrounded goals, and the
+    // focused goal + result. Without sessionGoals.delete, background goals added via
+    // `/goal add` survive clear and resurrect as the focused goal on restart.
     // Record the clear in the ledger before cleanupGoal removes the goal object.
     const goalBeforeClear = goalStates.get(sessionID)
     if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "Cleared via agent tool.")
     sessionOrdered.delete(sessionID)
+    sessionGoals.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
     await persist()
@@ -2180,9 +2199,13 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         // Record the clear in the ledger before cleanupGoal removes the goal
         // object, so reconstructFromLedger can identify cleared goals and skip
         // them rather than reconstructing them after a missing state file.
+        // sessionGoals.delete clears ALL backgrounded goals so they do not
+        // resurrect as the focused goal on restart (cleanupGoal only removes the
+        // focused one; background goals from `/goal add` would survive otherwise).
         const goalBeforeClear = goalStates.get(sessionID)
         if (goalBeforeClear) pushHistory(goalBeforeClear, "cleared", "User cleared the goal.")
         sessionOrdered.delete(sessionID)
+        sessionGoals.delete(sessionID)
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
         await persist()
@@ -2843,7 +2866,14 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
             activeGoalBeforePrompt.formatFailures += 1
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
           } else {
-            activeGoalBeforePrompt.formatFailures = 0
+            // Decrement rather than reset: an alternating bad/good/bad pattern
+            // should not indefinitely bypass the consecutive-failure cap. A model
+            // that produces one clean turn for every violation keeps formatFailures
+            // pinned near 1, which still accumulates toward the cap over time.
+            activeGoalBeforePrompt.formatFailures = Math.max(
+              0,
+              activeGoalBeforePrompt.formatFailures - 1,
+            )
             activeGoalBeforePrompt.lastStatus = latestText
               ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.`
               : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`

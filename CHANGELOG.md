@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.4.4 — 2026-06-29
+
+### Bug fixes (state machine + injection prevention)
+
+- **`escapeGoalText` now neutralizes role-like tag openings.** The previous `STRUCTURAL_TAGS` set only covered plugin-defined tags. Tags like `<system>`, `<assistant>`, `<human>`, `<anthropic>`, `<claude>`, `<context>`, `<instructions>`, and `<prompt>` could survive unescaped in compacted system messages, creating second-order injection opportunities where model output captured by `recordCheckpoint` re-appeared as an elevated-privilege block after compaction.
+- **`update_goal` objective update no longer un-stops a stopped goal.** Calling `update_goal({objective: "…"})` previously cleared `goal.stopped` and `goal.stopReason`, silently resurrecting a goal that was audit-rejected, user-paused, or blocked for any reason. Objective updates now preserve the stopped state; only an explicit `status: "resumed"` call resets it.
+- **`/goal clear` and agent `clearGoal` now delete all backgrounded goals.** Previously only the focused goal was removed from the session registry (`cleanupGoal` → `removeSessionGoal`). Background goals added via `/goal add` remained alive and would promote themselves to focused on restart. Both clear paths now call `sessionGoals.delete(sessionID)` first, wiping the entire per-session goal map.
+- **`formatFailures` decrements by 1 on a clean turn instead of resetting to 0.** A reset-to-zero on every non-violation turn allowed an alternating bad/good/bad pattern to bypass the consecutive-failure cap indefinitely. Decrementing by 1 means repeated violations accumulate toward the cap even when interspersed with good turns.
+- **`update_goal {status: "blocked"}` requires a non-empty `blocker` argument.** The event-handler path already rejects a `[goal:blocked]` marker with no concrete blocker, but the agent tool path accepted an empty `blocker` (recording an empty `blockedReason`). The agent tool now returns an error when `blocker` is missing or whitespace-only, consistent with the auto-continue guard.
+
 ## 0.4.3 — 2026-06-29
 
 ### Bug fixes (concurrency + persistence)
