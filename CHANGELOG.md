@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix `/goal <command> extra words` from silently creating goals. `status`, `history`, `resume`, `pause`, and all clear aliases are now first-word-validated — extra arguments produce a helpful error with a corrective hint instead of falling through to goal creation. (QA#021)
+- Add 31 comprehensive edge-case tests to the QA audit suite covering: all clear aliases, flag rejection (negative, zero, float, non-numeric), XML escaping, long goal text, newlines, goal overwrite behavior, flags-only rejection, command-like goal text, unicode/emoji, `persistState: false` in-memory-only behavior, double-resume no-op, pause-then-clear, duplicate checkpoint deduplication, single-dash flags, and command-disambiguation errors.
+
 ## 0.1.13 — 2026-06-11
 
 > Fixes a significant token-tracking bug where the reported token count could be 5–10× higher than what OpenCode displays, making budgets appear exhausted far sooner than expected.

@@ -905,6 +905,32 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       const sessionID = input.sessionID
       pruneGoalResults(defaultGoalOptions)
 
+      // Disambiguate commands from goal text: if the first word is a known
+      // command but there are extra words after it, reject with a hint.
+      const firstWord = args.split(/\s+/, 1)[0]
+      const KNOWN_COMMAND_WORDS = new Set([
+        "status",
+        "history",
+        "resume",
+        ...PAUSE_COMMANDS,
+        ...CLEAR_COMMANDS,
+      ])
+      if (KNOWN_COMMAND_WORDS.has(firstWord) && args !== firstWord) {
+        output.parts = [
+          makeTextPart(
+            [
+              `Unknown /goal command: "${args}".`,
+              "",
+              `"${firstWord}" is a /goal command that does not accept additional arguments.`,
+              `Did you mean "/goal ${firstWord}"?`,
+              "",
+              `To set a goal with this text, quote it: /goal "${args}"`,
+            ].join("\n"),
+          ),
+        ]
+        return
+      }
+
       if (!args || args === "status") {
         const goal = goalStates.get(sessionID)
         const lastResult = lastGoalResults.get(sessionID)
