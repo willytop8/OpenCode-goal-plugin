@@ -1,6 +1,24 @@
 # opencode-goal-plugin
 
-An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/).
+> Give your AI coding agent persistent objectives — just like Claude Code and Codex, but for OpenCode.
+
+[![npm version](https://img.shields.io/npm/v/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
+[![npm downloads](https://img.shields.io/npm/dm/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/) — give your agent a persistent objective, let it work autonomously across turns, and get notified when it's done (or blocked).
+
+![Demo: setting a goal and watching the agent work autonomously](demo.gif)
+
+## Why This Exists
+
+Claude Code and Codex both have native `/goal` functionality — but OpenCode didn't. I built this plugin to give OpenCode users the same autonomous-agent workflow: set a goal, walk away, come back to completed work.
+
+It's used by developers running multi-turn agent sessions who want their AI to stay on task without babysitting the terminal. If you've ever wished you could tell your coding agent "fix the test suite" and come back when it's done, this is for you.
+
+---
+
+## How It Works
 
 Set a goal and the plugin keeps it in context, auto-continues the session whenever the assistant goes idle, and stops when the goal is marked complete, a blocker is reported, or a safety limit is reached.
 
@@ -235,6 +253,10 @@ npm run smoke           # verify package export + command hook without a model c
 npm run check           # syntax check + tests
 npm run pack:check      # verify package contents before publishing
 ```
+
+## Credits
+
+Built by [William Ricchiuti](https://william-ricchiuti.com).
 
 ## License
 
