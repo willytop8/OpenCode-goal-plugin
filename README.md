@@ -140,6 +140,29 @@ A session can hold more than one goal. `/goal <condition>` replaces the focused 
 
 The first goal is focused and the rest are queued. `/goal list` marks the session as ordered. Auto-promotion stops when the sequence is exhausted; `/goal clear` ends the sequence.
 
+## Examples
+
+Copy-pasteable goals for common workflows:
+
+```
+/goal "fix the failing tests" --max-turns 10
+/goal "refactor auth to use new API" --max-minutes 30
+/goal "audit for security issues" --max-turns 3
+/goal "migrate class components to functional" --max-minutes 60 --max-tokens 400000
+```
+
+With success criteria, constraints, and a token budget shorthand:
+
+```
+/goal "ship the release" --success "tests pass and changelog updated" --constraints "do not touch the public API" --budget 150k
+```
+
+An ordered sequence, run as a strict pipeline:
+
+```
+/goal sisyphus build the parser; write the tests; ship the release
+```
+
 ## How it works
 
 1. When you set a goal, the plugin stores it in session memory and injects it into the system prompt so the assistant keeps it in view on every turn.
