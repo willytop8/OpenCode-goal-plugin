@@ -2109,11 +2109,19 @@ function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120_00
   }
 }
 
-export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
+export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {}) => {
   const defaultGoalOptions = normalizeOptions(pluginOptions)
+  // OpenCode's PluginInput carries the active session's project directory
+  // separately from the Node process's own process.cwd(), which — when
+  // OpenCode runs as a persistent server/daemon serving multiple
+  // projects/sessions — does NOT track the session's directory. Falling back
+  // to process.cwd() here would silently resolve the project-local state
+  // path against wherever the server happened to boot, not the project the
+  // user is actually working in. An explicit `cwd` plugin option (mainly for
+  // tests) still takes precedence.
   const persistenceOptions = normalizePersistenceOptions(pluginOptions, {
     env: pluginOptions.env,
-    cwd: pluginOptions.cwd,
+    cwd: pluginOptions.cwd || directory,
   })
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
   // Serialize all persist() calls through a promise chain so concurrent callers
@@ -2531,6 +2539,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       // goal and add another. Clear any ordered-sequence flag so the new
       // standalone goal does not trigger sisyphus auto-promotion of old sequence
       // goals that may still be in the registry (matches the agent setGoal path).
+      const replacedGoal = goalStates.get(sessionID)
       sessionOrdered.delete(sessionID)
       cleanupGoal(sessionID)
       lastGoalResults.delete(sessionID)
@@ -2540,6 +2549,13 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       output.parts = [
         makeTextPart(
           [
+            ...(replacedGoal
+              ? [
+                  `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
+                  `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
+                  "",
+                ]
+              : []),
             `New active goal: ${goal.condition}`,
             goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
             goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,

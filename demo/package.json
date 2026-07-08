@@ -1,0 +1,10 @@
+{
+  "name": "opencode-goal-plugin-demo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Minimal reproducible demo: a failing test and a /goal that fixes it autonomously.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

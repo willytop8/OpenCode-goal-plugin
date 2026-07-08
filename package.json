@@ -4,14 +4,19 @@
   "description": "Session-scoped /goal workflow for OpenCode.",
   "type": "module",
   "main": "./src/goal-plugin.js",
+  "types": "./index.d.ts",
   "exports": {
     ".": "./src/goal-plugin.js",
     "./server": "./src/goal-plugin.js"
+  },
+  "bin": {
+    "opencode-goal-plugin": "./scripts/verify.mjs"
   },
   "files": [
     "src",
     "scripts",
     "examples",
+    "index.d.ts",
     "README.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
@@ -20,9 +25,10 @@
     ".nvmrc"
   ],
   "scripts": {
-    "test": "node --test",
-    "test:coverage": "node --test --experimental-test-coverage",
+    "test": "node --test test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
     "smoke": "node scripts/smoke-command-hook.mjs",
+    "verify": "node scripts/verify.mjs",
     "check": "node -c src/goal-plugin.js && npm test",
     "pack:check": "npm pack --dry-run"
   },

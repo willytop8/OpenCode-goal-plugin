@@ -1,19 +1,56 @@
 # opencode-goal-plugin
 
+[![npm version](https://img.shields.io/npm/v/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
+[![npm downloads](https://img.shields.io/npm/dm/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
+[![CI](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](test/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/).
 
 Set a goal and the plugin keeps it in context, auto-continues the session whenever the assistant goes idle, and stops when the goal is marked complete, a blocker is reported, or a safety limit is reached.
 
 Compatibility: this plugin relies on experimental OpenCode hooks. Re-test against the exact OpenCode build and provider/backend stack you plan to use for unattended work.
 
+## Comparison
+
+| Feature | Claude Code | Codex | opencode-goal-plugin |
+|---|---|---|---|
+| `/goal` command | ✅ Native | ✅ Native | ✅ Plugin |
+| Auto-continue | ✅ | ✅ | ✅ |
+| Per-goal flag overrides | ❌ | ❌ | ✅ |
+| No-progress / no-tool-call detection | ❌ | ❌ | ✅ Both |
+| Configurable safety limits | Limited | Limited | ✅ All tunable |
+| Goal history | ✅ | ❌ | ✅ `/goal history` |
+| Goal persistence | ❌ | ❌ | ✅ Survives restart, ledger-backed |
+| Multiple concurrent goals | ❌ | ❌ | ✅ `/goal add` / `/goal focus` |
+| Ordered goal sequences | ❌ | ❌ | ✅ `/goal sisyphus` |
+| Evidence-gated completion | ❌ | ❌ | ✅ `[goal:evidence]` required |
+| Independent completion audit | ✅ | ❌ | ✅ Optional child-session auditor |
+| Budget wrap-up prompts | ❌ | ❌ | ✅ 80% threshold |
+| Open source | ❌ | ❌ | ✅ MIT |
+
 ## Compatibility snapshot
 
 | Surface | Status |
 |---|---|
-| Node.js | Declared support: `>=18`; CI covers Node 18, 20, and 22 |
+| Node.js | Declared support: `>=18`; CI covers Node 18, 20, 22, and 24 |
 | Package entrypoint | `npm run smoke` verifies the package export path plus `/goal` command-hook behavior from a local install without invoking a model |
-| OpenCode host | Manually smoke-tested against OpenCode 1.15.10 using the `opencode-go` provider (`qwen3.7-plus`) on this repo's local hardening branch; re-test your own version/provider stack before relying on unattended runs |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
+
+### OpenCode version compatibility
+
+Manually tested via the OpenCode TUI (`tmux` + real provider credentials, no mocks), verified against the plugin's own persisted state rather than terminal display alone:
+
+| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Hook Output Display |
+|---|---|---|---|---|---|
+| 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
+| 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
+| 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
+
+`/goal status` and auto-continue are graded on **state correctness** (verified directly against the plugin's persisted state file: correct limits parsed, correct turn/stop accounting, correct completion detection) — not on what's rendered in the terminal, since that's tracked separately as Hook Output Display.
+
+**Note:** Hook output display depends on OpenCode version — on 1.17.15, `command.execute.before`'s `output.parts` text is not rendered in the TUI for any provider tested; the raw command argument is instead routed to the model as a normal chat turn (see [Limitations](#limitations)). State mutations always work regardless of display: goal creation, flag parsing, auto-continue, limit enforcement, and evidence-gated completion detection were all verified correct via the persisted state file in every combination above. Re-test against your own OpenCode build before relying on unattended runs, and see [`docs/providers.md`](docs/providers.md) for the full per-model marker-compliance notes.
 
 ## Install
 
@@ -121,6 +158,29 @@ A session can hold more than one goal. `/goal <condition>` replaces the focused 
 ```
 
 The first goal is focused and the rest are queued. `/goal list` marks the session as ordered. Auto-promotion stops when the sequence is exhausted; `/goal clear` ends the sequence.
+
+## Examples
+
+Copy-pasteable goals for common workflows:
+
+```
+/goal "fix the failing tests" --max-turns 10
+/goal "refactor auth to use new API" --max-minutes 30
+/goal "audit for security issues" --max-turns 3
+/goal "migrate class components to functional" --max-minutes 60 --max-tokens 400000
+```
+
+With success criteria, constraints, and a token budget shorthand:
+
+```
+/goal "ship the release" --success "tests pass and changelog updated" --constraints "do not touch the public API" --budget 150k
+```
+
+An ordered sequence, run as a strict pipeline:
+
+```
+/goal sisyphus build the parser; write the tests; ship the release
+```
 
 ## How it works
 

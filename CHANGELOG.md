@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Replace the single-line "Compatibility snapshot" in the README with an OpenCode version compatibility table, manually verified via `tmux` + the OpenCode TUI against the persisted state file for each provider/model combination.
+- Add `docs/providers.md`, a provider/model compatibility guide covering evidence-gated marker-compliance behavior for `opencode-go/qwen3.7-plus`, `opencode-go/glm-5.2`, and `deepseek/deepseek-chat` (manually verified via the OpenCode TUI against real provider credentials on OpenCode 1.17.15), plus a step-by-step guide for testing new models.
+- Add a reproducible `demo/` directory: a minimal Node project with a deliberately buggy `add()` function, a test that catches it, and an `opencode.json` wired to the local plugin source. Verified end-to-end via the OpenCode TUI.
+- Scope `npm test`/`npm run test:coverage` to `test/*.test.js` explicitly, since Node's test runner otherwise recursively discovers `demo/test/*.test.js` too, which would fail the root suite whenever the demo's deliberate bug is (correctly) unfixed.
+- **Fix project-local state persistence to actually use the active session's directory.** `GoalPlugin` previously ignored the `directory` field OpenCode passes in its `PluginInput`, so the default `.opencode/goals/state.json` path resolved against the Node process's own `process.cwd()` instead. This works fine for a one-shot CLI invocation, but silently breaks when OpenCode runs as a persistent server/daemon serving multiple projects: `process.cwd()` stays wherever the server booted, not the active session's project. Confirmed live via the OpenCode TUI — a goal set in a project directory never persisted to disk at all. `GoalPlugin` now reads `directory` from its `PluginInput` and uses it as the default `cwd` for state-path resolution (an explicit `cwd` plugin option, mainly for tests, still takes precedence).
+- Add Node 24 to the CI matrix, a weekly scheduled CI run (Mondays 08:00 UTC) to catch upstream drift, a `test:coverage` step, and npm/CI/tests/license badges to the README.
+- Add GitHub issue templates for bug reports (OpenCode version, provider/model, Node version, relevant plugin options, repro steps) and feature requests (problem solved, scope fit against the current multi-goal/audit feature set).
+- Add an Examples section to the README with copy-pasteable `/goal` commands: common workflows, success criteria/constraints/budget shorthand, and an ordered (sisyphus) sequence.
+- Add a Comparison section to the README benchmarking `/goal` support, auto-continue, per-goal overrides, no-progress/no-tool-call detection, safety limits, history, persistence, multi-goal/sisyphus sequences, evidence-gated completion, the optional completion auditor, budget wrap-up, and license against Claude Code and Codex.
+- Add `npm run verify` / `npx opencode-goal-plugin` installation verification command (`scripts/verify.mjs`). Checks Node >= 18, the plugin module shape, that all 4 hooks (`command.execute.before`, `event`, `experimental.chat.system.transform`, `experimental.compaction.autocontinue`) register, and that `/goal status`/`/goal set` work — entirely via mock clients, with zero model calls.
+- Add TypeScript declarations (`index.d.ts`) covering the full current `GoalPluginOptions` surface — budgets, persistence/ledger paths, `commandName`/`registerCommand`/`registerTools`, and the completion-audit options (`completionAudit`, `auditor`, `auditorOptions`, `auditMessages`, `auditMessenger`) — plus the plugin's hook map and default export. `package.json`'s `types` field points at it.
+- Warn when `/goal <condition>` replaces the focused goal instead of silently discarding it. The response now leads with `⚠️ Replacing active goal: "<old condition>"` and points at `/goal add <condition>` as the non-destructive alternative that backgrounds the current goal instead.
+
 ## 0.4.7 — 2026-06-29
 
 ### Bug fixes (low-severity cleanups)
