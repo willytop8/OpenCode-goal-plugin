@@ -16,6 +16,20 @@ Claude Code and Codex both have native `/goal` functionality — but OpenCode di
 
 It's used by developers running multi-turn agent sessions who want their AI to stay on task without babysitting the terminal. If you've ever wished you could tell your coding agent "fix the test suite" and come back when it's done, this is for you.
 
+## Comparison
+
+| Feature | Claude Code | Codex | opencode-goal-plugin |
+|---|---|---|---|
+| `/goal` command | ✅ Native | ✅ Native | ✅ Plugin |
+| Auto-continue | ✅ | ✅ | ✅ |
+| Per-goal flag overrides | ❌ | ❌ | ✅ |
+| No-progress detection | ❌ | ❌ | ✅ |
+| Configurable safety limits | Limited | Limited | ✅ All tunable |
+| Goal history | ✅ | ❌ | ✅ `/goal history` |
+| Goal persistence | ❌ | ❌ | ✅ Survives restart |
+| Budget wrap-up prompts | ❌ | ❌ | ✅ 80% threshold |
+| Open source | ❌ | ❌ | ✅ MIT |
+
 ---
 
 ## How It Works
