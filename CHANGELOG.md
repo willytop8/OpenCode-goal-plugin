@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `npm run verify` / `npx opencode-goal-plugin` installation verification command (`scripts/verify.mjs`). Checks Node >= 18, the plugin module shape, that all 3 hooks register, and that `/goal status`/`/goal set` work — entirely via mock clients, with zero model calls.
 - Add TypeScript declarations (`index.d.ts`) covering `GoalPluginOptions`, the plugin hook map, and the module's default export. `package.json` now points `types` at it.
 - Warn when setting a new goal replaces an active one instead of silently overwriting it. `/goal <text>` now prefixes its response with `⚠️ Replacing active goal: "<old condition>"` when a goal is already active. (QA#015)
 - Fix `/goal <command> extra words` from silently creating goals. `status`, `history`, `resume`, `pause`, and all clear aliases are now first-word-validated — extra arguments produce a helpful error with a corrective hint instead of falling through to goal creation. (QA#021)
