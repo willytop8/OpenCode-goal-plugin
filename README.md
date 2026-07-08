@@ -6,6 +6,24 @@ Set a goal and the plugin keeps it in context, auto-continues the session whenev
 
 Compatibility: this plugin relies on experimental OpenCode hooks. Re-test against the exact OpenCode build and provider/backend stack you plan to use for unattended work.
 
+## Comparison
+
+| Feature | Claude Code | Codex | opencode-goal-plugin |
+|---|---|---|---|
+| `/goal` command | ✅ Native | ✅ Native | ✅ Plugin |
+| Auto-continue | ✅ | ✅ | ✅ |
+| Per-goal flag overrides | ❌ | ❌ | ✅ |
+| No-progress / no-tool-call detection | ❌ | ❌ | ✅ Both |
+| Configurable safety limits | Limited | Limited | ✅ All tunable |
+| Goal history | ✅ | ❌ | ✅ `/goal history` |
+| Goal persistence | ❌ | ❌ | ✅ Survives restart, ledger-backed |
+| Multiple concurrent goals | ❌ | ❌ | ✅ `/goal add` / `/goal focus` |
+| Ordered goal sequences | ❌ | ❌ | ✅ `/goal sisyphus` |
+| Evidence-gated completion | ❌ | ❌ | ✅ `[goal:evidence]` required |
+| Independent completion audit | ✅ | ❌ | ✅ Optional child-session auditor |
+| Budget wrap-up prompts | ❌ | ❌ | ✅ 80% threshold |
+| Open source | ❌ | ❌ | ✅ MIT |
+
 ## Compatibility snapshot
 
 | Surface | Status |
