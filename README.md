@@ -44,10 +44,23 @@ Compatibility: this plugin relies on experimental OpenCode hooks. Re-test agains
 
 | Surface | Status |
 |---|---|
-| Node.js | Declared support: `>=18`; CI covers Node 18, 20, and 22 |
+| Node.js | Declared support: `>=18`; CI covers Node 18, 20, 22, and 24 |
 | Package entrypoint | `npm run smoke` verifies the package export path plus `/goal` command-hook behavior from a local install without invoking a model |
-| OpenCode host | Manually smoke-tested against OpenCode 1.15.10 using the `opencode-go` provider (`qwen3.7-plus`) on this repo's local hardening branch; re-test your own version/provider stack before relying on unattended runs |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
+
+### OpenCode version compatibility
+
+Manually tested via the OpenCode TUI (`tmux` + real provider credentials, no mocks):
+
+| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Markers | Hook Output Display |
+|---|---|---|---|---|---|
+| 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Clean, bare `goal:complete` on its own line | ⚠️ Not displayed |
+| 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ⚠️ Sometimes trailed extra text after the marker; safety limits (`--max-turns`) still stopped the goal | ⚠️ Not displayed |
+| 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean, bare `goal:complete` on its own line | ⚠️ Not displayed |
+
+`/goal status` and auto-continue are graded on **state correctness** (verified directly against the plugin's persisted `state.json`: correct limits parsed, correct turn/stop accounting, correct completion detection) — not on what's rendered in the terminal, since that's tracked separately as Hook Output Display.
+
+**Note:** Hook output display depends on OpenCode version — on 1.17.15, `command.execute.before`'s `output.parts` text is not rendered in the TUI for any provider tested; the raw command argument is instead routed to the model as a normal chat turn (see [Limitations](#limitations)). State mutations always work regardless of display: goal creation, flag parsing, auto-continue, limit enforcement, and completion detection were all verified correct via `state.json` in every combination above. Re-test against your own OpenCode build before relying on unattended runs, and see [`docs/providers.md`](docs/providers.md) for the full per-model marker-compliance notes.
 
 ## Install
 
