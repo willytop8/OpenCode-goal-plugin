@@ -34,10 +34,23 @@ Compatibility: this plugin relies on experimental OpenCode hooks. Re-test agains
 
 | Surface | Status |
 |---|---|
-| Node.js | Declared support: `>=18`; CI covers Node 18, 20, and 22 |
+| Node.js | Declared support: `>=18`; CI covers Node 18, 20, 22, and 24 |
 | Package entrypoint | `npm run smoke` verifies the package export path plus `/goal` command-hook behavior from a local install without invoking a model |
-| OpenCode host | Manually smoke-tested against OpenCode 1.15.10 using the `opencode-go` provider (`qwen3.7-plus`) on this repo's local hardening branch; re-test your own version/provider stack before relying on unattended runs |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
+
+### OpenCode version compatibility
+
+Manually tested via the OpenCode TUI (`tmux` + real provider credentials, no mocks), verified against the plugin's own persisted state rather than terminal display alone:
+
+| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Hook Output Display |
+|---|---|---|---|---|---|
+| 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
+| 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
+| 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
+
+`/goal status` and auto-continue are graded on **state correctness** (verified directly against the plugin's persisted state file: correct limits parsed, correct turn/stop accounting, correct completion detection) — not on what's rendered in the terminal, since that's tracked separately as Hook Output Display.
+
+**Note:** Hook output display depends on OpenCode version — on 1.17.15, `command.execute.before`'s `output.parts` text is not rendered in the TUI for any provider tested; the raw command argument is instead routed to the model as a normal chat turn (see [Limitations](#limitations)). State mutations always work regardless of display: goal creation, flag parsing, auto-continue, limit enforcement, and evidence-gated completion detection were all verified correct via the persisted state file in every combination above. Re-test against your own OpenCode build before relying on unattended runs, and see [`docs/providers.md`](docs/providers.md) for the full per-model marker-compliance notes.
 
 ## Install
 
