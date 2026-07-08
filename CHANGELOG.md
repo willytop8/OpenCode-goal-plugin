@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-07-08
+
 - Replace the single-line "Compatibility snapshot" in the README with an OpenCode version compatibility table, manually verified via `tmux` + the OpenCode TUI against the persisted state file for each provider/model combination.
 - Add `docs/providers.md`, a provider/model compatibility guide covering evidence-gated marker-compliance behavior for `opencode-go/qwen3.7-plus`, `opencode-go/glm-5.2`, and `deepseek/deepseek-chat` (manually verified via the OpenCode TUI against real provider credentials on OpenCode 1.17.15), plus a step-by-step guide for testing new models.
 - Add a reproducible `demo/` directory: a minimal Node project with a deliberately buggy `add()` function, a test that catches it, and an `opencode.json` wired to the local plugin source. Verified end-to-end via the OpenCode TUI.
