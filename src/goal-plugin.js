@@ -1059,6 +1059,8 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         `Goal created with limits: ${goal.options.maxTurns} auto-continues, ${Math.round(goal.options.maxDurationMs / 1000)}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
       )
 
+      const existingGoal = goalStates.get(sessionID)
+
       cleanupGoal(sessionID)
       lastGoalResults.delete(sessionID)
       goalStates.set(sessionID, goal)
@@ -1066,6 +1068,9 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       output.parts = [
         makeTextPart(
           [
+            ...(existingGoal
+              ? [`⚠️ Replacing active goal: "${existingGoal.condition}"`, ""]
+              : []),
             `New active goal: ${goal.condition}`,
             "",
             "Start working toward this goal now.",

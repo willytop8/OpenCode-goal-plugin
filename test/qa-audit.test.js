@@ -226,22 +226,23 @@ test("QA-014: goal text with newlines is handled", async () => {
 
 // ── 6. Setting Goal While One Is Active ─────────────────────────────────
 
-test("QA-015: setting a new goal overwrites the existing one (current behavior)", async () => {
+test("QA-015: setting a new goal overwrites the existing one and warns about it", async () => {
   const { hooks } = await createHooks()
-  
+
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "s-overwrite", arguments: "first goal" },
     { parts: [] },
   )
   assert.equal(currentGoal("s-overwrite").condition, "first goal")
-  
+
   const output = { parts: [] }
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "s-overwrite", arguments: "second goal" },
     output,
   )
-  
+
   assert.equal(currentGoal("s-overwrite").condition, "second goal")
+  assert.match(output.parts[0].text, /⚠️ Replacing active goal: "first goal"/)
   assert.match(output.parts[0].text, /New active goal: second goal/)
 })
 
