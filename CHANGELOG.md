@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a reproducible `demo/` directory: a minimal Node project with a deliberately buggy `add()` function, a test that catches it, and an `opencode.json` wired to the local plugin source. Verified end-to-end via the OpenCode TUI — `/goal fix the failing tests in this repo --max-turns 10` autonomously located and fixed the bug and reported `[goal:complete]`.
+- Scope `npm test`/`npm run test:coverage` to `test/*.test.js` explicitly, since Node's test runner otherwise recursively discovers `demo/test/*.test.js` too, which would fail the root suite whenever the demo's deliberate bug is (correctly) unfixed.
 - Replace the single-line "Compatibility snapshot" in the README with an OpenCode version compatibility table, manually verified via `tmux` + the OpenCode TUI against `state.json` for each provider/model combination.
 - Add `docs/providers.md`, a provider/model compatibility guide covering marker-compliance behavior for `opencode-go/qwen3.7-plus`, `opencode-go/glm-5.2`, and `deepseek/deepseek-chat` (manually verified via the OpenCode TUI against real provider credentials on OpenCode 1.17.15), plus a step-by-step guide for testing new models.
 - Add Node 24 to the CI matrix, a weekly scheduled CI run (Mondays 08:00 UTC) to catch upstream drift, a `test:coverage` step, and CI/tests badges to the README.
