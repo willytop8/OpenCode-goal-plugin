@@ -25,8 +25,8 @@
     ".nvmrc"
   ],
   "scripts": {
-    "test": "node --test",
-    "test:coverage": "node --test --experimental-test-coverage",
+    "test": "node --test test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
     "smoke": "node scripts/smoke-command-hook.mjs",
     "verify": "node scripts/verify.mjs",
     "check": "node -c src/goal-plugin.js && npm test",
