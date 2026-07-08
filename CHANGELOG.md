@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `docs/providers.md`, a provider/model compatibility guide covering marker-compliance behavior for `opencode-go/qwen3.7-plus`, `opencode-go/glm-5.2`, and `deepseek/deepseek-chat` (manually verified via the OpenCode TUI against real provider credentials on OpenCode 1.17.15), plus a step-by-step guide for testing new models.
 - Add Node 24 to the CI matrix, a weekly scheduled CI run (Mondays 08:00 UTC) to catch upstream drift, a `test:coverage` step, and CI/tests badges to the README.
 - Add GitHub issue templates for bug reports (OpenCode version, provider/model, Node version, repro steps) and feature requests (problem solved, scope fit).
 - Add an Examples section to the README with copy-pasteable `/goal` commands for common workflows (fixing tests, refactors, audits, migrations).
