@@ -2625,6 +2625,41 @@ test("migrates state from a legacy XDG path to the project-local default", async
   }
 })
 
+test("GoalPlugin resolves project-local state against the host-provided directory, not process.cwd()", async () => {
+  // OpenCode's PluginInput carries `directory` (the active session's project
+  // directory) separately from the Node process's own process.cwd(), which
+  // does not track per-session project directories when OpenCode runs as a
+  // persistent server. Without reading `directory`, state silently resolves
+  // against wherever the server process happened to boot instead of the
+  // project the user is working in.
+  const sessionDir = await mkdtemp(join(tmpdir(), "goal-plugin-session-dir-"))
+  try {
+    assert.notEqual(sessionDir, process.cwd())
+
+    const client = {
+      app: { log: async () => {} },
+      session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+    }
+    // No `cwd` plugin option — only the host-provided `directory` should
+    // determine where state is written.
+    const hooks = await GoalPlugin({ client, directory: sessionDir }, { minDelayMs: 1 })
+    const output = { parts: [] }
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-dir-aware", arguments: "directory-aware persistence" },
+      output,
+    )
+
+    const expectedPath = join(sessionDir, ".opencode", "goals", "state.json")
+    const written = JSON.parse(await readFile(expectedPath, "utf8"))
+    assert.equal(written.goals[0].condition, "directory-aware persistence")
+
+    // Nothing was written under process.cwd()'s .opencode directory.
+    await assert.rejects(stat(join(process.cwd(), ".opencode", "goals", "state.json")))
+  } finally {
+    await rm(sessionDir, { recursive: true, force: true })
+  }
+})
+
 // ── Helper unit tests ──────────────────────────────────────────────────────
 
 test("escapeGoalText escapes all XML closing tags, not just goal_objective", () => {

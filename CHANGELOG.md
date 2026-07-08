@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Fix project-local state persistence to actually use the active session's directory.** `GoalPlugin` previously ignored the `directory` field OpenCode passes in its `PluginInput`, so the default `.opencode/goals/state.json` path resolved against the Node process's own `process.cwd()` instead. This works fine for a one-shot CLI invocation, but silently breaks when OpenCode runs as a persistent server/daemon serving multiple projects: `process.cwd()` stays wherever the server booted, not the active session's project. Confirmed live via the OpenCode TUI — a goal set in a project directory never persisted to disk at all. `GoalPlugin` now reads `directory` from its `PluginInput` and uses it as the default `cwd` for state-path resolution (an explicit `cwd` plugin option, mainly for tests, still takes precedence).
 - Add Node 24 to the CI matrix, a weekly scheduled CI run (Mondays 08:00 UTC) to catch upstream drift, a `test:coverage` step, and npm/CI/tests/license badges to the README.
 - Add GitHub issue templates for bug reports (OpenCode version, provider/model, Node version, relevant plugin options, repro steps) and feature requests (problem solved, scope fit against the current multi-goal/audit feature set).
 - Add an Examples section to the README with copy-pasteable `/goal` commands: common workflows, success criteria/constraints/budget shorthand, and an ordered (sisyphus) sequence.
