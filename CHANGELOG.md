@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add Node 24 to the CI matrix, a weekly scheduled CI run (Mondays 08:00 UTC) to catch upstream drift, a `test:coverage` step, and npm/CI/tests/license badges to the README.
 - Add GitHub issue templates for bug reports (OpenCode version, provider/model, Node version, relevant plugin options, repro steps) and feature requests (problem solved, scope fit against the current multi-goal/audit feature set).
 - Add an Examples section to the README with copy-pasteable `/goal` commands: common workflows, success criteria/constraints/budget shorthand, and an ordered (sisyphus) sequence.
 - Add a Comparison section to the README benchmarking `/goal` support, auto-continue, per-goal overrides, no-progress/no-tool-call detection, safety limits, history, persistence, multi-goal/sisyphus sequences, evidence-gated completion, the optional completion auditor, budget wrap-up, and license against Claude Code and Codex.

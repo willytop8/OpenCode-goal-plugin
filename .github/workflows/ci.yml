@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"
 
 permissions:
   contents: read
@@ -15,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [18, 20, 22, 24]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -27,6 +29,9 @@ jobs:
 
       - name: Run checks
         run: npm run check
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
 
       - name: Run package smoke test
         run: npm run smoke
