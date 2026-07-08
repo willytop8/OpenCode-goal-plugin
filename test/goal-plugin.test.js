@@ -2984,6 +2984,23 @@ async function runGoal(hooks, sessionID, args) {
   return output.parts[0]?.text || ""
 }
 
+test("/goal <condition> replacing a focused goal warns and points at /goal add", async () => {
+  const { hooks } = await createHooks()
+  const sid = "replace-warn-s1"
+
+  const firstText = await runGoal(hooks, sid, "first goal")
+  assert.doesNotMatch(firstText, /Replacing active goal/)
+  assert.equal(currentGoal(sid).condition, "first goal")
+
+  const secondText = await runGoal(hooks, sid, "second goal")
+  assert.match(secondText, /⚠️ Replacing active goal: "first goal"/)
+  assert.match(secondText, /Use `\/goal add <condition>` instead to keep it running in the background\./)
+  assert.match(secondText, /New active goal: second goal/)
+  assert.equal(currentGoal(sid).condition, "second goal")
+  // The replaced goal is discarded entirely, not backgrounded.
+  assert.equal(listSessionGoals(sid).length, 1)
+})
+
 test("/goal add keeps the previous goal, backgrounds it, and focuses the new one", async () => {
   const { hooks } = await createHooks()
   const sid = "multi-s1"

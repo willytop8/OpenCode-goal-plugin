@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Warn when `/goal <condition>` replaces the focused goal instead of silently discarding it. The response now leads with `⚠️ Replacing active goal: "<old condition>"` and points at `/goal add <condition>` as the non-destructive alternative that backgrounds the current goal instead.
+
 ## 0.4.7 — 2026-06-29
 
 ### Bug fixes (low-severity cleanups)

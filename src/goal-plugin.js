@@ -2531,6 +2531,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       // goal and add another. Clear any ordered-sequence flag so the new
       // standalone goal does not trigger sisyphus auto-promotion of old sequence
       // goals that may still be in the registry (matches the agent setGoal path).
+      const replacedGoal = goalStates.get(sessionID)
       sessionOrdered.delete(sessionID)
       cleanupGoal(sessionID)
       lastGoalResults.delete(sessionID)
@@ -2540,6 +2541,13 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       output.parts = [
         makeTextPart(
           [
+            ...(replacedGoal
+              ? [
+                  `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
+                  `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
+                  "",
+                ]
+              : []),
             `New active goal: ${goal.condition}`,
             goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
             goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
