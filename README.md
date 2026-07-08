@@ -116,6 +116,17 @@ Clear the active goal:
 
 `/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are aliases for `/goal clear`.
 
+## Examples
+
+Copy-pasteable goals for common workflows:
+
+```
+/goal "fix the failing tests" --max-turns 10
+/goal "refactor auth to use new API" --max-minutes 30
+/goal "audit for security issues" --max-turns 3
+/goal "migrate class components to functional" --max-minutes 60 --max-tokens 400000
+```
+
 ## How it works
 
 1. When you set a goal, the plugin stores it in session memory and injects it into the system prompt so the assistant keeps it in view on every turn.

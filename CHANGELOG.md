@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an Examples section to the README with copy-pasteable `/goal` commands for common workflows (fixing tests, refactors, audits, migrations).
 - Add a Comparison section to the README benchmarking `/goal` support, auto-continue, per-goal overrides, no-progress detection, safety limits, history, persistence, budget wrap-up, and license against Claude Code and Codex.
 - Add `npm run verify` / `npx opencode-goal-plugin` installation verification command (`scripts/verify.mjs`). Checks Node >= 18, the plugin module shape, that all 3 hooks register, and that `/goal status`/`/goal set` work — entirely via mock clients, with zero model calls.
 - Add TypeScript declarations (`index.d.ts`) covering `GoalPluginOptions`, the plugin hook map, and the module's default export. `package.json` now points `types` at it.
