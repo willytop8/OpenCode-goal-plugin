@@ -1,0 +1,299 @@
+/**
+ * Type declarations for opencode-goal-plugin.
+ *
+ * These describe the plugin-level configuration object accepted in
+ * `opencode.json` under `plugin: [["opencode-goal-plugin", { ... }]]`,
+ * and the shape of the module's exports.
+ */
+
+/**
+ * Verdict returned by a completion auditor (built-in or custom). See
+ * {@link GoalPluginOptions.auditor} and {@link GoalPluginOptions.completionAudit}.
+ */
+export interface CompletionAuditVerdict {
+  /** `true` to archive the goal as achieved; `false` to reject the completion. */
+  approved: boolean
+  /** Human-readable reason, surfaced in the goal's status when rejected. */
+  reason?: string
+}
+
+/** Arguments passed to a custom {@link GoalPluginOptions.auditor} function. */
+export interface CompletionAuditContext {
+  /** The goal being audited (objective, budget usage, checkpoints, etc.). */
+  goal: unknown
+  /** The OpenCode session ID the goal belongs to. */
+  sessionID: string
+  /** The assistant's latest response text, containing the `[goal:evidence]`/`[goal:complete]` claim. */
+  latestText: string
+}
+
+/** Options for the built-in child-session completion auditor (`completionAudit: true`). */
+export interface CompletionAuditorOptions {
+  /**
+   * How long, in milliseconds, the built-in auditor waits for a verdict from
+   * its child OpenCode session before failing open (auto-approving).
+   * @default 120000
+   */
+  timeoutMs?: number
+}
+
+/**
+ * Configuration options for opencode-goal-plugin. All fields are optional;
+ * unset fields fall back to the plugin's built-in defaults. These act as
+ * the default limits for every goal set in a session, and most of the
+ * budget/behavior fields can be overridden per-goal via `/goal` command
+ * flags (e.g. `--max-turns`, `--success`, `--mode`).
+ */
+export interface GoalPluginOptions {
+  /**
+   * Maximum number of auto-continue turns sent toward a goal before it is
+   * stopped for exceeding limits. Overridable per-goal with `--max-turns`.
+   * @default 10
+   */
+  maxTurns?: number
+
+  /**
+   * Maximum wall-clock duration, in milliseconds, a goal may run before it
+   * is stopped for exceeding limits. Overridable per-goal with
+   * `--max-duration-ms` or `--max-minutes`.
+   * @default 900000
+   */
+  maxDurationMs?: number
+
+  /**
+   * Maximum context token budget a goal may consume before it is stopped
+   * for exceeding limits. Overridable per-goal with `--max-tokens` or the
+   * `--budget` shorthand (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
+   * @default 200000
+   */
+  maxTokens?: number
+
+  /**
+   * Minimum delay, in milliseconds, enforced between consecutive
+   * auto-continue prompts. Overridable per-goal with `--cooldown-ms`.
+   * @default 1500
+   */
+  minDelayMs?: number
+
+  /**
+   * How many recent session messages to scan when looking for the latest
+   * assistant turn before auto-continuing. Higher values make long,
+   * tool-heavy sessions less likely to lose the most recent assistant
+   * response.
+   * @default 50
+   */
+  maxRecentMessages?: number
+
+  /**
+   * Output token floor below which a turn is considered "low-output" for
+   * no-progress detection. Overridable per-goal with
+   * `--no-progress-threshold`.
+   * @default 50
+   */
+  noProgressTokenThreshold?: number
+
+  /**
+   * Grace window for low-output stalls: the goal is paused only after this
+   * many consecutive stalled low-output turns, rather than on the first
+   * one. Overridable per-goal with `--no-progress-turns`.
+   * @default 2
+   */
+  noProgressTurnsBeforePause?: number
+
+  /**
+   * Grace window for tool-free continuation turns (a "talk only" turn that
+   * calls no tool). Complements the no-progress check by catching
+   * self-chat loops that still produce output. Overridable per-goal with
+   * `--no-tool-turns`.
+   * @default 2
+   */
+  noToolCallTurnsBeforePause?: number
+
+  /**
+   * Fraction (between 0 and 1, exclusive) of any budget (turns, duration,
+   * or tokens) at which the plugin sends a one-time "wrap up" prompt
+   * nudging the model to finish before the hard limit is hit.
+   * @default 0.8
+   */
+  budgetWrapupRatio?: number
+
+  /**
+   * Number of remaining auto-continue turns at which a limit-approaching
+   * warning is included in status output.
+   * @default 3
+   */
+  warnTurnsRemaining?: number
+
+  /**
+   * Remaining duration, in milliseconds, at which a limit-approaching
+   * warning is included in status output.
+   * @default 60000
+   */
+  warnDurationMsRemaining?: number
+
+  /**
+   * Remaining context tokens at which a limit-approaching warning is
+   * included in status output.
+   * @default 25000
+   */
+  warnTokensRemaining?: number
+
+  /**
+   * Maximum number of consecutive prompt failures (e.g. transport errors
+   * sending the auto-continue prompt, or repeated missing-evidence /
+   * missing-blocker format violations) tolerated before the goal is
+   * stopped.
+   * @default 3
+   */
+  maxPromptFailures?: number
+
+  /**
+   * Whether to persist active/backgrounded goals and recent goal results
+   * to disk so they survive a restart. Recovered active goals are loaded
+   * in a paused state. Set to `false` for purely in-memory behavior (this
+   * also disables the lifecycle ledger).
+   * @default true
+   */
+  persistState?: boolean
+
+  /**
+   * Filesystem path where persisted goal state is written when
+   * `persistState` is enabled. Overrides both the project-local default
+   * and the `OPENCODE_GOAL_STATE_PATH` environment variable.
+   * @default "<cwd>/.opencode/goals/state.json"
+   */
+  stateFilePath?: string
+
+  /**
+   * Filesystem path for the append-only lifecycle ledger
+   * (`<event> per line`, used to reconstruct active goals if the main
+   * state file is missing or corrupted).
+   * @default "<stateFilePath>.ledger.jsonl"
+   */
+  ledgerFilePath?: string
+
+  /**
+   * How long, in milliseconds, a completed goal's summary remains
+   * available through `/goal status` after the goal leaves active memory.
+   * @default 604800000
+   */
+  resultRetentionMs?: number
+
+  /**
+   * Maximum number of completed-goal summaries retained in process memory
+   * before the oldest ones are evicted.
+   * @default 200
+   */
+  maxStoredResults?: number
+
+  /**
+   * The slash command the plugin owns. Set to e.g. `"objective"` to drive
+   * the workflow with `/objective` instead of `/goal`; a leading slash is
+   * tolerated and stripped. Remember to register the matching command
+   * name in your OpenCode `command` config.
+   * @default "goal"
+   */
+  commandName?: string
+
+  /**
+   * Whether the plugin installs its `command.execute.before` hook at all.
+   * Set to `false` if you only want the auto-continue/persistence
+   * behavior driven programmatically (e.g. via {@link registerTools})
+   * and don't want the plugin to own a slash command.
+   * @default true
+   */
+  registerCommand?: boolean
+
+  /**
+   * Whether the plugin registers the agent-facing goal tools
+   * (`get_goal`, `get_goal_history`, `set_goal`, `update_goal`,
+   * `clear_goal`). Requires the optional `@opencode-ai/plugin` peer
+   * dependency; when it is absent, tool registration is silently skipped
+   * and the command/event hooks still work.
+   * @default true
+   */
+  registerTools?: boolean
+
+  /**
+   * Enables the built-in child-session completion auditor: before a
+   * `[goal:complete]` is archived, the plugin spawns an independent
+   * OpenCode session to verify the completion against the goal and
+   * workspace. Ignored if {@link auditor} is also set (the custom
+   * auditor takes precedence). Tune the built-in auditor with
+   * {@link auditorOptions}.
+   * @default false
+   */
+  completionAudit?: boolean
+
+  /**
+   * Supply a custom completion auditor instead of the built-in
+   * child-session one. Takes precedence over `completionAudit: true`.
+   * A verdict of `{ approved: false }` pauses the goal (stop reason
+   * `"audit rejected"`) instead of archiving it. A thrown error is
+   * treated as a rejection (fail closed).
+   */
+  auditor?: (context: CompletionAuditContext) => Promise<CompletionAuditVerdict>
+
+  /**
+   * Tuning options for the built-in child-session auditor. Ignored when
+   * a custom {@link auditor} is supplied.
+   */
+  auditorOptions?: CompletionAuditorOptions
+
+  /**
+   * Whether the plugin announces completion/blocked audits (an
+   * audit-start and an audit-result message) instead of running silently.
+   * @default true
+   */
+  auditMessages?: boolean
+
+  /**
+   * Custom sink for audit announcements. Defaults to routing through
+   * OpenCode's structured log (`client.app.log`). Provide this to route
+   * audit messages elsewhere, e.g. into the live conversation.
+   */
+  auditMessenger?: (sessionID: string, text: string) => Promise<void>
+}
+
+/**
+ * OpenCode plugin hook map returned by the plugin's `server` factory.
+ * Matches OpenCode's plugin hook contract; kept loose (`unknown`
+ * input/output) since hook payload shapes are defined by OpenCode itself,
+ * not by this package.
+ */
+export interface GoalPluginHooks {
+  /** Omitted entirely when {@link GoalPluginOptions.registerCommand} is `false`. */
+  "command.execute.before"?: (input: unknown, output: unknown) => Promise<void>
+  event: (input: unknown) => Promise<void>
+  "experimental.chat.system.transform": (input: unknown, output: unknown) => Promise<void>
+  "experimental.compaction.autocontinue": (input: unknown, output: unknown) => Promise<void>
+  /**
+   * Agent-facing tool definitions, present only when
+   * {@link GoalPluginOptions.registerTools} is enabled (default) and the
+   * optional `@opencode-ai/plugin` peer dependency is installed.
+   */
+  tool?: Record<string, unknown>
+  [hook: string]: unknown
+}
+
+/**
+ * The plugin's `server` factory. OpenCode calls this with a client bound
+ * to the running session and the resolved plugin options from
+ * `opencode.json`.
+ */
+export function GoalPlugin(
+  context: { client: unknown },
+  options?: GoalPluginOptions,
+): Promise<GoalPluginHooks>
+
+/**
+ * Default export consumed by OpenCode's plugin loader:
+ * `{ "opencode-goal-plugin": { ... } }` in `opencode.json` resolves `id`
+ * and calls `server` to obtain the plugin's hooks.
+ */
+declare const goalPlugin: {
+  id: "opencode-goal-plugin"
+  server: typeof GoalPlugin
+}
+
+export default goalPlugin
