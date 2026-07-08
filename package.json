@@ -4,6 +4,7 @@
   "description": "Session-scoped /goal workflow for OpenCode.",
   "type": "module",
   "main": "./src/goal-plugin.js",
+  "types": "./index.d.ts",
   "exports": {
     ".": "./src/goal-plugin.js",
     "./server": "./src/goal-plugin.js"
@@ -12,6 +13,7 @@
     "src",
     "scripts",
     "examples",
+    "index.d.ts",
     "README.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
