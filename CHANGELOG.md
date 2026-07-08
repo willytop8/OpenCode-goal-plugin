@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add GitHub issue templates for bug reports (OpenCode version, provider/model, Node version, relevant plugin options, repro steps) and feature requests (problem solved, scope fit against the current multi-goal/audit feature set).
 - Add an Examples section to the README with copy-pasteable `/goal` commands: common workflows, success criteria/constraints/budget shorthand, and an ordered (sisyphus) sequence.
 - Add a Comparison section to the README benchmarking `/goal` support, auto-continue, per-goal overrides, no-progress/no-tool-call detection, safety limits, history, persistence, multi-goal/sisyphus sequences, evidence-gated completion, the optional completion auditor, budget wrap-up, and license against Claude Code and Codex.
 - Add `npm run verify` / `npx opencode-goal-plugin` installation verification command (`scripts/verify.mjs`). Checks Node >= 18, the plugin module shape, that all 4 hooks (`command.execute.before`, `event`, `experimental.chat.system.transform`, `experimental.compaction.autocontinue`) register, and that `/goal status`/`/goal set` work — entirely via mock clients, with zero model calls.
