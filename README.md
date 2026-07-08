@@ -4,6 +4,8 @@
 
 [![npm version](https://img.shields.io/npm/v/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
+[![CI](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-104%20passing-brightgreen)](test/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/) — give your agent a persistent objective, let it work autonomously across turns, and get notified when it's done (or blocked).
