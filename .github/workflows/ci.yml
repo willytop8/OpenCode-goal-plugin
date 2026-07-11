@@ -33,8 +33,14 @@ jobs:
       - name: Run tests with coverage
         run: npm run test:coverage
 
+      - name: Run behavior and efficiency benchmark
+        run: npm run benchmark:behavior
+
       - name: Run package smoke test
         run: npm run smoke
+
+      - name: Verify installed tarball host contract
+        run: npm run smoke:packed-host
 
       - name: Verify package contents
         run: npm run pack:check

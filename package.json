@@ -1,7 +1,7 @@
 {
   "name": "opencode-goal-plugin",
-  "version": "0.5.0",
-  "description": "Session-scoped /goal workflow for OpenCode.",
+  "version": "0.6.0",
+  "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
   "main": "./src/goal-plugin.js",
   "types": "./index.d.ts",
@@ -16,6 +16,8 @@
     "src",
     "scripts",
     "examples",
+    "demo",
+    "docs",
     "index.d.ts",
     "README.md",
     "CHANGELOG.md",
@@ -28,6 +30,8 @@
     "test": "node --test test/*.test.js",
     "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
     "smoke": "node scripts/smoke-command-hook.mjs",
+    "smoke:packed-host": "node scripts/packed-host-contract.mjs",
+    "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "verify": "node scripts/verify.mjs",
     "check": "node -c src/goal-plugin.js && npm test",
     "pack:check": "npm pack --dry-run"
@@ -39,7 +43,7 @@
     "goal"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1"
+    "@opencode-ai/plugin": ">=1.17.15 <2"
   },
   "peerDependenciesMeta": {
     "@opencode-ai/plugin": {

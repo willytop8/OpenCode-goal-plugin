@@ -7,10 +7,12 @@
 import assert from "node:assert/strict"
 
 const REQUIRED_HOOKS = [
+  "config",
   "command.execute.before",
   "event",
   "experimental.chat.system.transform",
   "experimental.compaction.autocontinue",
+  "experimental.session.compacting",
 ]
 
 const results = []
@@ -68,10 +70,10 @@ const client = {
 
 let hooks
 
-await check("plugin initializes and registers all 4 required hooks", async () => {
+await check(`plugin initializes and registers all ${REQUIRED_HOOKS.length} required hooks`, async () => {
   // registerTools defaults to true but silently no-ops without the optional
   // @opencode-ai/plugin peer dependency, so it is not asserted here — the
-  // 4 hooks below are always present regardless of that peer dependency.
+  // These hooks are always present regardless of that peer dependency.
   hooks = await GoalPlugin({ client }, { minDelayMs: 1, persistState: false })
   for (const hookName of REQUIRED_HOOKS) {
     assert.equal(

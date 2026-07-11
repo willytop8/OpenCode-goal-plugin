@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-07-10
+
+> Adds canonical structured goal tools, native goal and read-only verifier agents, fail-closed completion verification, safer OpenCode SDK compatibility, bounded persistence, and stronger lifecycle isolation. Existing command workflows and legacy tool aliases remain supported.
+
+- Add canonical typed goal tools alongside backward-compatible aliases and structured completion claims.
+- Register collision-safe goal and verifier agents; completion auditing now requires an owned, distinct verifier identity with edit and shell permissions denied.
+- Fail closed on verifier errors/timeouts and abort timed-out child sessions when the host supports cancellation.
+- Isolate runtime state per workspace, suppress stale asynchronous continuations, handle abort/dispose races, and coalesce duplicate idle events.
+- Add an exclusive persistence lease so two OpenCode processes cannot silently overwrite one workspace state file.
+- Bound goal-definition inputs and rotate the sensitive lifecycle ledger using configurable size/retention ceilings.
+- Add normalized usage diagnostics, compact continuation prompts, a 100-point behavior benchmark, and packed-tarball host-contract verification.
+- Include provider documentation and the reproducible demo in the npm package; declare all public hooks.
+
 ## 0.5.0 — 2026-07-08
 
 - Replace the single-line "Compatibility snapshot" in the README with an OpenCode version compatibility table, manually verified via `tmux` + the OpenCode TUI against the persisted state file for each provider/model combination.
@@ -102,7 +115,7 @@
 
 ## 0.3.0 — 2026-06-14
 
-> A large feature release. Stronger completion integrity (evidence gate, optional auditor, visible audit messages), durable lifecycle ledger with state reconstruction, multiple goals per session with focus and ordered sisyphus sequences, richer goal schema, more auto-continue guardrails, project-local state with migration, a deterministic compaction summary, and npm Trusted Publishing CI. All changes are additive and backward-compatible; older state files load unchanged.
+> A large feature release. Stronger completion integrity (evidence gate, optional auditor, visible audit messages), durable lifecycle ledger with state reconstruction, multiple goals per session with focus and ordered sisyphus sequences, richer goal schema, more auto-continue guardrails, project-local state with migration, a deterministic compaction summary, and release-workflow groundwork. All changes are additive and backward-compatible; older state files load unchanged.
 
 ### Completion integrity & audit
 
@@ -135,7 +148,7 @@
 
 - **Default goal state to a project-local path, with an env override and migration fallbacks.** State resolves as `stateFilePath` option → `OPENCODE_GOAL_STATE_PATH` env var → project-local `<cwd>/.opencode/goals/state.json` (previously `~/.opencode-goal-plugin/state.json`). When the default path is empty, the plugin migrates forward on first load from the legacy home path and the XDG path, then writes project-local. Explicit option/env paths are literal with no fallback; a present-but-corrupt primary is preserved. New `resolveStateFilePath` / `xdgStateFilePath` / `legacyStateFilePaths` helpers. Home-based fallback paths resolve from an injectable `env.HOME` (falling back to `os.homedir()`), making path resolution deterministic across platforms — `os.homedir()` ignores `$HOME` on macOS. Implements megalist items 6.1 and 6.2.
 - _**Correction (2026-06-21):** an earlier version of this entry claimed agent-facing goal tools shipped in 0.3.0. They did not — the work was on an unmerged branch (`wr/agent-tools`) and was never included in the 0.3.0 release. The feature now actually ships; see the **Unreleased** section above. Megalist items 7.1 and 7.2._
-- **Add a `Publish` GitHub Actions workflow (`.github/workflows/publish.yml`) for npm Trusted Publishing (OIDC).** On a push to `main` it runs the full check matrix on Node 18/20/22, then publishes via OIDC with no stored `NPM_TOKEN`, using a publish-on-version-change model (only publishes when `package.json`'s version is new). The publish job requires `id-token: write` and is gated behind a `release` environment. First run still requires a human to publish an initial version and configure the npm Trusted Publisher. Implements megalist item 9.1.
+- **Release automation note.** Development included a proposed npm Trusted Publishing workflow, but `.github/workflows/publish.yml` was not part of the final release history and is not present in the current repository. Releases therefore remain manual unless a separately reviewed publishing workflow is added. No package is published solely by the CI workflow documented in this repository.
 
 ## 0.2.0 — 2026-06-14
 

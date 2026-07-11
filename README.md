@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
 [![CI](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](test/)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](test/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/).
@@ -12,23 +12,15 @@ Set a goal and the plugin keeps it in context, auto-continues the session whenev
 
 Compatibility: this plugin relies on experimental OpenCode hooks. Re-test against the exact OpenCode build and provider/backend stack you plan to use for unattended work.
 
-## Comparison
+## What it provides
 
-| Feature | Claude Code | Codex | opencode-goal-plugin |
-|---|---|---|---|
-| `/goal` command | ✅ Native | ✅ Native | ✅ Plugin |
-| Auto-continue | ✅ | ✅ | ✅ |
-| Per-goal flag overrides | ❌ | ❌ | ✅ |
-| No-progress / no-tool-call detection | ❌ | ❌ | ✅ Both |
-| Configurable safety limits | Limited | Limited | ✅ All tunable |
-| Goal history | ✅ | ❌ | ✅ `/goal history` |
-| Goal persistence | ❌ | ❌ | ✅ Survives restart, ledger-backed |
-| Multiple concurrent goals | ❌ | ❌ | ✅ `/goal add` / `/goal focus` |
-| Ordered goal sequences | ❌ | ❌ | ✅ `/goal sisyphus` |
-| Evidence-gated completion | ❌ | ❌ | ✅ `[goal:evidence]` required |
-| Independent completion audit | ✅ | ❌ | ✅ Optional child-session auditor |
-| Budget wrap-up prompts | ❌ | ❌ | ✅ 80% threshold |
-| Open source | ❌ | ❌ | ✅ MIT |
+- Session-scoped goals that remain visible across turns and compaction.
+- Guarded auto-continuation with turn, duration, token, no-progress, and no-tool-call limits.
+- Project-local restart recovery backed by persisted state and a bounded lifecycle ledger.
+- Evidence-gated completion with an optional independent, fail-closed verifier.
+- Canonical agent tools, collision-safe goal/verifier agents, multiple goals, and ordered goal sequences.
+
+This project is independently implemented for OpenCode. Product names used elsewhere identify their respective owners; no feature-parity or endorsement claim is implied.
 
 ## Compatibility snapshot
 
@@ -137,6 +129,18 @@ Clear the active goal:
 
 `/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are aliases for `/goal clear`.
 
+### Session forks and child sessions
+
+Goals are scoped to the session where they were created. A child session or a
+fork does not automatically inherit its parent's active goal; set a goal in the
+new session when you want it to continue independently.
+
+This isolation is intentional. OpenCode currently includes `parentID` for
+ordinary child sessions but does not expose the source session in the
+`session.created` event for forks. Inferring ancestry from a mutable title such
+as `(fork #1)` could attach a goal to the wrong session. Automatic inheritance
+can be added once the host exposes an explicit fork relationship.
+
 ### Multiple goals
 
 A session can hold more than one goal. `/goal <condition>` replaces the focused goal, while `/goal add <condition>` keeps the current goal (backgrounding it) and focuses a new one. Only the **focused** goal is auto-continued; backgrounded goals are paused until you focus them.
@@ -186,10 +190,8 @@ An ordered sequence, run as a strict pipeline:
 
 1. When you set a goal, the plugin stores it in session memory and injects it into the system prompt so the assistant keeps it in view on every turn.
 2. Each time the session goes idle, the plugin sends a continuation prompt containing the goal, the remaining budget, and a completion audit asking the assistant to verify the current state before declaring done.
-3. The plugin stops auto-continuing when the assistant ends a response with `[goal:complete]` or `[goal:blocked]`, or when a safety limit is reached.
-4. If OpenCode compacts the session, the plugin injects a deterministic summary into the compaction context so the goal survives the compaction and the assistant keeps the thread. The summary — objective, status, budget usage, recent checkpoints, and recent lifecycle events — is reconstructed from the plugin's persisted goal record rather than from chat memory, so it is stable and reproducible. While a goal is active, the plugin also disables OpenCode's generic post-compaction auto-continue so it does not race the plugin's own continuation.
 3. The plugin stops auto-continuing when the assistant ends a response with a substantiated `[goal:complete]` or `[goal:blocked]`, or when a safety limit is reached. A `[goal:complete]` is only honored when it is preceded by a `[goal:evidence]` line; a `[goal:blocked]` is only honored when a concrete blocker is stated. Unsubstantiated claims are rejected and the plugin re-prompts for the missing evidence or blocker.
-4. If OpenCode compacts the session, the plugin injects the goal objective, budget usage, and latest checkpoint into the compaction context so the goal survives the compaction and the assistant keeps the thread. While a goal is active, the plugin also disables OpenCode's generic post-compaction auto-continue so it does not race the plugin's own continuation.
+4. If OpenCode compacts the session, the plugin injects a deterministic summary into the compaction context so the goal survives the compaction and the assistant keeps the thread. The summary — objective, status, budget usage, recent checkpoints, and recent lifecycle events — is reconstructed from the plugin's persisted goal record rather than from chat memory, so it is stable and reproducible. While a goal is active, the plugin also disables OpenCode's generic post-compaction auto-continue so it does not race the plugin's own continuation.
 5. If you send a message of your own while the goal is running, the plugin treats it as the latest instruction and pauses auto-continue so it does not talk over you. The plugin's own continuation prompts are ignored for this check (they are not "your" messages). Run `/goal resume` to hand control back to the goal loop.
 
 ## Completion markers
@@ -317,8 +319,12 @@ Additional plugin-level options:
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Requires the optional `@opencode-ai/plugin` peer dependency to be present; when it is absent, tool registration is skipped and the command/event hooks still work. Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools-optional).
+- `registerAgents` — whether the config hook adds native `goal` and `goal-verify` agents (default `true`). Existing agents with those names are preserved unchanged; the plugin never changes your default agent.
+- `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with workspace and goal mutation tools disabled.
+- `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). The plugin remembers a successful shape per operation and only falls back after an explicit argument/schema `TypeError`; provider and transport errors are never retried as shape mismatches.
 - `persistState` — whether to persist active goals and recent goal results to disk.
 - `stateFilePath` — where the persisted state JSON is written. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default is `<cwd>/.opencode/goals/state.json` (see the persistence section above), and `OPENCODE_GOAL_STATE_PATH` can override it without editing config.
+- `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
 
@@ -328,11 +334,10 @@ In addition to the `/goal` command, the plugin can expose the same workflow to t
 
 Registered tools:
 
-- `get_goal` — current goal status (objective, budget usage, latest checkpoint).
-- `get_goal_history` — lifecycle history and latest checkpoint.
-- `set_goal` — set/replace the session goal. Its description constrains the agent to call it **only when the user explicitly asks** to set a goal. Accepts `objective` plus optional `maxTurns`, `maxTokens`, `maxDurationMs`, `successCriteria`, `constraints`, and `mode`.
-- `update_goal` — revise the `objective` and/or set `status` to `complete` / `blocked` / `paused` / `resumed` (with `evidence` for complete or `blocker` for blocked).
-- `clear_goal` — clear the current goal and discard its saved status.
+- `goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, and `goal_complete` are the canonical narrow operations. They return compact versioned JSON envelopes so agents can branch reliably without parsing prose.
+- `get_goal`, `get_goal_history`, `set_goal`, `update_goal`, and `clear_goal` remain compatibility aliases with their existing text responses.
+
+`goal_set` and `set_goal` are explicitly constrained to user-requested goals. `goal_complete` accepts a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`, `failed`, or `not-run`), changed files, and known limitations. Failed checks and empty criterion evidence are rejected before archival; accepted claims are serialized deterministically for the configured completion auditor. The legacy `update_goal` tool retains its string `evidence` field for compatibility.
 
 These operate on the same per-session multi-goal state as the command path: a tool-set goal persists, shows up in `/goal list`, and is driven by the idle auto-continue; completing a goal in an ordered (sisyphus) sequence auto-promotes the next.
 
@@ -348,7 +353,7 @@ By default a `[goal:complete]` is accepted on the assistant's word. You can requ
 - `completionAudit: true` — the plugin spawns an independent OpenCode child session to verify the completion against the goal and workspace. The auditor replies with `[audit:approved]` or `[audit:rejected]` (with a reason).
 - `auditor: async ({ goal, sessionID, latestText }) => ({ approved, reason })` — supply your own auditor function (takes precedence over `completionAudit`).
 
-On **approval** the goal is archived as achieved. On **rejection** the goal is *not* archived — it is paused with stop reason `audit rejected` and the reason in its status, so you can address the gap and `/goal resume`. The built-in child-session auditor fails *open* (auto-approves) if the session API is unavailable, while a custom auditor that throws is treated as a rejection (fail closed). The audit is off unless one of these options is set.
+On **approval** the goal is archived as achieved. On **rejection** the goal is *not* archived — it is paused with stop reason `audit rejected` and the reason in its status, so you can address the gap and `/goal resume`. The built-in and custom auditors fail closed by default. The audit is off unless one of these options is set.
 
 Pass `auditorOptions` to tune the built-in auditor:
 
@@ -357,11 +362,12 @@ GoalPlugin({
   completionAudit: true,
   auditorOptions: {
     timeoutMs: 60_000,  // default 120 000 ms; set lower for faster CI feedback
+    failurePolicy: "reject",
   },
 })
 ```
 
-`timeoutMs` caps how long the built-in child-session auditor waits for a verdict. If the session doesn't reply within the timeout the auditor auto-approves (fail open) so the goal can still be archived. `auditorOptions` is ignored when a custom `auditor` function is supplied.
+`timeoutMs` caps how long the built-in child-session auditor waits for a verdict. `failurePolicy` defaults to `reject`: an unavailable API, missing child-session ID, provider error, or timeout rejects the audit and pauses the goal for review. Set it to `approve` only as an explicit compatibility escape hatch; an actual negative or malformed verifier verdict still rejects. `auditorOptions` is ignored when a custom `auditor` function is supplied.
 
 ## Prompt safety
 
@@ -369,11 +375,27 @@ The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided
 
 ## Limitations
 
-This is a marker-based implementation. The assistant is responsible for outputting `[goal:complete]` or `[goal:blocked]` — there is no independent evaluator verifying completion against the original goal. Claude Code's native `/goal` uses a separate evaluator model; this plugin currently approximates the workflow using OpenCode hooks and explicit completion markers. A future version could add a separate evaluator once OpenCode exposes a clean plugin API for that flow.
+The assistant still signals candidate outcomes with `[goal:complete]` or `[goal:blocked]`. Completion can additionally be checked by a custom `completionAudit` callback or the built-in child-session auditor before the goal becomes terminal. Marker quality therefore remains model-dependent when auditing is disabled, and audit quality depends on the configured verifier model and evidence available in the session.
 
 OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update.
 
 The plugin depends on `experimental.chat.system.transform` and other OpenCode plugin hooks that may change between OpenCode versions.
+
+Only one persistence-enabled OpenCode plugin instance may own a given `stateFilePath` at a time. A second process fails initialization with the owning PID/host instead of risking last-writer-wins state loss. Dispose the first host or configure a different path.
+
+## Diagnostics and recovery
+
+Start with `/goal status`, then `/goal history`. Together they show whether a goal is active, its stop reason and budget usage, and the recent lifecycle/checkpoint trail without exposing the entire on-disk ledger to the model.
+
+If a goal does not continue:
+
+1. Check for a deliberate pause: user intervention, a hard limit, repeated tool-free/no-progress turns, prompt failures, or a rejected completion audit all stop unattended work by design.
+2. Run `/goal resume` only after resolving the reported reason. Resume creates a fresh local budget window; it does not erase the objective or history.
+3. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
+4. Confirm the configured project directory and state-path precedence described under [Safety limits](#safety-limits). A daemon started elsewhere can otherwise make a manually configured relative path surprising.
+5. Run `npm run verify`, `npm run smoke`, and `npm run smoke:packed-host` against the installed source when diagnosing registration or packaging problems. `npm run benchmark:behavior` exercises completion, false-completion, loop, interruption, compaction, and restart behavior without a provider call.
+
+Do not paste `state.json`, its ledger, or verbose logs into a public issue without reviewing them first: they can contain goal text, assistant checkpoints, blockers, local paths, and command evidence. Prefer the bounded status/history output and redact project-specific content. There is intentionally no broad "dump diagnostics" tool: exposing process-wide session state or persistence paths to the model would add more privacy risk than troubleshooting value.
 
 ## Local development
 
@@ -403,6 +425,9 @@ Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode wil
 npm test                # run the test suite
 npm run test:coverage   # run tests with coverage
 npm run smoke           # verify package export + command hook without a model call
+npm run smoke:packed-host # install the packed tarball and exercise the host contract
+npm run benchmark:behavior # deterministic autonomy + token-efficiency scenarios
+npm run verify          # verify the installed plugin hook surface
 npm run check           # syntax check + tests
 npm run pack:check      # verify package contents before publishing
 ```
