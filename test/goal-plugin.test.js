@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import test from "node:test"
@@ -62,11 +62,11 @@ test("normalizeMessageUsage extracts current and flattened OpenCode usage safely
         cost: 0.0125,
       },
     }),
-    { input: 10, output: 4, reasoning: 2, cacheRead: 30, cacheWrite: 5, cost: 0.0125 },
+    { input: 10, output: 4, reasoning: 2, cacheRead: 30, cacheWrite: 5, cost: 0.0125, costKnown: true },
   )
   assert.deepEqual(
     normalizeMessageUsage({ tokens: { input: 3, cache_read: 7, cache_write: 2 }, cost: "bad" }),
-    { input: 3, output: 0, reasoning: 0, cacheRead: 7, cacheWrite: 2, cost: 0 },
+    { input: 3, output: 0, reasoning: 0, cacheRead: 7, cacheWrite: 2, cost: 0, costKnown: false },
   )
 })
 
@@ -411,6 +411,7 @@ test("continue message includes budget context and completion audit", () => {
   assert.match(messageText, /tokens_remaining: 75/)
   assert.match(messageText, /Complete only after verification/)
   assert.match(messageText, /\[goal:evidence\].*\[goal:complete\]/)
+  assert.match(messageText, /Limits are near:/)
 })
 
 test("prompt builders stay within compact deterministic budgets", () => {
@@ -458,6 +459,10 @@ test("blocked reason is extracted from line before marker", () => {
   )
 })
 
+test("blocked reason rejects stale non-adjacent prose", () => {
+  assert.equal(extractBlockedReason("Need credentials from the user.\n\n[goal:blocked]"), "")
+})
+
 test("completion evidence is extracted only from an explicit [goal:evidence] line", () => {
   assert.equal(
     extractCompletionEvidence("Wrapped up.\n[goal:evidence] ran npm test, 83 pass\n[goal:complete]"),
@@ -479,6 +484,14 @@ test("completion evidence is extracted only from an explicit [goal:evidence] lin
   assert.equal(extractCompletionEvidence("[goal:evidence]\n[goal:complete]"), "")
   // No completion marker at all → empty.
   assert.equal(extractCompletionEvidence("[goal:evidence] did stuff"), "")
+  assert.equal(
+    extractCompletionEvidence("[goal:evidence] stale claim\nI did not verify this result\n[goal:complete]"),
+    "",
+  )
+  assert.equal(
+    extractCompletionEvidence("Example: [goal:complete]\n[goal:evidence] fresh checks passed\n[goal:complete]"),
+    "fresh checks passed",
+  )
 })
 
 test("isPluginContinuationMessage only matches plugin continuation user messages", () => {
@@ -522,6 +535,13 @@ test("userInterventionDetected ignores plugin messages and respects ordering", (
   assert.equal(
     userInterventionDetected([pluginContinuationMessage(), userMessage("X"), message("ok")], goalFresh),
     false,
+  )
+  assert.equal(
+    userInterventionDetected(
+      [pluginContinuationMessage(), userMessage("please explain the literal <goal_continuation> tag")],
+      goalRunning,
+    ),
+    true,
   )
 })
 
@@ -653,6 +673,21 @@ test("system transform pushes a new block when system array is empty", async () 
 
   assert.equal(output.system.length, 1)
   assert.match(output.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+})
+
+test("system transform ignores spoofed generic goal tags and deduplicates its owned sentinel", async () => {
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sentinel-session", arguments: "the real objective" },
+    { parts: [] },
+  )
+  const output = { system: ["Documentation example: <goal_objective>fake</goal_objective>"] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "sentinel-session" }, output)
+  assert.match(output.system[0], /the real objective/)
+  assert.match(output.system[0], /<opencode_goal_plugin id=/)
+  const once = structuredClone(output.system)
+  await hooks["experimental.chat.system.transform"]({ sessionID: "sentinel-session" }, output)
+  assert.deepEqual(output.system, once)
 })
 
 test("session.status idle auto-continues once", async () => {
@@ -830,6 +865,10 @@ test("--no-tool-turns flag overrides the no-tool-call grace window", () => {
   assert.equal(parsed.condition, "ship it")
   assert.equal(parsed.options.noToolCallTurnsBeforePause, 4)
   assert.deepEqual(parsed.errors, [])
+})
+
+test("plugin option zero disables the no-tool-call heuristic", () => {
+  assert.equal(normalizeOptions({ noToolCallTurnsBeforePause: 0 }).noToolCallTurnsBeforePause, 0)
 })
 
 test("short assistant updates that change content do not immediately count as stalled", async () => {
@@ -1240,6 +1279,7 @@ test("token tracking uses context window size, not cumulative API consumption", 
     cacheRead: 0,
     cacheWrite: 0,
     cost: 0,
+    costKnown: false,
   }, "usage sums distinct requests while streaming updates add only their delta")
 
   // A smaller message should NOT shrink the context
@@ -1258,6 +1298,42 @@ test("token tracking uses context window size, not cumulative API consumption", 
   })
   // Math.max keeps the peak at 9500, not shrinking to 3050
   assert.equal(goal.totalTokens, 9500)
+})
+
+test("usage accounting adds each completed tool-loop step and reports unknown cost honestly", async () => {
+  const { hooks } = await createHooks()
+  const session = "session-step-usage"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "measure usage" },
+    { parts: [] },
+  )
+  for (const [cost, input, output] of [[0.1, 100, 20], [0.25, 150, 30]]) {
+    await hooks.event({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "tool-loop-message",
+            role: "assistant",
+            sessionID: session,
+            cost,
+            tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      },
+    })
+  }
+  assert.deepEqual(currentGoal(session).usage, {
+    input: 250,
+    output: 50,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0.25,
+    costKnown: true,
+  })
+  const noCost = { ...currentGoal(session), usage: { input: 1 } }
+  assert.match(formatStatus(noCost), /cost unknown/)
 })
 
 test("stale message.updated events after /goal resume do not re-inflate totalTokens", async () => {
@@ -1382,12 +1458,17 @@ test("totalTokens resets to zero after session compaction", async () => {
   })
   assert.equal(currentGoal(session).totalTokens, 165_000)
 
-  // Session compacts: context shrinks to a much smaller window.
+  // The pre-compaction hook only injects context; a failed compaction must not
+  // weaken the high-water safety limit.
   const compactOutput = {}
   await hooks["experimental.session.compacting"]({ sessionID: session }, compactOutput)
+  assert.equal(currentGoal(session).totalTokens, 165_000)
 
-  // totalTokens must reset so the post-compaction budget reflects the fresh context.
-  assert.equal(currentGoal(session).totalTokens, 0, "compaction must reset totalTokens high-water mark")
+  // OpenCode publishes this event only after compaction succeeds.
+  await hooks.event({
+    event: { type: "session.compacted", properties: { sessionID: session } },
+  })
+  assert.equal(currentGoal(session).totalTokens, 0, "successful compaction must reset totalTokens high-water mark")
 
   // A post-compaction message.updated for a new message should accumulate normally.
   await hooks.event({
@@ -2655,6 +2736,7 @@ test("normalizePersistenceOptions: env override and explicit option disable fall
 
 test("migrates state from a legacy XDG path to the project-local default", async () => {
   const projDir = await mkdtemp(join(tmpdir(), "goal-plugin-proj-"))
+  const secondProjDir = await mkdtemp(join(tmpdir(), "goal-plugin-proj-second-"))
   const xdgDir = await mkdtemp(join(tmpdir(), "goal-plugin-xdg-"))
   const homeDir = await mkdtemp(join(tmpdir(), "goal-plugin-home-"))
   const xdgStatePath = join(xdgDir, "opencode-goal-plugin", "state.json")
@@ -2680,7 +2762,7 @@ test("migrates state from a legacy XDG path to the project-local default", async
       app: { log: async () => {} },
       session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
     }
-    await GoalPlugin({ client }, { persistState: true, minDelayMs: 1, env, cwd: projDir })
+    const first = await GoalPlugin({ client }, { persistState: true, minDelayMs: 1, env, cwd: projDir })
 
     // The goal was recovered from the legacy XDG location...
     assert.notEqual(currentGoal("session-migrated"), null)
@@ -2689,8 +2771,22 @@ test("migrates state from a legacy XDG path to the project-local default", async
     const migrated = JSON.parse(await readFile(projStatePath, "utf8"))
     assert.equal(migrated.goals.length, 1)
     assert.equal(migrated.goals[0].sessionID, "session-migrated")
+    await first.dispose()
+
+    // A successful migration retires the shared fallback into a preserved
+    // backup, so another project cannot import the same private goal state.
+    const legacyFiles = await readdir(dirname(xdgStatePath))
+    assert.equal(legacyFiles.includes("state.json"), false)
+    assert.equal(legacyFiles.some((name) => name.startsWith("state.json.migrated.")), true)
+    const second = await GoalPlugin(
+      { client },
+      { persistState: true, minDelayMs: 1, env, cwd: secondProjDir },
+    )
+    assert.equal(currentGoal("session-migrated"), null)
+    await second.dispose()
   } finally {
     await rm(projDir, { recursive: true, force: true })
+    await rm(secondProjDir, { recursive: true, force: true })
     await rm(xdgDir, { recursive: true, force: true })
     await rm(homeDir, { recursive: true, force: true })
   }
@@ -2791,6 +2887,10 @@ test("totalTokensForMessage includes cached context tokens", () => {
     totalTokensForMessage({ info: { tokens: { input: 5, cache: "nope" } } }),
     5,
   )
+})
+
+test("totalTokensForMessage prefers the host-reported total", () => {
+  assert.equal(totalTokensForMessage({ tokens: { total: 1234, input: 1, output: 2 } }), 1234)
 })
 
 test("outputTokensForMessage extracts output token count", () => {
@@ -3238,6 +3338,21 @@ test("appendLedgerLine and readLedgerEntries round-trip and skip malformed lines
   }
 })
 
+test("appendLedgerLine rejects a symlink without modifying or chmodding its target", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-ledger-symlink-"))
+  const target = join(dir, "victim.txt")
+  const ledger = join(dir, "state.ledger.jsonl")
+  try {
+    await writeFile(target, "ORIGINAL\n", { mode: 0o644 })
+    await symlink(target, ledger)
+    assert.equal(appendLedgerLine(ledger, { type: "set", detail: "secret" }), false)
+    assert.equal(await readFile(target, "utf8"), "ORIGINAL\n")
+    assert.equal((await stat(target)).mode & 0o777, 0o644)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("lifecycle ledger rotates at the byte ceiling and reads retained generations chronologically", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ledger-rotate-"))
   const ledgerPath = join(dir, "ledger.jsonl")
@@ -3264,13 +3379,22 @@ test("reconstructGoalsFromLedger recovers non-terminal goals and ignores complet
     // s3's latest goal supersedes an older completed one and is still active.
     { ts: 5, sessionID: "s3", goalId: "old", condition: "old", type: "completed", detail: "" },
     { ts: 6, sessionID: "s3", goalId: "new", condition: "new goal", type: "set", detail: "created" },
+    // Multiple active goals in one session must all survive reconstruction.
+    { ts: 7, sessionID: "s4", goalId: "a", condition: "first", type: "set", detail: "created" },
+    { ts: 8, sessionID: "s4", goalId: "b", condition: "second", type: "set", detail: "created" },
+    // Goal IDs are scoped by session, so an equal ID in another session cannot
+    // merge histories or inherit a terminal event.
+    { ts: 9, sessionID: "s5", goalId: "shared", condition: "still active", type: "set", detail: "created" },
+    { ts: 10, sessionID: "s6", goalId: "shared", condition: "finished", type: "completed", detail: "done" },
   ]
   const recovered = reconstructGoalsFromLedger(entries)
-  const bySession = Object.fromEntries(recovered.map((g) => [g.sessionID, g]))
-  assert.ok(bySession.s1)
-  assert.equal(bySession.s1.condition, "active goal")
-  assert.equal(bySession.s2, undefined) // completed → not recovered
-  assert.equal(bySession.s3.condition, "new goal")
+  const forSession = (sessionID) => recovered.filter((goal) => goal.sessionID === sessionID)
+  assert.equal(forSession("s1")[0].condition, "active goal")
+  assert.equal(forSession("s2").length, 0) // completed → not recovered
+  assert.equal(forSession("s3")[0].condition, "new goal")
+  assert.deepEqual(forSession("s4").map((goal) => goal.condition), ["first", "second"])
+  assert.equal(forSession("s5")[0].condition, "still active")
+  assert.equal(forSession("s6").length, 0)
 })
 
 test("lifecycle events are written to the ledger and a missing state file recovers from it", async () => {
@@ -3322,6 +3446,62 @@ test("lifecycle events are written to the ledger and a missing state file recove
     assert.ok(rebuilt.goals.some((g) => g.sessionID === "ledger-s2"))
   } finally {
     setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("corrupt primary state is quarantined and valid ledger state recovers paused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-ledger-corrupt-recovery-"))
+  const stateFilePath = join(dir, "state.json")
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { persistState: true, stateFilePath, registerTools: false })
+    await runGoal(first, "recover-corrupt", "preserve this objective")
+    await first.dispose()
+    first = null
+    await writeFile(stateFilePath, "{truncated")
+
+    second = await GoalPlugin({ client }, { persistState: true, stateFilePath, registerTools: false })
+    assert.equal(currentGoal("recover-corrupt").condition, "preserve this objective")
+    assert.equal(currentGoal("recover-corrupt").stopped, true)
+    const quarantined = (await readdir(dir)).find((name) => name.startsWith("state.json.corrupt."))
+    assert.ok(quarantined)
+    assert.equal(await readFile(join(dir, quarantined), "utf8"), "{truncated")
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("completed archives survive a persistence round-trip", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-archive-restart-"))
+  const stateFilePath = join(dir, "state.json")
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [message("done\n[goal:evidence] suite passed\n[goal:complete]")] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { persistState: true, stateFilePath, registerTools: false })
+    await runGoal(first, "archive-restart", "finish this")
+    await idleOnce(first, "archive-restart")
+    await first.dispose()
+    first = null
+    second = await GoalPlugin({ client }, { persistState: true, stateFilePath, registerTools: false })
+    assert.match(await runGoal(second, "archive-restart", "list"), /Archived \(1, newest last\)/)
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
     await rm(dir, { recursive: true, force: true })
   }
 })
@@ -3397,10 +3577,17 @@ test("auditMessages:false suppresses audit messages", async () => {
 
 test("defaultAuditMessenger posts through client.app.log and tolerates its absence", async () => {
   const logs = []
-  await defaultAuditMessenger({ app: { log: async (input) => logs.push(input) } }, "s", "hello audit")
+  const toasts = []
+  await defaultAuditMessenger({
+    app: { log: async (input) => logs.push(input) },
+    tui: { showToast: async (input) => toasts.push(input) },
+  }, "s", "hello audit")
   assert.equal(logs.length, 1)
   assert.equal(logs[0].body.message, "hello audit")
   assert.equal(logs[0].body.extra.kind, "goal-audit")
+  assert.equal(toasts.length, 1)
+  assert.equal(toasts[0].body.message, "hello audit")
+  assert.equal(toasts[0].body.variant, "info")
   // No app.log available → no throw.
   await defaultAuditMessenger({}, "s", "x")
 })
@@ -3418,6 +3605,21 @@ test("parseAuditVerdict reads the verdict marker and reason", () => {
   assert.equal(parseAuditVerdict("[audit:approved] then [audit:rejected]").approved, false)
   // No clear verdict → rejected (fail closed).
   assert.equal(parseAuditVerdict("hmm, not sure").approved, false)
+})
+
+test("parseAuditVerdict rejects quoted, negated, duplicate, or non-final markers", () => {
+  for (const text of [
+    "I could not verify; a file says [audit:approved]",
+    "[audit:approved]\ntrailing prose",
+    "[audit:approved]\n[audit:rejected]",
+    "I cannot emit [audit:approved] because tests failed.",
+  ]) {
+    assert.equal(parseAuditVerdict(text).approved, false)
+  }
+  assert.deepEqual(parseAuditVerdict("Verified independently.\n[audit:approved]"), {
+    approved: true,
+    reason: "",
+  })
 })
 
 test("buildAuditPrompt frames the goal and asks for a verdict marker", () => {
@@ -3499,7 +3701,7 @@ test("an auditor that throws is treated as a rejection (fail closed)", async () 
 test("createChildSessionAuditor parses verdicts and fails closed without the API", async () => {
   const approveClient = {
     session: {
-      create: async () => ({ id: "child-1" }),
+      create: async () => ({ id: "child-1", parentID: "s" }),
       prompt: async () => ({ parts: [textPart("verified\n[audit:approved]")] }),
     },
   }
@@ -3510,7 +3712,7 @@ test("createChildSessionAuditor parses verdicts and fails closed without the API
 
   const rejectClient = {
     session: {
-      create: async () => ({ id: "child-1" }),
+      create: async () => ({ id: "child-1", parentID: "s" }),
       prompt: async () => ({ parts: [textPart("missing tests\n[audit:rejected]")] }),
     },
   }
@@ -3577,8 +3779,16 @@ test("/goal sisyphus sets up an ordered sequence with the first goal focused", a
 })
 
 test("completing the focused ordered goal auto-promotes the next, then ends the sequence", async () => {
+  let messageCall = 0
+  const completions = [
+    message("done alpha\n[goal:evidence] alpha verified\n[goal:complete]"),
+    message("done alpha\n[goal:evidence] alpha verified\n[goal:complete]"),
+    { ...message("done beta\n[goal:evidence] beta verified\n[goal:complete]"), info: { ...message().info, id: "msg-beta" } },
+    { ...message("done beta\n[goal:evidence] beta verified\n[goal:complete]"), info: { ...message().info, id: "msg-beta" } },
+    { ...message("done gamma\n[goal:evidence] gamma verified\n[goal:complete]"), info: { ...message().info, id: "msg-gamma" } },
+  ]
   const { hooks } = await createHooks({
-    messages: async () => ({ data: [message("done\n[goal:evidence] step verified\n[goal:complete]")] }),
+    messages: async () => ({ data: [completions[Math.min(messageCall++, completions.length - 1)]] }),
     options: { minDelayMs: 1 },
   })
   const sid = "sis-s2"
@@ -3589,10 +3799,16 @@ test("completing the focused ordered goal auto-promotes the next, then ends the 
   assert.equal(currentGoal(sid).condition, "beta")
   assert.equal(currentGoal(sid).stopped, false)
 
-  await idleOnce(hooks, sid) // completes beta → promotes gamma
+  await idleOnce(hooks, sid) // repeated alpha message is only an activation boundary
+  assert.equal(currentGoal(sid).condition, "beta")
+
+  await idleOnce(hooks, sid) // distinct beta completion → promotes gamma
   assert.equal(currentGoal(sid).condition, "gamma")
 
-  await idleOnce(hooks, sid) // completes gamma → sequence exhausted
+  await idleOnce(hooks, sid) // repeated beta message is only an activation boundary
+  assert.equal(currentGoal(sid).condition, "gamma")
+
+  await idleOnce(hooks, sid) // distinct gamma completion → sequence exhausted
   assert.equal(currentGoal(sid), null)
   assert.equal(listSessionGoals(sid).length, 0)
 
@@ -4089,6 +4305,57 @@ test("goal cleared during announceAudit is not archived (liveness re-check after
   assert.ok(!statusOutput.parts[0]?.text?.includes("achieved"))
 })
 
+test("goal replacement during blocker announcement cannot mutate or resurrect the old goal", async () => {
+  let announceStarted
+  let releaseAnnouncement
+  const started = new Promise((resolve) => { announceStarted = resolve })
+  const blocked = new Promise((resolve) => { releaseAnnouncement = resolve })
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [message("Need the user to provide a token\n[goal:blocked]")] }),
+    options: {
+      minDelayMs: 1,
+      auditMessenger: async () => {
+        announceStarted()
+        await blocked
+      },
+    },
+  })
+  const sessionID = "blocker-replacement"
+  await runGoal(hooks, sessionID, "old objective")
+  const idle = hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  await started
+  await runGoal(hooks, sessionID, "replacement objective")
+  releaseAnnouncement()
+  await idle
+  assert.equal(currentGoal(sessionID).condition, "replacement objective")
+  assert.equal(currentGoal(sessionID).stopped, false)
+})
+
+test("agent completion approval cannot delete a goal that replaced it during audit", async () => {
+  let auditStarted
+  let approve
+  const started = new Promise((resolve) => { auditStarted = resolve })
+  const verdict = new Promise((resolve) => { approve = resolve })
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+    completionAuditor: async () => {
+      auditStarted()
+      return verdict
+    },
+  })
+  const sessionID = "tool-audit-replacement"
+  await handlers.setGoal(sessionID, { objective: "old objective" })
+  const completing = handlers.updateGoal(sessionID, { status: "complete", evidence: "tests passed" })
+  await started
+  await handlers.setGoal(sessionID, { objective: "replacement objective" })
+  approve({ approved: true })
+  assert.match(await completing, /goal changed|not recorded/i)
+  assert.equal(currentGoal(sessionID).condition, "replacement objective")
+})
+
 // ── PR C: State machine + security fixes ──────────────────────────────────────
 
 test("formatFailures is preserved through a persistence round-trip", async () => {
@@ -4202,12 +4469,17 @@ test("agent update_goal complete invokes the auditor before archiving", async ()
 
 test("createChildSessionAuditor returns a rejected verdict on timeout", async () => {
   const aborted = []
+  const deleted = []
   const client = {
     session: {
-      create: async () => ({ id: "child-1" }),
+      create: async () => ({ id: "child-1", parentID: "s1" }),
       // prompt never resolves, simulating a hang
       prompt: () => new Promise(() => {}),
-      abort: async (input) => { aborted.push(input) },
+      abort: (input) => {
+        aborted.push(input)
+        return new Promise(() => {})
+      },
+      delete: async (input) => deleted.push(input),
     },
   }
   const auditor = createChildSessionAuditor(client, { timeoutMs: 50 })
@@ -4215,6 +4487,27 @@ test("createChildSessionAuditor returns a rejected verdict on timeout", async ()
   assert.equal(verdict.approved, false)
   assert.match(verdict.reason, /timed out/)
   assert.deepEqual(aborted, [{ path: { id: "child-1" } }])
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(deleted, [{ path: { id: "child-1" } }])
+})
+
+test("built-in auditor deletes its verifier child after extracting a verdict", async () => {
+  const deleted = []
+  const client = {
+    session: {
+      create: async () => ({ id: "child-2", parentID: "s2" }),
+      prompt: async () => ({ parts: [textPart("Verified.\n[audit:approved]")] }),
+      delete: async (input) => deleted.push(input),
+    },
+  }
+  const verdict = await createChildSessionAuditor(client)({
+    goal: { condition: "ship it" },
+    sessionID: "s2",
+    latestText: "done",
+  })
+  assert.equal(verdict.approved, true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(deleted, [{ path: { id: "child-2" } }])
 })
 
 test("completionAudit rejects unsafe agent registration combinations", async () => {
@@ -4228,6 +4521,89 @@ test("completionAudit rejects unsafe agent registration combinations", async () 
     hooks.config({ agent: { "goal-verify": { mode: "subagent" } } }),
     /cannot safely use existing agent/,
   )
+})
+
+test("built-in completion audit stays fail-closed when verifier ownership was not confirmed", async () => {
+  let childCreates = 0
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [message("Done.\n[goal:evidence] suite green\n[goal:complete]")],
+      }),
+      promptAsync: async () => ({}),
+      create: async () => {
+        childCreates += 1
+        return { id: "unsafe-child", parentID: "ownership-unconfirmed" }
+      },
+      prompt: async () => ({ parts: [textPart("[audit:approved]")] }),
+    },
+  }
+  const hooks = await GoalPlugin({ client }, {
+    persistState: false,
+    minDelayMs: 1,
+    completionAudit: true,
+  })
+  await assert.rejects(
+    hooks.config({ agent: { "goal-verify": { mode: "subagent" } } }),
+    /cannot safely use existing agent/,
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "ownership-unconfirmed", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "ownership-unconfirmed", status: { type: "idle" } },
+    },
+  })
+  assert.equal(childCreates, 0)
+  assert.equal(currentGoal("ownership-unconfirmed").stopReason, "audit rejected")
+})
+
+test("agent completion remains paused when neither state nor ledger records the terminal event", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => false,
+    persistTerminalState: async () => false,
+  })
+  await handlers.setGoal("dual-storage-failure", { objective: "ship it" })
+  const result = await handlers.updateGoal("dual-storage-failure", {
+    status: "complete",
+    evidence: "suite green",
+  })
+  assert.match(result, /could not be persisted/)
+  const goal = currentGoal("dual-storage-failure")
+  assert.ok(goal)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "terminal persistence failed")
+})
+
+test("ordered completion storage failure rolls back premature successor promotion", async () => {
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "ordered-storage-failure", arguments: "sisyphus first; second" },
+    { parts: [] },
+  )
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => false,
+    persistTerminalState: async () => false,
+  })
+  const result = await handlers.updateGoal("ordered-storage-failure", {
+    status: "complete",
+    evidence: "verified",
+  })
+  assert.match(result, /could not be persisted/)
+  const goals = listSessionGoals("ordered-storage-failure")
+  assert.equal(currentGoal("ordered-storage-failure").condition, "first")
+  assert.equal(currentGoal("ordered-storage-failure").stopReason, "terminal persistence failed")
+  assert.equal(goals.find((goal) => goal.condition === "second").stopReason, "queued")
 })
 
 test("ledger cross-check removes completed goals still active in a stale state file on restart", async () => {
@@ -4277,6 +4653,48 @@ test("ledger cross-check removes completed goals still active in a stale state f
     assert.equal(currentGoal("xcheck-s1"), null)
   } finally {
     setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("ledger-only ordered completion promotes the queued successor during restart recovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ordered-ledger-xcheck-"))
+  const stateFilePath = join(dir, "state.json")
+  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { stateFilePath, minDelayMs: 1 })
+    await first["command.execute.before"](
+      { command: "goal", sessionID: "ordered-ledger-restart", arguments: "sisyphus first; second" },
+      { parts: [] },
+    )
+    const firstGoal = currentGoal("ordered-ledger-restart")
+    await first.dispose()
+    first = null
+
+    assert.equal(appendLedgerLine(ledgerFilePath, {
+      ts: Date.now(),
+      sessionID: "ordered-ledger-restart",
+      goalId: firstGoal.goalId,
+      condition: firstGoal.condition,
+      type: "completed",
+      detail: "state write was lost",
+    }), true)
+
+    second = await GoalPlugin({ client }, { stateFilePath, minDelayMs: 1 })
+    const recovered = currentGoal("ordered-ledger-restart")
+    assert.ok(recovered)
+    assert.equal(recovered.condition, "second")
+    assert.equal(recovered.stopped, false)
+    assert.equal(listSessionGoals("ordered-ledger-restart").length, 1)
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
     await rm(dir, { recursive: true, force: true })
   }
 })

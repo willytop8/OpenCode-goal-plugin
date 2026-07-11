@@ -5,6 +5,11 @@ const SHAPE_ERROR_PATTERNS = [
   /(?:validation|schema|invalid input|invalid argument)/i,
 ]
 
+// Only read-only operations may be retried with another argument shape. A
+// TypeError can be raised after a mutating SDK call has already reached the
+// host, so replaying create/prompt/update/delete/abort could duplicate side effects.
+const REPLAY_SAFE_OPERATIONS = new Set(["messages", "get"])
+
 function isArgumentShapeError(error) {
   if (!(error instanceof TypeError)) return false
   const message = String(error.message || "")
@@ -46,7 +51,9 @@ export function createOpenCodeSessionApi(client, options = {}) {
       shapes.set(operation, firstShape)
       return unwrapData(response)
     } catch (error) {
-      if (knownShape || !isArgumentShapeError(error)) throw error
+      if (knownShape || !REPLAY_SAFE_OPERATIONS.has(operation) || !isArgumentShapeError(error)) {
+        throw error
+      }
       const fallbackShape = firstShape === "flat" ? "legacy" : "flat"
       const fallbackInput = fallbackShape === "flat" ? flatInput : legacyInput
       const response = await method.call(client.session, fallbackInput)
@@ -90,6 +97,9 @@ export function createOpenCodeSessionApi(client, options = {}) {
     },
     get(sessionID) {
       return invoke("get", { sessionID }, { path: { id: sessionID } })
+    },
+    delete(sessionID) {
+      return invoke("delete", { sessionID }, { path: { id: sessionID } })
     },
     abort(sessionID) {
       return invoke("abort", { sessionID }, { path: { id: sessionID } })

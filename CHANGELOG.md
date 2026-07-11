@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-07-10
+
+- Default-deny verifier tools except read/glob/grep, and fail closed unless the owned verifier agent registers successfully.
+- Require exact final-line audit verdicts and adjacent bounded completion evidence to prevent quoted-marker false approvals.
+- Prevent mutating SDK shape retries, validate child-session ancestry, and make auditor timeout independent of a hanging abort.
+- Move context-budget reset to the successful `session.compacted` event and prevent ordered goals from reusing a prior goal's completion message.
+- Drain accepted persistence writes before disposal, suppress late disposed-instance writes, and re-check goal identity after asynchronous audits/announcements.
+- Harden persistence recovery with bounded hostile-state parsing, cross-session-safe ledger identities, multi-goal snapshots, archive restoration, corrupt-state quarantine, stale malformed-lock recovery, symlink-safe ledger appends, and exclusive one-project legacy migration with preserved backups.
+- Fail closed when neither terminal state nor ledger can be persisted; keep the goal paused instead of claiming archival.
+- Preserve paused time for queued/backgrounded goals, expose an opt-out for the tool-free heuristic, honor host `tokens.total`, and improve multi-step usage/cost availability accounting.
+- Add conditional TypeScript export mappings, an OpenCode engine range, honest auditor/visibility documentation, and cache-safe near-limit continuation warnings.
+
 ## 0.6.0 — 2026-07-10
 
 > Adds canonical structured goal tools, native goal and read-only verifier agents, fail-closed completion verification, safer OpenCode SDK compatibility, bounded persistence, and stronger lifecycle isolation. Existing command workflows and legacy tool aliases remain supported.
@@ -147,7 +159,7 @@
 ### Storage, tools & packaging
 
 - **Default goal state to a project-local path, with an env override and migration fallbacks.** State resolves as `stateFilePath` option → `OPENCODE_GOAL_STATE_PATH` env var → project-local `<cwd>/.opencode/goals/state.json` (previously `~/.opencode-goal-plugin/state.json`). When the default path is empty, the plugin migrates forward on first load from the legacy home path and the XDG path, then writes project-local. Explicit option/env paths are literal with no fallback; a present-but-corrupt primary is preserved. New `resolveStateFilePath` / `xdgStateFilePath` / `legacyStateFilePaths` helpers. Home-based fallback paths resolve from an injectable `env.HOME` (falling back to `os.homedir()`), making path resolution deterministic across platforms — `os.homedir()` ignores `$HOME` on macOS. Implements megalist items 6.1 and 6.2.
-- _**Correction (2026-06-21):** an earlier version of this entry claimed agent-facing goal tools shipped in 0.3.0. They did not — the work was on an unmerged branch (`wr/agent-tools`) and was never included in the 0.3.0 release. The feature now actually ships; see the **Unreleased** section above. Megalist items 7.1 and 7.2._
+- _**Correction (2026-06-21):** an earlier version of this entry claimed agent-facing goal tools shipped in 0.3.0. They did not — the work was on an unmerged branch (`wr/agent-tools`) and was never included in the 0.3.0 release. The feature now actually ships; see the **0.6.0** section above. Megalist items 7.1 and 7.2._
 - **Release automation note.** Development included a proposed npm Trusted Publishing workflow, but `.github/workflows/publish.yml` was not part of the final release history and is not present in the current repository. Releases therefore remain manual unless a separately reviewed publishing workflow is added. No package is published solely by the CI workflow documented in this repository.
 
 ## 0.2.0 — 2026-06-14

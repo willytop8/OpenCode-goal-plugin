@@ -1,6 +1,6 @@
 const GOAL_AGENT_PROMPT = `Execute explicit goals persistently. Use goal tools to track state and checkpoints. Make concrete progress; claim completion only with verification evidence. Report only genuine blockers.`
 
-const VERIFIER_AGENT_PROMPT = `Independently verify the claim against the goal, constraints, evidence, and workspace. Use read-only checks; never edit or mutate goal state. Approve only when proven; otherwise give one actionable reason.`
+const VERIFIER_AGENT_PROMPT = `Independently verify the claim against the goal, constraints, evidence, and workspace. Use only the read, glob, and grep tools; never edit, execute commands, call other tools, or mutate goal state. Approve only when proven; otherwise give one actionable reason.`
 
 export function applyNativeGoalConfig(config, options = {}) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
@@ -40,6 +40,10 @@ export function applyNativeGoalConfig(config, options = {}) {
     hidden: true,
     prompt: VERIFIER_AGENT_PROMPT,
     permission: {
+      "*": "deny",
+      read: "allow",
+      glob: "allow",
+      grep: "allow",
       edit: "deny",
       bash: "deny",
     },
