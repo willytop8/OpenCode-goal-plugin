@@ -8,39 +8,85 @@ on:
   schedule:
     - cron: "0 8 * * 1"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
-  check:
+  node-compatibility:
+    name: Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        node-version: [18, 20, 22, 24]
+        node-version: ["18", "20", "22", "24"]
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: ${{ matrix.node-version }}
-
-      - name: Run checks
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run syntax and unit tests
         run: npm run check
 
+  quality-contracts:
+    name: Quality and package contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
       - name: Run tests with coverage
         run: npm run test:coverage
-
+      - name: Compile installed-package type contracts
+        run: npm run type:check
+      - name: Prove critical tests kill safety regressions
+        run: npm run test:mutation
       - name: Run behavior and efficiency benchmark
         run: npm run benchmark:behavior
-
-      - name: Run package smoke test
+      - name: Run source package smoke test
         run: npm run smoke
-
       - name: Verify installed tarball host contract
         run: npm run smoke:packed-host
-
+      - name: Verify installed tarball tool contract
+        run: npm run smoke:packed-tools
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
       - name: Verify package contents
         run: npm run pack:check
+
+  filesystem-compatibility:
+    name: Filesystem (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run portable lifecycle and filesystem tests
+        run: node --test test/host-lifecycle.test.js test/persistence-lease.test.js test/public-hook-cancellation.test.js

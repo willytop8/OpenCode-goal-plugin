@@ -1,6 +1,6 @@
 {
   "name": "opencode-goal-plugin",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
   "main": "./src/goal-plugin.js",
@@ -22,7 +22,7 @@
   },
   "files": [
     "src",
-    "scripts",
+    "scripts/verify.mjs",
     "examples",
     "demo",
     "docs",
@@ -36,13 +36,18 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:model": "node --test test/lifecycle-model.test.js",
+    "test:mutation": "node scripts/mutation-contract.mjs",
     "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
+    "type:check": "node scripts/type-contract.mjs",
     "smoke": "node scripts/smoke-command-hook.mjs",
     "smoke:packed-host": "node scripts/packed-host-contract.mjs",
+    "smoke:packed-tools": "node scripts/packed-tool-contract.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "verify": "node scripts/verify.mjs",
     "check": "node -c src/goal-plugin.js && npm test",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "release:check": "npm run check && npm run test:coverage && npm run type:check && npm run test:mutation && npm run benchmark:behavior && npm run smoke && npm run smoke:packed-host && npm run smoke:packed-tools && npm run verify && npm audit --omit=dev --audit-level=high && npm run pack:check"
   },
   "keywords": [
     "opencode",
@@ -73,5 +78,9 @@
   "homepage": "https://github.com/willytop8/OpenCode-goal-plugin#readme",
   "author": {
     "name": "willytop8"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.18",
+    "typescript": "5.9.3"
   }
 }

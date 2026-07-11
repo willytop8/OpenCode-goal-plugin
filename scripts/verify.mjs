@@ -9,6 +9,7 @@ import assert from "node:assert/strict"
 const REQUIRED_HOOKS = [
   "config",
   "command.execute.before",
+  "tool.execute.before",
   "event",
   "experimental.chat.system.transform",
   "experimental.compaction.autocontinue",

@@ -1051,7 +1051,11 @@ test("stopped goals can be resumed", async () => {
 
   const stoppedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, stoppedOutput)
-  assert.equal(stoppedOutput.system.length, 0)
+  assert.equal(stoppedOutput.system.length, 1)
+  assert.match(stoppedOutput.system[0], /<goal_state>paused<\/goal_state>/)
+  assert.match(stoppedOutput.system[0], /do not change files or goal state/i)
+  assert.doesNotMatch(stoppedOutput.system[0], /<goal_objective>/)
+  assert.doesNotMatch(stoppedOutput.system[0], /Keep working until/)
 
   const resumeOutput = { parts: [] }
   await hooks["command.execute.before"](
@@ -1063,6 +1067,73 @@ test("stopped goals can be resumed", async () => {
   const resumedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, resumedOutput)
   assert.equal(resumedOutput.system.length, 1)
+  assert.match(resumedOutput.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+  assert.match(resumedOutput.system[0], /Keep working until/)
+})
+
+test("inspection, pause, and clear commands block mutation tools when command text reaches the model", async () => {
+  const { hooks } = await createHooks()
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "status" },
+    { parts: [] },
+  )
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "set_goal", sessionID: "session-read-only", callID: "empty-status-call" },
+      { args: { objective: "stale work" } },
+    ),
+    /control command.*set_goal.*blocked/i,
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-read-only", status: { type: "idle" } },
+    },
+  })
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "pause" },
+    { parts: [] },
+  )
+  await assert.doesNotReject(() => hooks["tool.execute.before"](
+    { tool: "goal_status", sessionID: "session-read-only", callID: "status-call" },
+    { args: {} },
+  ))
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "write", sessionID: "session-read-only", callID: "write-call" },
+      { args: { filePath: "unsafe.txt", content: "unexpected" } },
+    ),
+    /control command.*write.*blocked/i,
+  )
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "clear" },
+    { parts: [] },
+  )
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "set_goal", sessionID: "session-read-only", callID: "clear-call" },
+      { args: { objective: "resurrect stale work" } },
+    ),
+    /control command.*set_goal.*blocked/i,
+  )
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-read-only", status: { type: "idle" } },
+    },
+  })
+  await assert.doesNotReject(() => hooks["tool.execute.before"](
+    { tool: "write", sessionID: "session-read-only", callID: "later-write-call" },
+    { args: {} },
+  ))
 })
 
 test("resume after a limit stop starts a fresh local budget", async () => {
@@ -3094,7 +3165,7 @@ test("buildCompactionContext includes the latest checkpoint when present", () =>
   assert.match(context, /finish the audit/)
 })
 
-test("buildCompactionProgressSummary is deterministic and built from the persisted record (item 6.3)", () => {
+test("buildCompactionProgressSummary is deterministic and built from the persisted record", () => {
   const now = Date.now()
   const goal = {
     checkpoints: [
@@ -3506,7 +3577,7 @@ test("completed archives survive a persistence round-trip", async () => {
   }
 })
 
-// ── Visible audit messages (item 2.4) ──────────────────────────────────────
+// ── Visible audit messages ─────────────────────────────────────────────────
 
 test("completion emits visible audit-start and audit-result messages", async () => {
   const audits = []
@@ -3592,7 +3663,7 @@ test("defaultAuditMessenger posts through client.app.log and tolerates its absen
   await defaultAuditMessenger({}, "s", "x")
 })
 
-// ── Separate completion auditor (item 2.2) ─────────────────────────────────
+// ── Separate completion auditor ────────────────────────────────────────────
 
 test("parseAuditVerdict reads the verdict marker and reason", () => {
   assert.deepEqual(parseAuditVerdict("looks complete\n[audit:approved]"), { approved: true, reason: "" })
@@ -3753,7 +3824,7 @@ test("createChildSessionAuditor requires an explicit policy to approve operation
   )
 })
 
-// ── Sisyphus ordered goals (item 3.4) ──────────────────────────────────────
+// ── Sisyphus ordered goals ─────────────────────────────────────────────────
 
 async function idleOnce(hooks, sessionID) {
   await hooks.event({
@@ -3856,7 +3927,7 @@ test("ordered (sisyphus) flag survives a persistence round-trip", async () => {
   }
 })
 
-// ── Agent-facing tools (megalist items 7.1 / 7.2) ──────────────────────────
+// ── Agent-facing tools ─────────────────────────────────────────────────────
 
 function makeAgentHandlers(options = {}) {
   const persistCalls = []
@@ -3978,7 +4049,7 @@ test("buildAgentTools wraps handlers into OpenCode tool defs and routes by sessi
     "set_goal",
     "update_goal",
   ])
-  // The set_goal description constrains autonomous use (item 7.2).
+  // The set_goal description constrains autonomous use.
   assert.match(tools.set_goal.description, /ONLY call this when the user explicitly asks/)
 
   const sid = "agent-tool-s1"
@@ -4173,24 +4244,40 @@ test("canonical errors use state and stable codes instead of parsing legacy pros
   assert.match(rejected.message, /custom provider verdict/)
 })
 
-test("/goal resume does not leak a stale registry entry on later clear", async () => {
+test("/goal resume preserves registry identity and clears cleanly", async () => {
   const { hooks } = await createHooks()
   const run = (args) =>
     hooks["command.execute.before"]({ command: "goal", sessionID: "resume-leak", arguments: args }, { parts: [] })
 
   await run("ship it")
   assert.equal(listSessionGoals("resume-leak").length, 1)
+  const goalId = currentGoal("resume-leak").goalId
   await run("pause")
-  // resume rotates the goalId via resetGoalBudget; the registry must be re-keyed.
   await run("resume")
   assert.equal(listSessionGoals("resume-leak").length, 1)
+  assert.equal(currentGoal("resume-leak").goalId, goalId)
   await run("clear")
-  // Before the re-key fix this left a stale goal behind (length 1).
   assert.equal(listSessionGoals("resume-leak").length, 0)
   assert.equal(currentGoal("resume-leak"), null)
 })
 
-// ── PR B: Concurrency + Persistence fixes ─────────────────────────────────────
+test("resuming a backgrounded goal preserves creation order", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "resume-order"
+  const run = (args) =>
+    hooks["command.execute.before"]({ command: "goal", sessionID, arguments: args }, { parts: [] })
+
+  await run("first")
+  await run("add second")
+  await run("add third")
+  await run("focus 1")
+  await run("pause")
+  await run("resume")
+
+  assert.deepEqual(listSessionGoals(sessionID).map(({ condition }) => condition), ["first", "second", "third"])
+})
+
+// ── Concurrency and persistence ────────────────────────────────────────────────
 
 test("/goal clear records a 'cleared' ledger event so cleared goals are not reconstructed after restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-clear-ledger-"))
@@ -4356,7 +4443,7 @@ test("agent completion approval cannot delete a goal that replaced it during aud
   assert.equal(currentGoal(sessionID).condition, "replacement objective")
 })
 
-// ── PR C: State machine + security fixes ──────────────────────────────────────
+// ── State machine and security ────────────────────────────────────────────────
 
 test("formatFailures is preserved through a persistence round-trip", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ff-"))
@@ -5215,30 +5302,29 @@ test("approved completion that is lost while auditor runs produces an announceme
   assert.equal(currentGoal("lost-completion-s1"), null, "goal must be gone (was cleared)")
 })
 
-// ── PR G: Low-severity cleanups ───────────────────────────────────────────────
+// ── Regression coverage ──────────────────────────────────────────────────────
 
-test("agent updateGoal status='resumed' does not leak a stale registry entry on later clear", async () => {
-  // resetGoalBudget always rotates goalId; the registry must be re-keyed
-  // unconditionally (rank 42 fix — removed dead if-conditional in agent path).
+test("agent updateGoal status='resumed' preserves identity and clears cleanly", async () => {
   const { handlers } = makeAgentHandlers()
   const sid = "agent-resume-leak"
 
   await handlers.setGoal(sid, { objective: "ship it" })
   assert.equal(listSessionGoals(sid).length, 1)
+  const goalId = currentGoal(sid).goalId
 
   await handlers.updateGoal(sid, { status: "paused" })
   await handlers.updateGoal(sid, { status: "resumed" })
   assert.equal(listSessionGoals(sid).length, 1, "registry must have exactly one entry after resume")
+  assert.equal(currentGoal(sid).goalId, goalId)
 
   await handlers.clearGoal(sid)
-  // Before the fix a stale pre-resume goalId entry remained.
   assert.equal(listSessionGoals(sid).length, 0, "registry must be empty after clear")
   assert.equal(currentGoal(sid), null)
 })
 
 test("null-assistant idle does not accumulate noToolCallTurns", async () => {
   // When messages() returns only a user message (latestAssistant === null),
-  // the noToolCallTurns counter must be reset, not incremented (rank 43 fix).
+  // the noToolCallTurns counter must be reset, not incremented.
   const { hooks } = await createHooks({
     messages: async () => ({
       data: [{ info: { id: "msg-user-only", role: "user", sessionID: "null-asst-notool" }, parts: [textPart("hi")] }],
@@ -5267,7 +5353,7 @@ test("null-assistant idle does not accumulate noToolCallTurns", async () => {
 test("null-assistant idle does not accumulate noProgressTurns", async () => {
   // When messages() returns only a user message (latestAssistant === null,
   // latestOutputTokens === null), the noProgressTurns counter must be reset,
-  // not incremented (rank 44 fix).
+  // not incremented.
   const { hooks } = await createHooks({
     messages: async () => ({
       data: [{ info: { id: "msg-user-only2", role: "user", sessionID: "null-asst-noprog" }, parts: [textPart("hi")] }],
