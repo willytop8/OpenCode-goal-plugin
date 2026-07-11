@@ -206,7 +206,7 @@ function messageHasToolCall(message) {
 
 const GOAL_MODES = new Set(["normal", "ordered"])
 
-// Goal "mode" field (item 4.3): normal vs ordered (a.k.a. sisyphus). `ordered`
+// Goal mode: normal vs ordered (a.k.a. sisyphus). `ordered`
 // signals a strict execution sequence; `sisyphus` is accepted as an alias.
 // Returns the canonical mode or null when unrecognized.
 function normalizeMode(value) {
@@ -289,12 +289,12 @@ function makeHistoryEntry(type, detail, timestamp = Date.now()) {
   }
 }
 
-// Append-only lifecycle ledger (item 2.3). pushHistory emits every lifecycle
+// Append-only lifecycle ledger. pushHistory emits every lifecycle
 // event to this sink, which a configured plugin instance points at a JSONL
 // file. Because the in-memory history is truncated to MAX_HISTORY_ENTRIES, the
 // ledger is the durable record used to reconstruct state if the main state file
 // is lost or corrupted, and it captures terminal events even when the main
-// state write fails (fail-closed, item 2.5).
+// state write fails (fail closed).
 function setLedgerSink(sink) {
   currentRuntime().ledgerSink = typeof sink === "function" ? sink : null
 }
@@ -1001,7 +1001,7 @@ async function assertSafeProjectPersistencePath({ stateFilePath, projectRoot, en
   }
 }
 
-// Command surface options (item 8.2): `commandName` lets the plugin own a
+// Command surface options: `commandName` lets the plugin own a
 // different slash command (e.g. /objective) and `registerCommand: false` makes
 // the plugin skip the command hook entirely (agent/programmatic use only). A
 // leading slash in commandName is tolerated and stripped.
@@ -1418,7 +1418,7 @@ async function loadPersistedState(persistenceOptions, client) {
 
 // Last-resort recovery: when the main state file is absent, rebuild still-active
 // goals from the append-only ledger so a lost/rotated state file does not drop
-// in-flight goals (item 2.3). Recovered goals are paused (via deserializeGoal).
+// in-flight goals. Recovered goals are paused (via deserializeGoal).
 async function reconstructFromLedger(persistenceOptions, client) {
   const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
     maxBytes: persistenceOptions.ledgerMaxBytes,
@@ -1788,7 +1788,7 @@ function buildContinueMessage(
 
 // Deterministic progress summary built from the plugin's persisted goal record
 // (checkpoints + lifecycle history) rather than from chat memory, so it is
-// stable and reproducible across a compaction (item 6.3).
+// stable and reproducible across a compaction.
 function buildCompactionProgressSummary(goal, { maxCheckpoints = 3, maxEvents = 6 } = {}) {
   const lines = []
   const checkpoints = Array.isArray(goal.checkpoints) ? goal.checkpoints.slice(-maxCheckpoints) : []
@@ -2069,7 +2069,7 @@ function isPluginContinuationMessage(message) {
 
 // "Latest instruction wins": detect a real (human) user message that arrived
 // after the plugin's most recent continuation prompt. Plugin-generated
-// continuation/audit messages are ignored (item 5.2). Detection requires the
+// continuation/audit messages are ignored. Detection requires the
 // loop to be running (turnCount > 0) and a plugin continuation to be visible in
 // the recent window, so the first idle after /goal set and sessions where the
 // continuations have scrolled out of view are never misread as intervention.
@@ -2139,7 +2139,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
 const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed"])
 
 // Programmatic equivalents of the /goal command, exposed to the agent as tools
-// (megalist items 7.1 / 7.2). Each handler operates on a session id and mutates
+// Each handler operates on a session id and mutates
 // the same in-memory state the command path uses, persisting through the
 // provided `persist` callback, and returns a human-readable string for the tool
 // result. Goal creation/replacement routes through the multi-goal registry
@@ -2356,12 +2356,9 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
       } else if (status === "resumed") {
         if (!goal.stopped)
           return "Goal is already running. Pause or stop it first if you want to reset the budget window."
-        const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
-        // re-key the registry so the goal stays findable by its new id.
-        removeSessionGoal(sessionID, previousGoalId)
-        registerSessionGoal(goal)
+        // goalId is stable across budget windows; runId is the execution epoch.
+        // Keeping the existing registry entry also preserves multi-goal order.
         focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
@@ -2594,7 +2591,7 @@ function formatGoalList(sessionID, commandName = "goal") {
   return lines.join("\n")
 }
 
-// Visible audit messages (item 2.4): when the plugin audits a completion or
+// Visible audit messages: when the plugin audits a completion or
 // blocker it announces the audit and its result instead of doing the work
 // silently. Delivery is via this default messenger (structured app log, the
 // channel OpenCode surfaces to the user) or a caller-supplied `auditMessenger`
@@ -2623,7 +2620,7 @@ async function defaultAuditMessenger(client, sessionID, text) {
   }
 }
 
-// Completion auditor (item 2.2). When an auditor is configured, a [goal:complete]
+// Completion auditor. When an auditor is configured, a [goal:complete]
 // is verified before the goal is archived: an approved verdict archives it, a
 // rejected verdict restores the goal (pauses it with the reason) instead of
 // archiving. The auditor is a function `({ goal, sessionID, latestText }) =>
@@ -2783,7 +2780,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   }
   runtime.drainPersistence = () => persistChain.catch(() => false)
 
-  // Fail-closed (item 2.5): when persisting a terminal state (complete/blocked)
+  // Fail closed when persisting a terminal state (complete/blocked)
   // fails, surface it loudly. The terminal event is already in the append-only
   // ledger, so it stays recoverable across a restart even though the main state
   // file write did not land.
@@ -2810,7 +2807,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     setLedgerSink(null)
   }
 
-  // Visible audit announcements (item 2.4).
+  // Visible audit announcements.
   const auditMessagesEnabled = pluginOptions.auditMessages !== false
   const auditMessenger =
     typeof pluginOptions.auditMessenger === "function"
@@ -2987,12 +2984,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           return
         }
 
-        const previousGoalId = goal.goalId
         resetGoalBudget(goal)
-        // resetGoalBudget always rotates goalId via randomUUID; unconditionally
-        // re-key the registry so a later clear/replace removes the right entry.
-        removeSessionGoal(sessionID, previousGoalId)
-        registerSessionGoal(goal)
+        // goalId is stable across budget windows; runId is the execution epoch.
+        // Keeping the existing registry entry also preserves multi-goal order.
         focusGoal(sessionID, goal)
         goal.stopped = false
         goal.stopReason = ""
@@ -3478,7 +3472,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             // bail out without archiving — archiving a cleared goal would resurrect
             // it in memory and potentially in the persisted state.
             if (!activeGoal(sessionID, goalID, runID)) return
-            // Optional independent auditor (item 2.2): an approved verdict
+            // Optional independent auditor: an approved verdict
             // archives; a rejected verdict restores (pauses) the goal instead.
             if (completionAuditor) {
               let verdict
@@ -3930,13 +3924,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
   }
 
-  // register_command toggle (item 8.2): when disabled, the plugin does not own
+  // register_command toggle: when disabled, the plugin does not own
   // a slash command and only the event/transform/compaction hooks remain.
   if (!registerCommand) {
     delete hooks["command.execute.before"]
   }
 
-  // Register agent-facing tools (megalist 7.1 / 7.2) when @opencode-ai/plugin is
+  // Register agent-facing tools when @opencode-ai/plugin is
   // available (it provides the `tool` helper and zod-style schema). Disabled via
   // `registerTools: false`. When the helper is absent the command/event hooks
   // still work; only the programmatic tool surface is omitted, preserving the

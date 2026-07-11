@@ -2,18 +2,16 @@
 
 ## Supported Versions
 
-This project is experimental. Security fixes are provided for the latest published version only.
+Security fixes are provided for the latest published version only. Users should
+upgrade to the newest patch release before reporting a vulnerability.
 
 ## Reporting a Vulnerability
 
-GitHub private vulnerability reporting may not always be enabled for this repository.
-
-Until a dedicated private reporting channel is documented here, do **not** open a public issue with exploit details, credentials, local paths, or reproduction steps that could expose user data or local system access.
-
-Instead:
-
-1. open a minimal public issue asking for a private contact path, or
-2. contact the maintainer through their GitHub profile and request a private handoff.
+Use [GitHub's private vulnerability report](https://github.com/willytop8/OpenCode-goal-plugin/security/advisories/new).
+Do **not** open a public issue with exploit details, credentials, local paths, or
+reproduction steps that could expose user data or local system access. If private
+reporting is temporarily unavailable, contact the maintainer through their GitHub
+profile and request a private handoff.
 
 ## Scope
 

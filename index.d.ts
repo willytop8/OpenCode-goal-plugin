@@ -17,10 +17,58 @@ export interface CompletionAuditVerdict {
   reason?: string
 }
 
+/** A timestamped lifecycle entry retained with an active or archived goal. */
+export interface GoalHistoryEntry {
+  type: string
+  detail: string
+  timestamp: number
+}
+
+/** A bounded progress checkpoint retained with a goal. */
+export interface GoalCheckpoint {
+  summary: string
+  timestamp: number
+}
+
+/** Normalized token and cost usage accumulated for the current goal run. */
+export interface GoalUsage {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+  costKnown: boolean
+}
+
+/** Read-only goal snapshot passed to custom completion auditors. */
+export interface GoalAuditSnapshot {
+  goalId: string
+  runId: string
+  condition: string
+  successCriteria: string
+  constraints: string
+  mode: "normal" | "sisyphus"
+  sessionID: string
+  turnCount: number
+  startedAt: number
+  pausedAt: number
+  totalTokens: number
+  usage: Readonly<GoalUsage>
+  options: Readonly<GoalPluginOptions>
+  lastStatus: string
+  blockedReason: string
+  stopped: boolean
+  stopReason: string
+  history: readonly Readonly<GoalHistoryEntry>[]
+  checkpoints: readonly Readonly<GoalCheckpoint>[]
+  lastCheckpoint: Readonly<GoalCheckpoint> | null
+}
+
 /** Arguments passed to a custom {@link GoalPluginOptions.auditor} function. */
 export interface CompletionAuditContext {
   /** The goal being audited (objective, budget usage, checkpoints, etc.). */
-  goal: unknown
+  goal: Readonly<GoalAuditSnapshot>
   /** The OpenCode session ID the goal belongs to. */
   sessionID: string
   /** The assistant's latest response text, containing the `[goal:evidence]`/`[goal:complete]` claim. */
@@ -283,10 +331,10 @@ export interface GoalPluginOptions {
 
   /**
    * Custom sink for audit announcements. Defaults to routing through
-   * OpenCode's structured log (`client.app.log`). Provide this to route
-   * audit messages elsewhere, e.g. into the live conversation.
+   * OpenCode's structured log (`client.app.log`) and TUI toast when those
+   * host APIs are available. Provide this to route audit messages elsewhere.
    */
-  auditMessenger?: (sessionID: string, text: string) => Promise<void>
+  auditMessenger?: (sessionID: string, text: string) => Promise<void> | void
 }
 
 /**
@@ -312,7 +360,6 @@ export interface GoalPluginHooks {
   tool?: Record<string, unknown>
   /** Cancels pending continuation work and releases this plugin instance. */
   dispose: () => Promise<void>
-  [hook: string]: unknown
 }
 
 /**

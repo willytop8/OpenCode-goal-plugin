@@ -3,10 +3,10 @@
 [![npm version](https://img.shields.io/npm/v/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-goal-plugin)](https://www.npmjs.com/package/opencode-goal-plugin)
 [![CI](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](test/)
+[![CodeQL](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/codeql.yml/badge.svg)](https://github.com/willytop8/OpenCode-goal-plugin/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An experimental session-scoped `/goal` command for [OpenCode](https://opencode.ai/).
+A session-scoped `/goal` workflow for [OpenCode](https://opencode.ai/).
 
 Set a goal and the plugin keeps it in context, auto-continues the session whenever the assistant goes idle, and stops when the goal is marked complete, a blocker is reported, or a safety limit is reached.
 
@@ -27,8 +27,12 @@ This project is independently implemented for OpenCode. Product names used elsew
 | Surface | Status |
 |---|---|
 | Node.js | Declared support: `>=18`; CI covers Node 18, 20, 22, and 24 |
-| Package entrypoint | `npm run smoke` verifies the package export path plus `/goal` command-hook behavior from a local install without invoking a model |
+| Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows |
+| Package entrypoint | Installed-tarball contracts verify both export paths, consumer TypeScript resolution, hooks, and all 11 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
+
+See the [compatibility policy](docs/compatibility.md) for the supported public
+surface and versioning expectations.
 
 ### OpenCode version compatibility
 
@@ -396,7 +400,7 @@ If a goal does not continue:
 2. Run `/goal resume` only after resolving the reported reason. Resume creates a fresh local budget window; it does not erase the objective or history.
 3. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 4. Confirm the configured project directory and state-path precedence described under [Safety limits](#safety-limits). A daemon started elsewhere can otherwise make a manually configured relative path surprising.
-5. Run `npm run verify`, `npm run smoke`, and `npm run smoke:packed-host` against the installed source when diagnosing registration or packaging problems. `npm run benchmark:behavior` exercises completion, false-completion, loop, interruption, compaction, and restart behavior without a provider call.
+5. Run `npm run verify`, `npm run smoke`, and `npm run smoke:packed-host` against the installed source when diagnosing registration or packaging problems. Maintainers can run `npm run release:check` for the complete artifact and quality gate. `npm run benchmark:behavior` exercises completion, false-completion, loop, interruption, compaction, and restart behavior without a provider call.
 
 Do not paste `state.json`, its ledger, or verbose logs into a public issue without reviewing them first: they can contain goal text, assistant checkpoints, blockers, local paths, and command evidence. Prefer the bounded status/history output and redact project-specific content. There is intentionally no broad "dump diagnostics" tool: exposing process-wide session state or persistence paths to the model would add more privacy risk than troubleshooting value.
 
@@ -427,12 +431,16 @@ Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode wil
 ```sh
 npm test                # run the test suite
 npm run test:coverage   # run tests with coverage
+npm run type:check      # compile installed-package consumers
+npm run test:mutation   # prove critical regressions are detected
 npm run smoke           # verify package export + command hook without a model call
 npm run smoke:packed-host # install the packed tarball and exercise the host contract
+npm run smoke:packed-tools # verify all tools from an installed tarball
 npm run benchmark:behavior # deterministic autonomy + token-efficiency scenarios
 npm run verify          # verify the installed plugin hook surface
 npm run check           # syntax check + tests
 npm run pack:check      # verify package contents before publishing
+npm run release:check   # run the complete release gate
 ```
 
 ## License
