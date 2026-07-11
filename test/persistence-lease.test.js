@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile, mkdir, utimes } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawn } from "node:child_process"
@@ -28,6 +28,22 @@ test("persistence lease reclaims a dead same-host owner", async () => {
   const owner = JSON.parse(await readFile(`${lock}/owner.json`, "utf8"))
   assert.notEqual(owner.token, "old")
   await lease.release()
+  await rm(dir, { recursive: true, force: true })
+})
+
+test("persistence lease protects fresh malformed locks and reclaims old ones", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-lease-malformed-"))
+  const state = join(dir, "state.json")
+  const lock = `${state}.lock`
+  await mkdir(lock)
+  await writeFile(`${lock}/owner.json`, "{truncated")
+  await assert.rejects(
+    acquirePersistenceLease(state, { malformedGraceMs: 30_000 }),
+    /unknown owner/,
+  )
+  await utimes(lock, new Date(0), new Date(0))
+  const lease = await acquirePersistenceLease(state, { malformedGraceMs: 1 })
+  assert.equal(await lease.release(), true)
   await rm(dir, { recursive: true, force: true })
 })
 

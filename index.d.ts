@@ -121,7 +121,7 @@ export interface GoalPluginOptions {
    * Grace window for tool-free continuation turns (a "talk only" turn that
    * calls no tool). Complements the no-progress check by catching
    * self-chat loops that still produce output. Overridable per-goal with
-   * `--no-tool-turns`.
+   * `--no-tool-turns`. Set the plugin option to `0` to disable this heuristic.
    * @default 2
    */
   noToolCallTurnsBeforePause?: number
@@ -330,6 +330,9 @@ export function GoalPlugin(
   },
   options?: GoalPluginOptions,
 ): Promise<GoalPluginHooks>
+
+/** Internal diagnostic/test helpers. Not covered by semantic-version compatibility guarantees. */
+export const testInternals: Readonly<Record<string, unknown>>
 
 /**
  * Default export consumed by OpenCode's plugin loader:

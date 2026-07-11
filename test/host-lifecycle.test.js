@@ -273,7 +273,51 @@ test("disposing one workspace leaves another workspace active", async () => {
   await second.dispose()
 
   assert.match(await goalStatus(first, "session-dispose-one"), /keep first alive/)
-  assert.match(await goalStatus(second, "session-dispose-two"), /No active goal/)
+  assert.equal(await goalStatus(second, "session-dispose-two"), "")
+})
+
+test("disposed instance cannot persist over a replacement instance after a late prompt", async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), "goal-plugin-late-dispose-"))
+  let releasePrompt
+  let promptStarted
+  const started = new Promise((resolve) => { promptStarted = resolve })
+  const pendingPrompt = new Promise((resolve) => { releasePrompt = resolve })
+  const firstClient = hostClient({
+    promptAsync: async () => {
+      promptStarted()
+      await pendingPrompt
+      return {}
+    },
+  })
+  let first
+  let second
+  try {
+    first = await GoalPlugin(
+      { client: firstClient, directory },
+      { registerTools: false, minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+    )
+    await setGoal(first, "late-session", "old objective")
+    const oldIdle = idle(first, "late-session")
+    await started
+    await first.dispose()
+    first = null
+
+    second = await GoalPlugin(
+      { client: hostClient(), directory },
+      { registerTools: false, minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+    )
+    await setGoal(second, "late-session", "replacement objective")
+    releasePrompt()
+    await oldIdle
+
+    const raw = JSON.parse(await fs.readFile(join(directory, ".opencode", "goals", "state.json"), "utf8"))
+    assert.deepEqual(raw.goals.map((goal) => goal.condition), ["replacement objective"])
+  } finally {
+    releasePrompt?.()
+    await first?.dispose()
+    await second?.dispose()
+    await fs.rm(directory, { recursive: true, force: true })
+  }
 })
 
 test("workspace persistence and lifecycle ledgers remain isolated", async () => {

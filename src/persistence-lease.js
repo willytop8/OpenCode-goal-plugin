@@ -27,7 +27,10 @@ async function readOwner(lockPath) {
  * deliberately rejects a second writer instead of allowing stale full-state
  * snapshots to overwrite each other.
  */
-export async function acquirePersistenceLease(stateFilePath) {
+export async function acquirePersistenceLease(
+  stateFilePath,
+  { malformedGraceMs = 30_000, now = () => Date.now() } = {},
+) {
   const lockPath = `${stateFilePath}.lock`
   await fs.mkdir(dirname(stateFilePath), { recursive: true, mode: 0o700 })
   const owner = {
@@ -58,7 +61,16 @@ export async function acquirePersistenceLease(stateFilePath) {
       }
       const existing = await readOwner(lockPath)
       const sameHost = existing?.hostname === owner.hostname
-      if (sameHost && processIsAlive(existing?.pid) === false) {
+      let reclaimableMalformed = false
+      if (!existing) {
+        try {
+          const info = await fs.lstat(lockPath)
+          reclaimableMalformed = now() - info.mtimeMs >= malformedGraceMs
+        } catch (statError) {
+          if (statError?.code === "ENOENT") continue
+        }
+      }
+      if ((sameHost && processIsAlive(existing?.pid) === false) || reclaimableMalformed) {
         const stalePath = `${lockPath}.stale.${randomUUID()}`
         try {
           await fs.rename(lockPath, stalePath)

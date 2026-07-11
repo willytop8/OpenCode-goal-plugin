@@ -207,7 +207,7 @@ The deploy step needs a production API token I don't have.
 [goal:blocked]
 ```
 
-`[goal:complete]` — goal is satisfied. It is **only honored when the line immediately before it (or an earlier line) begins with `[goal:evidence]` and contains a non-empty summary** of what was verified (commands run and their results, files checked). A `[goal:complete]` with no `[goal:evidence]` line is rejected, not recorded, and the plugin re-prompts for evidence. The accepted evidence is shown in `/goal status` after completion.
+`[goal:complete]` — goal is satisfied. It is **only honored when the immediately adjacent evidence line begins with `[goal:evidence]` and contains a non-empty summary** of what was verified (commands run and their results, files checked). The historical two-line form (`[goal:evidence]`, then one evidence line) is also accepted. A stale or non-adjacent evidence marker is rejected. The accepted evidence is shown in `/goal status` after completion.
 `[goal:blocked]` — the assistant needs input from you. The line immediately before the marker must explain the specific blocker; `/goal status` shows it while the goal remains in memory. A `[goal:blocked]` with no concrete blocker is rejected and the plugin keeps working.
 
 Markers must appear on their own final line. The bracketed form is canonical, but the plugin also accepts bare `goal:complete`, `goal:blocked`, and `goal:evidence` lines because some models omit brackets. Natural-language phrases like "goal complete" are intentionally ignored.
@@ -224,7 +224,7 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 | Budget wrap-up threshold | 80% of context token budget |
 | Auto-continue failure pause | 3 consecutive prompt failures |
 
-**Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. At that latency, raising `--max-minutes` is usually more useful than raising `--max-turns`. At 45 s/turn, the default 15-minute window gives roughly 15–20 turns of headroom before the turn limit becomes the binding brake.
+**Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. The default 10 auto-continues is normally the binding brake before the 15-minute window; raise `--max-turns` and/or `--max-minutes` deliberately for longer work.
 
 **Token budget.** The plugin tracks the session's context window size (`input + output + reasoning` tokens on the latest message). This matches the token count that OpenCode displays, so the numbers should be consistent. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops. In high-context sessions (large codebases, long conversation history), the context can grow quickly — treat the budget as a safety brake.
 
@@ -242,7 +242,7 @@ The state-file location is resolved with this precedence:
 2. the `OPENCODE_GOAL_STATE_PATH` environment variable, if set;
 3. the project-local default `<cwd>/.opencode/goals/state.json`.
 
-When the default path has no state yet, the plugin migrates forward from older locations on first load: the legacy `~/.opencode-goal-plugin/state.json` and the XDG path `${XDG_STATE_HOME:-~/.local/state}/opencode-goal-plugin/state.json`. An explicit `stateFilePath` or `OPENCODE_GOAL_STATE_PATH` is used literally with no migration fallback.
+When the default path has no state yet, the plugin migrates forward from older locations on first load: the legacy `~/.opencode-goal-plugin/state.json` and the XDG path `${XDG_STATE_HOME:-~/.local/state}/opencode-goal-plugin/state.json`. Migration is exclusively claimed; after the project-local write succeeds, the legacy file is retired to a timestamped `.migrated…` backup so another project cannot import the same private goal state. An explicit `stateFilePath` or `OPENCODE_GOAL_STATE_PATH` is used literally with no migration fallback.
 
 The state directory is created with owner-only permissions, and the JSON state file is written as `0600` because it may contain goal text, assistant checkpoints, and workflow history.
 
@@ -314,14 +314,14 @@ Additional plugin-level options:
 
 - `maxRecentMessages` — how many recent session messages to scan when looking for the latest assistant turn before auto-continuing. Higher values make long, tool-heavy sessions less likely to lose the most recent assistant response.
 - `noProgressTurnsBeforePause` — grace window for low-output stalls. The plugin pauses only after this many consecutive stalled low-output turns rather than on the first one.
-- `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`.
+- `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`; set the plugin option to `0` for legitimate tool-free writing/research workflows.
 - `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `60000` ms, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier.
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Requires the optional `@opencode-ai/plugin` peer dependency to be present; when it is absent, tool registration is skipped and the command/event hooks still work. Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools-optional).
 - `registerAgents` — whether the config hook adds native `goal` and `goal-verify` agents (default `true`). Existing agents with those names are preserved unchanged; the plugin never changes your default agent.
-- `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with workspace and goal mutation tools disabled.
-- `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). The plugin remembers a successful shape per operation and only falls back after an explicit argument/schema `TypeError`; provider and transport errors are never retried as shape mismatches.
+- `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with a default-deny tool policy; only `read`, `glob`, and `grep` are allowed.
+- `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
 - `persistState` — whether to persist active goals and recent goal results to disk.
 - `stateFilePath` — where the persisted state JSON is written. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default is `<cwd>/.opencode/goals/state.json` (see the persistence section above), and `OPENCODE_GOAL_STATE_PATH` can override it without editing config.
 - `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
@@ -345,7 +345,7 @@ These operate on the same per-session multi-goal state as the command path: a to
 
 ## Audit messages
 
-When the assistant marks a goal complete or blocked, the plugin announces the audit instead of doing it silently: an audit-start message ("Auditing goal completion…") and an audit-result message ("completion accepted — goal archived" / "paused as blocked — …"). By default these are delivered through OpenCode's structured log (`client.app.log`, visible to the user). Provide an `auditMessenger(sessionID, text)` plugin option to route them elsewhere (for example into the live conversation once a suitable message API is available), or set `auditMessages: false` to disable them.
+When the assistant marks a goal complete or blocked, the plugin announces the audit instead of doing it silently: an audit-start message ("Auditing goal completion…") and an audit-result message ("completion accepted — goal archived" / "paused as blocked — …"). By default these are written to OpenCode's structured log and shown as a TUI toast when that client capability is available. Provide an `auditMessenger(sessionID, text)` plugin option to route them elsewhere, or set `auditMessages: false` to disable them.
 ## Completion auditor (optional)
 
 By default a `[goal:complete]` is accepted on the assistant's word. You can require an independent audit before a goal is archived:
@@ -358,13 +358,16 @@ On **approval** the goal is archived as achieved. On **rejection** the goal is *
 Pass `auditorOptions` to tune the built-in auditor:
 
 ```js
-GoalPlugin({
-  completionAudit: true,
-  auditorOptions: {
-    timeoutMs: 60_000,  // default 120 000 ms; set lower for faster CI feedback
-    failurePolicy: "reject",
+await GoalPlugin(
+  { client },
+  {
+    completionAudit: true,
+    auditorOptions: {
+      timeoutMs: 60_000,  // default 120 000 ms; set lower for faster CI feedback
+      failurePolicy: "reject",
+    },
   },
-})
+)
 ```
 
 `timeoutMs` caps how long the built-in child-session auditor waits for a verdict. `failurePolicy` defaults to `reject`: an unavailable API, missing child-session ID, provider error, or timeout rejects the audit and pauses the goal for review. Set it to `approve` only as an explicit compatibility escape hatch; an actual negative or malformed verifier verdict still rejects. `auditorOptions` is ignored when a custom `auditor` function is supplied.
@@ -375,7 +378,7 @@ The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided
 
 ## Limitations
 
-The assistant still signals candidate outcomes with `[goal:complete]` or `[goal:blocked]`. Completion can additionally be checked by a custom `completionAudit` callback or the built-in child-session auditor before the goal becomes terminal. Marker quality therefore remains model-dependent when auditing is disabled, and audit quality depends on the configured verifier model and evidence available in the session.
+The assistant still signals candidate outcomes with `[goal:complete]` or `[goal:blocked]`. Completion can additionally be checked by a custom `auditor` callback or the built-in child-session auditor before the goal becomes terminal. Marker quality therefore remains model-dependent when auditing is disabled, and audit quality depends on the configured verifier model and evidence available in the session. The built-in verifier performs static inspection with `read`, `glob`, and `grep`; it cannot execute shell commands.
 
 OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update.
 

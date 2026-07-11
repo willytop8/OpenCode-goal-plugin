@@ -1,13 +1,21 @@
 {
   "name": "opencode-goal-plugin",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
   "main": "./src/goal-plugin.js",
   "types": "./index.d.ts",
   "exports": {
-    ".": "./src/goal-plugin.js",
-    "./server": "./src/goal-plugin.js"
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/goal-plugin.js",
+      "default": "./src/goal-plugin.js"
+    },
+    "./server": {
+      "types": "./index.d.ts",
+      "import": "./src/goal-plugin.js",
+      "default": "./src/goal-plugin.js"
+    }
   },
   "bin": {
     "opencode-goal-plugin": "./scripts/verify.mjs"
@@ -52,7 +60,8 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "opencode": ">=1.17.15 <2"
   },
   "repository": {
     "type": "git",
