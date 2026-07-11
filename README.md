@@ -384,7 +384,7 @@ The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided
 
 The assistant still signals candidate outcomes with `[goal:complete]` or `[goal:blocked]`. Completion can additionally be checked by a custom `auditor` callback or the built-in child-session auditor before the goal becomes terminal. Marker quality therefore remains model-dependent when auditing is disabled, and audit quality depends on the configured verifier model and evidence available in the session. The built-in verifier performs static inspection with `read`, `glob`, and `grep`; it cannot execute shell commands.
 
-OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update.
+OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update. The plugin therefore guards `/goal status`, `/goal history`, `/goal list`, `/goal pause`, and `/goal clear` (including its aliases) with `tool.execute.before`: inspection tools remain available, while mutation-capable tools are rejected for that routed command turn. Paused goals also inject a system guard that omits the objective and requires an explicit resume before goal work continues.
 
 The plugin depends on `experimental.chat.system.transform` and other OpenCode plugin hooks that may change between OpenCode versions.
 

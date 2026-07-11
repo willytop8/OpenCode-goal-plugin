@@ -107,6 +107,7 @@ try {
   for (const hook of [
     "config",
     "command.execute.before",
+    "tool.execute.before",
     "event",
     "experimental.chat.system.transform",
     "experimental.session.compacting",

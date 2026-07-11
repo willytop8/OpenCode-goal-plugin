@@ -88,6 +88,7 @@ function createRuntimeState() {
     activeContinues: new Map(),
     continuationControllers: new Map(),
     seenIdleEventIDs: new Set(),
+    readOnlyCommandGuards: new Set(),
     ledgerSink: null,
     persistenceLease: null,
     migrationLease: null,
@@ -143,6 +144,7 @@ const seenOutputTokens = runtimeCollection("seenOutputTokens")
 const activeContinues = runtimeCollection("activeContinues")
 const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
 const PAUSE_COMMANDS = new Set(["pause"])
+const READ_ONLY_COMMAND_TOOLS = new Set(["goal_status", "get_goal", "get_goal_history", "read", "glob", "grep"])
 const GOAL_FLAG_SPECS = {
   "--max-turns": {
     optionKey: "maxTurns",
@@ -705,6 +707,7 @@ function clearRuntimeState() {
   activeContinues.clear()
   runtime.continuationControllers.clear()
   runtime.seenIdleEventIDs.clear()
+  runtime.readOnlyCommandGuards.clear()
 }
 
 function pruneGoalResults(options) {
@@ -2882,6 +2885,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       })
       if (pluginOptions.completionAudit) verifierRegistrationReady = true
     },
+    "tool.execute.before": async (input) => {
+      const sessionID = input?.sessionID
+      if (!sessionID || !currentRuntime().readOnlyCommandGuards.has(sessionID)) return
+      if (READ_ONLY_COMMAND_TOOLS.has(input?.tool)) return
+      throw new Error(
+        `This /${commandName} control command is read-only for the routed model turn. Tool "${input?.tool || "unknown"}" was blocked. Wait for a separate user turn; do not modify work or goal state now.`,
+      )
+    },
     "command.execute.before": async (input, output) => {
       if (!input || input.command !== commandName || !output) return
 
@@ -2895,10 +2906,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       const args = input.arguments.trim()
       const sessionID = input.sessionID
+      currentRuntime().readOnlyCommandGuards.delete(sessionID)
       pruneGoalResults(defaultGoalOptions)
 
       if (!args || args === "status") {
         const goal = goalStates.get(sessionID)
+        currentRuntime().readOnlyCommandGuards.add(sessionID)
         const lastResult = lastGoalResults.get(sessionID)
         output.parts = [
           makeTextPart(
@@ -2914,6 +2927,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       if (args === "history") {
         const goal = goalStates.get(sessionID)
+        currentRuntime().readOnlyCommandGuards.add(sessionID)
         const lastResult = lastGoalResults.get(sessionID)
         output.parts = [
           makeTextPart(
@@ -2940,6 +2954,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
 
       if (CLEAR_COMMANDS.has(args)) {
+        currentRuntime().readOnlyCommandGuards.add(sessionID)
         // Record the clear in the ledger before cleanupGoal removes the goal
         // object, so reconstructFromLedger can identify cleared goals and skip
         // them rather than reconstructing them after a missing state file.
@@ -2959,6 +2974,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
 
       if (PAUSE_COMMANDS.has(args)) {
+        currentRuntime().readOnlyCommandGuards.add(sessionID)
         const goal = goalStates.get(sessionID)
         if (!goal) {
           output.parts = [makeTextPart(`No active goal. Set one with \`/${commandName} <condition>\`.`)]
@@ -3046,6 +3062,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
 
       if (args === "list") {
+        currentRuntime().readOnlyCommandGuards.add(sessionID)
         output.parts = [makeTextPart(formatGoalList(sessionID, commandName))]
         return
       }
@@ -3388,6 +3405,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (!isIdleEvent(event)) return
 
       const sessionID = getSessionID(event)
+      currentRuntime().readOnlyCommandGuards.delete(sessionID)
       const eventID = typeof event?.id === "string" ? event.id : ""
       const seenIdleEventIDs = currentRuntime().seenIdleEventIDs
       if (eventID && seenIdleEventIDs.has(eventID)) return
@@ -3861,7 +3879,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
-      if (goal.stopped) return
       const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
       if (systemBlocks.some((block) => systemBlockContainsGoal(block, goal.goalId))) return
 
@@ -3874,14 +3891,23 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // on every continuation turn via buildContinueMessage (buildLimitWarning
       // and <progress_budget>), which is sufficient — the model doesn't need
       // them in the system prompt mid-turn.
-      const goalBlock = [
-        `<opencode_goal_plugin id="${goal.goalId}">`,
-        buildGoalBlock(goal),
-        "Keep working until the goal is fully satisfied.",
-        "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
-        "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
-        "</opencode_goal_plugin>",
-      ].join("\n")
+      const goalBlock = goal.stopped
+        ? [
+            `<opencode_goal_plugin id="${goal.goalId}">`,
+            "<goal_state>paused</goal_state>",
+            "A goal exists for this session, but it is paused. Do not continue or modify work toward it, and do not call completion or blocker tools, unless the current user message explicitly asks to resume it.",
+            "For status or history requests, only report the goal state; do not change files or goal state.",
+            `To continue, the user can run /${commandName} resume or explicitly ask you to call goal_resume before doing any goal work.`,
+            "</opencode_goal_plugin>",
+          ].join("\n")
+        : [
+            `<opencode_goal_plugin id="${goal.goalId}">`,
+            buildGoalBlock(goal),
+            "Keep working until the goal is fully satisfied.",
+            "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
+            "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
+            "</opencode_goal_plugin>",
+          ].join("\n")
 
       if (systemBlocks.length === 0) {
         output.system = [goalBlock]

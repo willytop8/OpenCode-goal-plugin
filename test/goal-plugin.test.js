@@ -1051,7 +1051,11 @@ test("stopped goals can be resumed", async () => {
 
   const stoppedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, stoppedOutput)
-  assert.equal(stoppedOutput.system.length, 0)
+  assert.equal(stoppedOutput.system.length, 1)
+  assert.match(stoppedOutput.system[0], /<goal_state>paused<\/goal_state>/)
+  assert.match(stoppedOutput.system[0], /do not change files or goal state/i)
+  assert.doesNotMatch(stoppedOutput.system[0], /<goal_objective>/)
+  assert.doesNotMatch(stoppedOutput.system[0], /Keep working until/)
 
   const resumeOutput = { parts: [] }
   await hooks["command.execute.before"](
@@ -1063,6 +1067,73 @@ test("stopped goals can be resumed", async () => {
   const resumedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, resumedOutput)
   assert.equal(resumedOutput.system.length, 1)
+  assert.match(resumedOutput.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+  assert.match(resumedOutput.system[0], /Keep working until/)
+})
+
+test("inspection, pause, and clear commands block mutation tools when command text reaches the model", async () => {
+  const { hooks } = await createHooks()
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "status" },
+    { parts: [] },
+  )
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "set_goal", sessionID: "session-read-only", callID: "empty-status-call" },
+      { args: { objective: "stale work" } },
+    ),
+    /control command.*set_goal.*blocked/i,
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-read-only", status: { type: "idle" } },
+    },
+  })
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "pause" },
+    { parts: [] },
+  )
+  await assert.doesNotReject(() => hooks["tool.execute.before"](
+    { tool: "goal_status", sessionID: "session-read-only", callID: "status-call" },
+    { args: {} },
+  ))
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "write", sessionID: "session-read-only", callID: "write-call" },
+      { args: { filePath: "unsafe.txt", content: "unexpected" } },
+    ),
+    /control command.*write.*blocked/i,
+  )
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-read-only", arguments: "clear" },
+    { parts: [] },
+  )
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "set_goal", sessionID: "session-read-only", callID: "clear-call" },
+      { args: { objective: "resurrect stale work" } },
+    ),
+    /control command.*set_goal.*blocked/i,
+  )
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-read-only", status: { type: "idle" } },
+    },
+  })
+  await assert.doesNotReject(() => hooks["tool.execute.before"](
+    { tool: "write", sessionID: "session-read-only", callID: "later-write-call" },
+    { args: {} },
+  ))
 })
 
 test("resume after a limit stop starts a fresh local budget", async () => {

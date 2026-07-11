@@ -4,6 +4,7 @@
 
 ## 0.6.2 — 2026-07-11
 
+- Keep paused, blocked, and crash-recovered goals inert in model turns with a stopped-goal system guard, and enforce status/history/list/pause/clear control turns as read-only through the host's tool-execution hook so routed command text cannot mutate or resurrect work.
 - Add installed-package TypeScript and full tool-surface contracts, critical mutation testing, generated lifecycle-model testing, Linux/macOS/Windows filesystem CI, CodeQL, dependency updates, and a verified release workflow.
 - Preserve multi-goal creation order when a paused goal resumes; execution epochs rotate through `runId` while the public `goalId` remains stable.
 - Document the supported compatibility surface, release integrity process, and private vulnerability reporting path.

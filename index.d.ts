@@ -348,6 +348,8 @@ export interface GoalPluginHooks {
   config: (config: unknown) => Promise<void>
   /** Omitted entirely when {@link GoalPluginOptions.registerCommand} is `false`. */
   "command.execute.before"?: (input: unknown, output: unknown) => Promise<void>
+  /** Enforces read-only tool behavior when inspection, pause, or clear command text is routed to the model. */
+  "tool.execute.before": (input: unknown, output: unknown) => Promise<void>
   event: (input: unknown) => Promise<void>
   "experimental.chat.system.transform": (input: unknown, output: unknown) => Promise<void>
   "experimental.compaction.autocontinue": (input: unknown, output: unknown) => Promise<void>

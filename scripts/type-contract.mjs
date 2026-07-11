@@ -65,6 +65,7 @@ const hooks: GoalPluginHooks = await GoalPlugin({ client: {}, directory: "/tmp" 
 hooks.config({})
 hooks.event({})
 hooks["experimental.chat.system.transform"]({}, {})
+hooks["tool.execute.before"]({}, {})
 hooks["experimental.compaction.autocontinue"]({}, {})
 hooks["experimental.session.compacting"]({}, {})
 await hooks.dispose()
