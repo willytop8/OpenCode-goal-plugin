@@ -31,10 +31,19 @@ export interface CompletionAuditContext {
 export interface CompletionAuditorOptions {
   /**
    * How long, in milliseconds, the built-in auditor waits for a verdict from
-   * its child OpenCode session before failing open (auto-approving).
+   * its child OpenCode session. A timeout rejects the audit and pauses the
+   * goal. Operational failures follow {@link failurePolicy}.
    * @default 120000
    */
   timeoutMs?: number
+
+  /**
+   * Result used when the child-session API is unavailable, malformed, throws,
+   * or times out. Semantic rejection or an invalid verdict always rejects.
+   * `"approve"` is an explicit compatibility escape hatch.
+   * @default "reject"
+   */
+  failurePolicy?: "reject" | "approve"
 }
 
 /**
@@ -45,6 +54,14 @@ export interface CompletionAuditorOptions {
  * flags (e.g. `--max-turns`, `--success`, `--mode`).
  */
 export interface GoalPluginOptions {
+  /**
+   * OpenCode session SDK argument shape. PluginInput currently supplies the
+   * legacy generated client; set `"flat"` when embedding with the v2 SDK.
+   * The compatibility adapter remembers the successful shape per operation.
+   * @default "legacy"
+   */
+  sdkShape?: "legacy" | "flat"
+
   /**
    * Maximum number of auto-continue turns sent toward a goal before it is
    * stopped for exceeding limits. Overridable per-goal with `--max-turns`.
@@ -172,6 +189,12 @@ export interface GoalPluginOptions {
    */
   ledgerFilePath?: string
 
+  /** Maximum bytes in one lifecycle-ledger generation. @default 2097152 */
+  ledgerMaxBytes?: number
+
+  /** Number of rotated lifecycle-ledger generations to retain (0-10). @default 3 */
+  ledgerRetentionFiles?: number
+
   /**
    * How long, in milliseconds, a completed goal's summary remains
    * available through `/goal status` after the goal leaves active memory.
@@ -206,13 +229,24 @@ export interface GoalPluginOptions {
 
   /**
    * Whether the plugin registers the agent-facing goal tools
-   * (`get_goal`, `get_goal_history`, `set_goal`, `update_goal`,
-   * `clear_goal`). Requires the optional `@opencode-ai/plugin` peer
+   * (canonical `goal_status`, `goal_set`, `goal_pause`, `goal_resume`,
+   * `goal_block`, `goal_complete`, plus legacy `get_goal`,
+   * `get_goal_history`, `set_goal`, `update_goal`, `clear_goal`).
+   * Canonical tools return versioned JSON envelopes. Requires the optional `@opencode-ai/plugin` peer
    * dependency; when it is absent, tool registration is silently skipped
    * and the command/event hooks still work.
    * @default true
    */
   registerTools?: boolean
+
+  /** Register collision-safe native `goal` and `goal-verify` agents through OpenCode's config hook. */
+  registerAgents?: boolean
+
+  /** Name of the native primary goal agent. @default "goal" */
+  goalAgentName?: string
+
+  /** Name of the native read-only verifier subagent. @default "goal-verify" */
+  verifierAgentName?: string
 
   /**
    * Enables the built-in child-session completion auditor: before a
@@ -262,17 +296,22 @@ export interface GoalPluginOptions {
  * not by this package.
  */
 export interface GoalPluginHooks {
+  /** Registers collision-safe native goal and verifier agents. */
+  config: (config: unknown) => Promise<void>
   /** Omitted entirely when {@link GoalPluginOptions.registerCommand} is `false`. */
   "command.execute.before"?: (input: unknown, output: unknown) => Promise<void>
   event: (input: unknown) => Promise<void>
   "experimental.chat.system.transform": (input: unknown, output: unknown) => Promise<void>
   "experimental.compaction.autocontinue": (input: unknown, output: unknown) => Promise<void>
+  "experimental.session.compacting": (input: unknown, output: unknown) => Promise<void>
   /**
    * Agent-facing tool definitions, present only when
    * {@link GoalPluginOptions.registerTools} is enabled (default) and the
    * optional `@opencode-ai/plugin` peer dependency is installed.
    */
   tool?: Record<string, unknown>
+  /** Cancels pending continuation work and releases this plugin instance. */
+  dispose: () => Promise<void>
   [hook: string]: unknown
 }
 
@@ -282,7 +321,13 @@ export interface GoalPluginHooks {
  * `opencode.json`.
  */
 export function GoalPlugin(
-  context: { client: unknown },
+  context: {
+    client: unknown
+    /** OpenCode's resolved project directory for this plugin instance. */
+    directory?: string
+    /** OpenCode's resolved worktree directory for this plugin instance. */
+    worktree?: string
+  },
   options?: GoalPluginOptions,
 ): Promise<GoalPluginHooks>
 

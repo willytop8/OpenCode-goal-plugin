@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto"
-import { promises as fs, appendFileSync, mkdirSync } from "node:fs"
+import { AsyncLocalStorage } from "node:async_hooks"
+import { promises as fs, appendFileSync, mkdirSync, statSync, renameSync, rmSync, chmodSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { createOpenCodeSessionApi } from "./opencode-session-api.js"
+import { applyNativeGoalConfig } from "./native-agent-config.js"
+import { serializeCompletionClaim } from "./completion-claim.js"
+import { goalToolFailure, goalToolSuccess, serializeGoalToolResult } from "./goal-tool-result.js"
+import { acquirePersistenceLease } from "./persistence-lease.js"
 
 const STATE_FILE_VERSION = 1
 // Default state now follows the project: <cwd>/.opencode/goals/state.json.
@@ -21,6 +27,13 @@ function legacyHomeStateFilePath(env = process.env) {
 const MAX_HISTORY_ENTRIES = 20
 const MAX_CHECKPOINTS = 5
 const CHECKPOINT_CHAR_LIMIT = 280
+const MAX_GOAL_OBJECTIVE_LENGTH = 4000
+const MAX_GOAL_META_LENGTH = 2000
+const MAX_GOAL_BLOCKER_LENGTH = 2000
+const MAX_LEGACY_EVIDENCE_LENGTH = 8000
+const DEFAULT_LEDGER_MAX_BYTES = 2 * 1024 * 1024
+const DEFAULT_LEDGER_RETENTION_FILES = 3
+const MAX_LEDGER_LINE_BYTES = 16 * 1024
 
 const DEFAULT_OPTIONS = {
   maxTurns: 10,
@@ -45,24 +58,70 @@ const DEFAULT_OPTIONS = {
 // is the full registry of live goals per session (focused + backgrounded);
 // the focused goal is the same object reference held in both. `sessionArchive`
 // keeps a capped list of completed/cleared goals so they stay readable.
-const goalStates = new Map()
-const sessionGoals = new Map()
-const sessionArchive = new Map()
+function createRuntimeState() {
+  return {
+    goalStates: new Map(),
+    sessionGoals: new Map(),
+    sessionArchive: new Map(),
+    sessionOrdered: new Set(),
+    lastGoalResults: new Map(),
+    seenTokens: new Map(),
+    seenUsage: new Map(),
+    seenOutputTokens: new Map(),
+    activeContinues: new Map(),
+    continuationControllers: new Map(),
+    seenIdleEventIDs: new Set(),
+    ledgerSink: null,
+    persistenceLease: null,
+    disposed: false,
+  }
+}
+
+const runtimeStorage = new AsyncLocalStorage()
+let lastRuntime = createRuntimeState()
+
+function currentRuntime() {
+  return runtimeStorage.getStore() || lastRuntime
+}
+
+// Route the existing domain helpers to the plugin instance associated with the
+// current async hook/tool execution. OpenCode caches imported plugin modules but
+// initializes their factories per workspace, so module-global Maps would let a
+// second workspace clear or persist the first workspace's goals. The proxies
+// keep the mature helper surface intact while making every collection
+// instance-scoped.
+function runtimeCollection(name) {
+  return new Proxy(
+    {},
+    {
+      get(_target, property) {
+        const collection = currentRuntime()[name]
+        const value = collection[property]
+        return typeof value === "function" ? value.bind(collection) : value
+      },
+    },
+  )
+}
+
+const goalStates = runtimeCollection("goalStates")
+const sessionGoals = runtimeCollection("sessionGoals")
+const sessionArchive = runtimeCollection("sessionArchive")
 // Sessions running an ordered (sisyphus) sequence: when the focused goal
 // completes, the next live goal (in creation order) is auto-promoted to focus
 // so the sequence advances on its own.
-const sessionOrdered = new Set()
+const sessionOrdered = runtimeCollection("sessionOrdered")
 const MAX_ARCHIVED_PER_SESSION = 10
-const lastGoalResults = new Map()
-const seenTokens = new Map()
-const seenOutputTokens = new Map()
+const lastGoalResults = runtimeCollection("lastGoalResults")
+const seenTokens = runtimeCollection("seenTokens")
+const seenUsage = runtimeCollection("seenUsage")
+const seenOutputTokens = runtimeCollection("seenOutputTokens")
 // Map<sessionID, token> rather than Set so the idle handler's finally block can
 // detect whether its entry has been superseded by a new handler: if cleanupGoal
 // deletes the sessionID (allowing a new handler to start and set a fresh token)
 // before the old handler's finally fires, the old finally skips the delete
 // because the token no longer matches. With a plain Set, the old finally would
 // unconditionally delete the new handler's guard, exposing a race window.
-const activeContinues = new Map()
+const activeContinues = runtimeCollection("activeContinues")
 const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
 const PAUSE_COMMANDS = new Set(["pause"])
 const GOAL_FLAG_SPECS = {
@@ -148,8 +207,17 @@ function getText(parts) {
     .trim()
 }
 
-function makeTextPart(text) {
-  return { type: "text", text }
+function makeTextPart(text, extra = {}) {
+  return { type: "text", text, ...extra }
+}
+
+function makeContinuationPart(text) {
+  return makeTextPart(text, {
+    synthetic: true,
+    metadata: {
+      "opencode-goal-plugin": { kind: "continuation" },
+    },
+  })
 }
 
 function getSessionID(event) {
@@ -161,6 +229,14 @@ function isIdleEvent(event) {
     event?.type === "session.idle" ||
     (event?.type === "session.status" && event?.properties?.status?.type === "idle")
   )
+}
+
+function isAbortErrorEvent(event) {
+  if (event?.type !== "session.error") return false
+  const error = event?.properties?.error
+  const name = String(error?.name || error?.data?.name || "")
+  const message = String(error?.message || error?.data?.message || "")
+  return name === "MessageAbortedError" || /\babort(?:ed)?\b/i.test(`${name} ${message}`)
 }
 
 function summarizeText(text, limit = CHECKPOINT_CHAR_LIMIT) {
@@ -193,13 +269,12 @@ function makeHistoryEntry(type, detail, timestamp = Date.now()) {
 // ledger is the durable record used to reconstruct state if the main state file
 // is lost or corrupted, and it captures terminal events even when the main
 // state write fails (fail-closed, item 2.5).
-let ledgerSink = null
-
 function setLedgerSink(sink) {
-  ledgerSink = typeof sink === "function" ? sink : null
+  currentRuntime().ledgerSink = typeof sink === "function" ? sink : null
 }
 
 function emitLedgerEvent(goal, type, detail, timestamp) {
+  const ledgerSink = currentRuntime().ledgerSink
   if (!ledgerSink) return
   try {
     ledgerSink({
@@ -224,32 +299,89 @@ function pushHistory(goal, type, detail, timestamp = Date.now()) {
 // Synchronous append keeps lifecycle events ordered and durable without
 // unawaited promises leaking past teardown. Owner-only perms mirror the state
 // file. Failures are reported to the caller, not thrown.
-function appendLedgerLine(ledgerFilePath, entry) {
+function rotateLedger(ledgerFilePath, retentionFiles) {
+  if (retentionFiles <= 0) {
+    rmSync(ledgerFilePath, { force: true })
+    return
+  }
+  rmSync(`${ledgerFilePath}.${retentionFiles}`, { force: true })
+  for (let index = retentionFiles - 1; index >= 1; index -= 1) {
+    try {
+      renameSync(`${ledgerFilePath}.${index}`, `${ledgerFilePath}.${index + 1}`)
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+  }
+  try {
+    renameSync(ledgerFilePath, `${ledgerFilePath}.1`)
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
+  }
+}
+
+function appendLedgerLine(
+  ledgerFilePath,
+  entry,
+  { maxBytes = DEFAULT_LEDGER_MAX_BYTES, retentionFiles = DEFAULT_LEDGER_RETENTION_FILES } = {},
+) {
   try {
     mkdirSync(dirname(ledgerFilePath), { recursive: true, mode: 0o700 })
-    appendFileSync(ledgerFilePath, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
+    const line = `${JSON.stringify(entry)}\n`
+    if (Buffer.byteLength(line) > MAX_LEDGER_LINE_BYTES) return false
+    let currentBytes = 0
+    try {
+      currentBytes = statSync(ledgerFilePath).size
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+    if (currentBytes + Buffer.byteLength(line) > maxBytes) {
+      rotateLedger(ledgerFilePath, retentionFiles)
+    }
+    appendFileSync(ledgerFilePath, line, { mode: 0o600 })
+    chmodSync(ledgerFilePath, 0o600)
     return true
   } catch {
     return false
   }
 }
 
-async function readLedgerEntries(ledgerFilePath) {
-  let raw
-  try {
-    raw = await fs.readFile(ledgerFilePath, "utf8")
-  } catch {
-    return []
-  }
+async function readLedgerEntries(
+  ledgerFilePath,
+  { maxBytes = DEFAULT_LEDGER_MAX_BYTES, retentionFiles = DEFAULT_LEDGER_RETENTION_FILES } = {},
+) {
   const entries = []
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
+  const paths = [
+    ...Array.from({ length: retentionFiles }, (_, index) => `${ledgerFilePath}.${retentionFiles - index}`),
+    ledgerFilePath,
+  ]
+  for (const path of paths) {
+    let raw
     try {
-      const parsed = JSON.parse(trimmed)
-      if (isPlainObject(parsed)) entries.push(parsed)
-    } catch {
-      // Skip malformed lines so a partial write can't break recovery.
+      const handle = await fs.open(path, "r")
+      try {
+        const { size } = await handle.stat()
+        const length = Math.min(size, maxBytes)
+        const buffer = Buffer.alloc(length)
+        await handle.read(buffer, 0, length, size - length)
+        raw = buffer.toString("utf8")
+        if (size > length) raw = raw.slice(raw.indexOf("\n") + 1)
+      } finally {
+        await handle.close()
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") continue
+      continue
+    }
+    for (const line of raw.split("\n")) {
+      if (Buffer.byteLength(line) > MAX_LEDGER_LINE_BYTES) continue
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      try {
+        const parsed = JSON.parse(trimmed)
+        if (isPlainObject(parsed)) entries.push(parsed)
+      } catch {
+        // Skip malformed lines so a partial write can't break recovery.
+      }
     }
   }
   return entries
@@ -331,6 +463,7 @@ function formatStatus(goal, commandName = "goal") {
   lines.push(
     `Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`,
     `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
+    formatUsage(goal.usage),
     `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`,
     `Last progress: ${lastProgress}`,
     `No-progress turns: ${goal.noProgressTurns}`,
@@ -347,6 +480,11 @@ function formatStatus(goal, commandName = "goal") {
   return lines.join("\n")
 }
 
+function formatUsage(value) {
+  const usage = normalizeUsage(value)
+  return `API usage: input ${usage.input.toLocaleString()}, output ${usage.output.toLocaleString()}, reasoning ${usage.reasoning.toLocaleString()}, cache read ${usage.cacheRead.toLocaleString()}, cache write ${usage.cacheWrite.toLocaleString()}, cost $${usage.cost.toFixed(4)}`
+}
+
 function formatGoalResult(result) {
   const elapsed = Math.round((result.finishedAt - result.startedAt) / 1000)
   const lastCheckpoint = result.lastCheckpoint
@@ -357,6 +495,7 @@ function formatGoalResult(result) {
     `State: ${result.state}`,
     `Auto-continues sent: ${result.turnCount}`,
     `Context tokens: ${result.totalTokens.toLocaleString()}`,
+    formatUsage(result.usage),
     `Elapsed: ${elapsed}s`,
     `Last checkpoint: ${lastCheckpoint}`,
     `Last status: ${result.lastStatus || "No status recorded."}`,
@@ -464,14 +603,19 @@ function cleanupGoal(sessionID) {
 }
 
 function clearRuntimeState() {
+  const runtime = currentRuntime()
+  for (const controller of runtime.continuationControllers.values()) controller.abort()
   goalStates.clear()
   sessionGoals.clear()
   sessionArchive.clear()
   sessionOrdered.clear()
   lastGoalResults.clear()
   seenTokens.clear()
+  seenUsage.clear()
   seenOutputTokens.clear()
   activeContinues.clear()
+  runtime.continuationControllers.clear()
+  runtime.seenIdleEventIDs.clear()
 }
 
 function pruneGoalResults(options) {
@@ -501,6 +645,7 @@ function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") 
     blockedReason: goal.blockedReason,
     turnCount: goal.turnCount,
     totalTokens: goal.totalTokens,
+    usage: normalizeUsage(goal.usage),
     startedAt: goal.startedAt,
     finishedAt: Date.now(),
     lastStatus: goal.lastStatus,
@@ -521,10 +666,13 @@ function resetGoalBudget(goal) {
   // is in seenTokens but NOT in the current goal.messageIDs — keeping the entries
   // alive is what makes that check reliable. cleanupGoal removes them when the
   // goal is fully discarded, so seenTokens entries are bounded to active goals.
-  goal.goalId = randomUUID()
+  // Keep the registry identity stable. runId is the execution epoch used to
+  // reject stale handlers from the previous budget window.
+  goal.runId = randomUUID()
   goal.startedAt = Date.now()
   goal.turnCount = 0
   goal.totalTokens = 0
+  goal.usage = emptyUsage()
   goal.lastContinueAt = 0
   goal.lastProgressAt = 0
   goal.noProgressTurns = 0
@@ -537,10 +685,11 @@ function resetGoalBudget(goal) {
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
 }
 
-function currentGoal(sessionID, goalID) {
+function currentGoal(sessionID, goalID, runID) {
   const goal = goalStates.get(sessionID)
   if (!goal) return null
   if (goalID !== undefined && goal.goalId !== goalID) return null
+  if (runID !== undefined && goal.runId !== runID) return null
   return goal
 }
 
@@ -548,8 +697,8 @@ function currentGoal(sessionID, goalID) {
 // cleared-and-replaced, blocked) while an async step was in flight. Used at the
 // post-await re-checks so a `/goal pause` issued during messages-fetch or the
 // cooldown sleep actually prevents the next auto-continue from firing.
-function activeGoal(sessionID, goalID) {
-  const goal = currentGoal(sessionID, goalID)
+function activeGoal(sessionID, goalID, runID) {
+  const goal = currentGoal(sessionID, goalID, runID)
   if (!goal || goal.stopped) return null
   return goal
 }
@@ -686,7 +835,11 @@ function normalizePersistenceOptions(options = {}, { env = process.env, cwd } = 
     typeof options.ledgerFilePath === "string" && options.ledgerFilePath.trim()
       ? options.ledgerFilePath.trim()
       : ledgerPathFor(stateFilePath)
-  return { persistState, stateFilePath, fallbackPaths, ledgerFilePath }
+  const ledgerMaxBytes = toPositiveInteger(options.ledgerMaxBytes, DEFAULT_LEDGER_MAX_BYTES)
+  const ledgerRetentionFiles = Number.isSafeInteger(options.ledgerRetentionFiles) && options.ledgerRetentionFiles >= 0
+    ? Math.min(options.ledgerRetentionFiles, 10)
+    : DEFAULT_LEDGER_RETENTION_FILES
+  return { persistState, stateFilePath, fallbackPaths, ledgerFilePath, ledgerMaxBytes, ledgerRetentionFiles }
 }
 
 // Command surface options (item 8.2): `commandName` lets the plugin own a
@@ -754,6 +907,10 @@ function normalizePersistedGoal(rawGoal) {
       typeof rawGoal.goalId === "string" && rawGoal.goalId.trim()
         ? rawGoal.goalId
         : randomUUID(),
+    runId:
+      typeof rawGoal.runId === "string" && rawGoal.runId.trim()
+        ? rawGoal.runId
+        : randomUUID(),
     condition: rawGoal.condition.trim(),
     successCriteria: typeof rawGoal.successCriteria === "string" ? rawGoal.successCriteria : "",
     constraints: typeof rawGoal.constraints === "string" ? rawGoal.constraints : "",
@@ -762,6 +919,7 @@ function normalizePersistedGoal(rawGoal) {
     turnCount: toNonNegativeInteger(rawGoal.turnCount),
     startedAt: normalizeTimestamp(rawGoal.startedAt),
     totalTokens: toNonNegativeInteger(rawGoal.totalTokens),
+    usage: normalizeUsage(rawGoal.usage),
     options: normalizeOptions(isPlainObject(rawGoal.options) ? rawGoal.options : {}),
     lastStatus: typeof rawGoal.lastStatus === "string" ? rawGoal.lastStatus : "Goal recovered.",
     lastAssistantText:
@@ -804,6 +962,7 @@ function normalizePersistedResult(rawResult) {
     blockedReason: typeof rawResult.blockedReason === "string" ? rawResult.blockedReason : "",
     turnCount: toNonNegativeInteger(rawResult.turnCount),
     totalTokens: toNonNegativeInteger(rawResult.totalTokens),
+    usage: normalizeUsage(rawResult.usage),
     startedAt: normalizeTimestamp(rawResult.startedAt),
     finishedAt: normalizeTimestamp(rawResult.finishedAt),
     lastStatus: typeof rawResult.lastStatus === "string" ? rawResult.lastStatus : "",
@@ -943,7 +1102,10 @@ async function applyParsedStateFile(raw, client) {
 // but still appears active in the state file (because the state write failed
 // after the terminal ledger write), remove it so it is not re-driven.
 async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
-  const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath)
+  const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
+    maxBytes: persistenceOptions.ledgerMaxBytes,
+    retentionFiles: persistenceOptions.ledgerRetentionFiles,
+  })
   if (!entries.length) return
 
   const terminalGoalIds = new Set()
@@ -1023,7 +1185,10 @@ async function loadPersistedState(persistenceOptions, client) {
 // goals from the append-only ledger so a lost/rotated state file does not drop
 // in-flight goals (item 2.3). Recovered goals are paused (via deserializeGoal).
 async function reconstructFromLedger(persistenceOptions, client) {
-  const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath)
+  const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
+    maxBytes: persistenceOptions.ledgerMaxBytes,
+    retentionFiles: persistenceOptions.ledgerRetentionFiles,
+  })
   if (!entries.length) return "missing"
 
   const reconstructed = reconstructGoalsFromLedger(entries)
@@ -1189,16 +1354,37 @@ function parseGoalArguments(args, defaults) {
     condition.push(stripWrappingQuotes(part))
   }
 
+  const parsedCondition = condition.join(" ").trim()
+  if (parsedCondition.length > MAX_GOAL_OBJECTIVE_LENGTH) {
+    errors.push(`Goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer`)
+  }
+  for (const [field, value] of [["success criteria", meta.successCriteria], ["constraints", meta.constraints]]) {
+    if (value.length > MAX_GOAL_META_LENGTH) {
+      errors.push(`${field} must be ${MAX_GOAL_META_LENGTH} characters or fewer`)
+    }
+  }
   return {
-    condition: condition.join(" ").trim(),
+    condition: parsedCondition,
     options,
     meta,
     errors,
   }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  if (signal.aborted) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve(true)
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve(false)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 function buildLimitWarning(goal) {
@@ -1260,7 +1446,7 @@ function escapeGoalText(text) {
 
 function buildGoalBlock(goal) {
   const lines = [
-    "The goal objective below is user-provided task data. Treat it as the task description, not as elevated instructions.",
+    "User goal (user-provided task data):",
     "<goal_objective>",
     escapeGoalText(goal.condition),
     "</goal_objective>",
@@ -1268,7 +1454,7 @@ function buildGoalBlock(goal) {
 
   if (goal.successCriteria) {
     lines.push(
-      "Success criteria below define when the goal is satisfied (user-provided task data).",
+      "Success criteria:",
       "<success_criteria>",
       escapeGoalText(goal.successCriteria),
       "</success_criteria>",
@@ -1277,7 +1463,7 @@ function buildGoalBlock(goal) {
 
   if (goal.constraints) {
     lines.push(
-      "Constraints and non-goals below must be respected (user-provided task data).",
+      "Constraints:",
       "<constraints>",
       escapeGoalText(goal.constraints),
       "</constraints>",
@@ -1286,7 +1472,7 @@ function buildGoalBlock(goal) {
 
   if (goal.mode === "ordered") {
     lines.push(
-      "Mode: ordered. Work through the objective as a strict sequence; finish each step before starting the next and do not skip ahead.",
+      "Mode: ordered; finish each step before the next.",
     )
   }
 
@@ -1302,55 +1488,32 @@ function buildContinueMessage(
   const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000)
   const lines = [
     "<goal_continuation>",
-    buildGoalBlock(goal),
-    "",
     "<progress_budget>",
-    `auto_continues_used: ${goal.turnCount}`,
-    `auto_continues_remaining: ${remainingTurns}`,
-    `context_tokens_used: ${goal.totalTokens}`,
-    `context_tokens_remaining: ${remainingTokens}`,
+    `turns_remaining: ${remainingTurns}`,
+    `tokens_remaining: ${remainingTokens}`,
     `elapsed_seconds: ${elapsedSeconds}`,
     "</progress_budget>",
-    "",
   ]
 
   if (budgetWrapup) {
     lines.push(
       "<budget_wrapup>",
-      "This goal is near its context token limit. Finish the current step if it is small and safe.",
-      "Then write a concise handoff summary covering what is done, what remains, and the next concrete command or file to inspect.",
-      "Do not output [goal:complete] unless the goal is actually finished and verified.",
-      "After the handoff, stop.",
+      "Budget limit near. Finish only a small safe step, then summarize done, remaining, and the next action; stop. Do not claim completion unless verified.",
       "</budget_wrapup>",
     )
   } else {
     lines.push(
-      "<next_step>",
-      "Continue working toward the active goal. Take the next concrete step.",
-      "Prefer verifying actual current state over assuming prior work succeeded.",
-      "If a check fails, repair the issue rather than shrinking the scope.",
-      "</next_step>",
+      "Continue with the next concrete step; inspect current state and repair failures.",
     )
   }
 
-  lines.push(
-    "",
-    "<completion_audit>",
-    "Before outputting [goal:complete], treat completion as unproven.",
-    "Verify the result against the goal objective and the current project state.",
-    "Only mark complete when every requirement is satisfied and any relevant checks have passed or their absence is explicitly justified.",
-    "When you do mark complete, put a line beginning with [goal:evidence] immediately before [goal:complete], summarizing what you verified (commands run and their results, files checked). A [goal:complete] without a [goal:evidence] line is rejected and not recorded.",
-    "If user input is required, explain the specific blocker in the line immediately before [goal:blocked]. A [goal:blocked] without a concrete blocker is rejected.",
-    "</completion_audit>",
-  )
+  lines.push("Complete only after verification: `[goal:evidence] …` then `[goal:complete]`. If only user input can unblock work, state why then `[goal:blocked]`.")
 
   if (completionUnverified) {
     lines.push(
       "",
       "<evidence_required>",
-      "Your previous turn ended with [goal:complete] but included no [goal:evidence] line, so the completion was REJECTED and not recorded.",
-      "Do not output [goal:complete] again until the goal is truly finished and verified.",
-      "When it is, put a line starting with [goal:evidence] (summarizing the checks you ran and their results) immediately before [goal:complete].",
+      "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.",
       "</evidence_required>",
     )
   }
@@ -1359,17 +1522,12 @@ function buildContinueMessage(
     lines.push(
       "",
       "<evidence_required>",
-      "Your previous turn ended with [goal:blocked] but stated no concrete blocker, so it was REJECTED.",
-      "If you are truly blocked, state the specific blocker — what you need from the user and why you cannot proceed — on the line immediately before [goal:blocked]. Otherwise keep working.",
+      "Previous blocker was rejected: it was not concrete. State what user input is needed and why, immediately before `[goal:blocked]`; otherwise continue.",
       "</evidence_required>",
     )
   }
 
   lines.push(
-    "",
-    "End with [goal:complete] (preceded by a [goal:evidence] line) only when the goal is fully satisfied.",
-    "End with [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
-    buildLimitWarning(goal),
     "</goal_continuation>",
   )
 
@@ -1418,7 +1576,7 @@ function buildCompactionContext(goal) {
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
     `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
-    goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(goal.lastCheckpoint.summary)}` : null,
+    goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
   ]
@@ -1498,6 +1656,46 @@ function messageTokens(message) {
     : isPlainObject(message?.tokens)
       ? message.tokens
       : {}
+}
+
+const USAGE_TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWrite"]
+
+function emptyUsage() {
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+}
+
+// Normalize both current OpenCode message info and the flattened shapes used by
+// older SDK adapters. Invalid provider values are ignored so diagnostics can
+// never corrupt budget enforcement or persisted state.
+function normalizeMessageUsage(message) {
+  const tokens = messageTokens(message)
+  const cache = isPlainObject(tokens.cache) ? tokens.cache : {}
+  const rawCost = message?.info?.cost ?? message?.cost
+  return {
+    input: toNonNegativeInteger(tokens.input),
+    output: toNonNegativeInteger(tokens.output),
+    reasoning: toNonNegativeInteger(tokens.reasoning),
+    cacheRead: toNonNegativeInteger(cache.read ?? tokens.cacheRead ?? tokens.cache_read),
+    cacheWrite: toNonNegativeInteger(cache.write ?? tokens.cacheWrite ?? tokens.cache_write),
+    cost: Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0 ? Number(rawCost) : 0,
+  }
+}
+
+function normalizeUsage(value) {
+  const source = isPlainObject(value) ? value : {}
+  const usage = emptyUsage()
+  for (const field of USAGE_TOKEN_FIELDS) usage[field] = toNonNegativeInteger(source[field])
+  usage.cost = Number.isFinite(Number(source.cost)) && Number(source.cost) >= 0 ? Number(source.cost) : 0
+  return usage
+}
+
+function addUsageDelta(total, current, previous) {
+  const next = normalizeUsage(total)
+  for (const field of USAGE_TOKEN_FIELDS) {
+    next[field] += Math.max(0, current[field] - previous[field])
+  }
+  next.cost += Math.max(0, current.cost - previous.cost)
+  return next
 }
 
 function cacheTokensForMessage(tokens) {
@@ -1594,9 +1792,18 @@ function findLatestAssistantMessage(messages) {
 // any forged <goal_continuation in goal text, so genuine goal text cannot
 // masquerade as a plugin continuation.
 function isPluginContinuationMessage(message) {
-  return (
-    messageRole(message) === "user" && getText(message?.parts).includes("<goal_continuation>")
+  if (messageRole(message) !== "user") return false
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  const metadataMarked = parts.some(
+    (part) =>
+      part?.type === "text" &&
+      part.synthetic === true &&
+      part?.metadata?.["opencode-goal-plugin"]?.kind === "continuation",
   )
+  if (metadataMarked) return true
+  // Backward compatibility for continuation turns persisted by releases before
+  // synthetic metadata was introduced. New turns must use metadata above.
+  return getText(parts).includes("<goal_continuation>")
 }
 
 // "Latest instruction wins": detect a real (human) user message that arrived
@@ -1635,6 +1842,7 @@ function budgetWrapupNeeded(goal) {
 function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "Goal set.") {
   return {
     goalId: randomUUID(),
+    runId: randomUUID(),
     condition,
     successCriteria: typeof meta.successCriteria === "string" ? meta.successCriteria : "",
     constraints: typeof meta.constraints === "string" ? meta.constraints : "",
@@ -1643,6 +1851,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     turnCount: 0,
     startedAt: Date.now(),
     totalTokens: 0,
+    usage: emptyUsage(),
     options,
     lastStatus,
     lastAssistantText: "",
@@ -1713,6 +1922,12 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
   async function setGoal(sessionID, args = {}) {
     const objective = typeof args.objective === "string" ? args.objective.trim() : ""
     if (!objective) return "No objective provided. Pass a non-empty `objective`."
+    if (objective.length > MAX_GOAL_OBJECTIVE_LENGTH)
+      return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
+    for (const [field, value] of [["successCriteria", args.successCriteria], ["constraints", args.constraints]]) {
+      if (typeof value === "string" && value.length > MAX_GOAL_META_LENGTH)
+        return `Invalid ${field}: must be ${MAX_GOAL_META_LENGTH} characters or fewer.`
+    }
 
     // Validate budget args before normalizing: normalizeOptions silently substitutes
     // defaults for non-positive values, giving no feedback to the caller.
@@ -1780,6 +1995,9 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     const messages = []
 
     if (typeof args.objective === "string" && args.objective.trim()) {
+      if (args.objective.trim().length > MAX_GOAL_OBJECTIVE_LENGTH) {
+        return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
+      }
       goal.condition = args.objective.trim()
       // Deliberately NOT clearing goal.stopped or goal.stopReason: updating the
       // objective does not un-stop a goal. Use status='resumed' to explicitly
@@ -1802,6 +2020,8 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
       }
       if (status === "complete") {
         const evidence = typeof args.evidence === "string" ? args.evidence.trim() : ""
+        if (evidence.length > MAX_LEGACY_EVIDENCE_LENGTH)
+          return `Completion evidence must be ${MAX_LEGACY_EVIDENCE_LENGTH} characters or fewer.`
         // If a completion auditor is configured, run it before archiving so the
         // agent tool path has the same integrity gate as the [goal:complete] marker
         // path. Without this, an autonomous agent could bypass the auditor by
@@ -1840,6 +2060,8 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
         const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : ""
         if (!blockerText)
           return "status 'blocked' requires a non-empty 'blocker' argument describing what is needed."
+        if (blockerText.length > MAX_GOAL_BLOCKER_LENGTH)
+          return `Blocker must be ${MAX_GOAL_BLOCKER_LENGTH} characters or fewer.`
         goal.blockedReason = blockerText
         goal.stopped = true
         goal.stopReason = "blocked"
@@ -1921,7 +2143,101 @@ function buildAgentTools(toolHelper, handlers) {
     if (!sessionID) return "No session id available for the goal tool."
     return handler(sessionID, args || {})
   }
+  // Canonical tools use a small, versioned machine-readable envelope. Keep the
+  // legacy tools below byte-for-byte compatible: existing agents may parse
+  // their human-readable results.
+  const canonicalRun = (operation, handler) => async (args, ctx) => {
+    const sessionID = agentToolSessionID(ctx)
+    if (!sessionID) {
+      return serializeGoalToolResult(
+        operation,
+        goalToolFailure("missing_session", "No session id available for the goal tool."),
+      )
+    }
+    return serializeGoalToolResult(operation, await handler(sessionID, args || {}))
+  }
+
+  const canonicalHandlers = {
+    status: async (sessionID) => goalToolSuccess(await handlers.getGoal(sessionID)),
+    set: async (sessionID, args) => {
+      if (typeof args.objective !== "string" || !args.objective.trim()) {
+        return goalToolFailure("invalid_objective", "No objective provided. Pass a non-empty objective.")
+      }
+      return goalToolSuccess(await handlers.setGoal(sessionID, args))
+    },
+    update: async (sessionID, args) => {
+      const before = currentGoal(sessionID)
+      if (!before) return goalToolFailure("no_active_goal", "No active goal for this session.")
+      if (args.status === "blocked" && (typeof args.blocker !== "string" || !args.blocker.trim())) {
+        return goalToolFailure("missing_blocker", "A non-empty blocker is required.")
+      }
+      if (args.status === "resumed" && !before.stopped) {
+        return goalToolFailure("already_running", "Goal is already running.")
+      }
+      const message = await handlers.updateGoal(sessionID, args)
+      if (args.status === "complete" && currentGoal(sessionID)) {
+        return goalToolFailure("completion_rejected", message)
+      }
+      return goalToolSuccess(message)
+    },
+  }
   return {
+    goal_status: toolHelper({
+      description: "Return the current goal state in a compact, versioned JSON envelope.",
+      args: {},
+      execute: canonicalRun("status", canonicalHandlers.status),
+    }),
+    goal_set: toolHelper({
+      description:
+        "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal.",
+      args: {
+        objective: schema.string(),
+        maxTurns: schema.number().optional(),
+        maxTokens: schema.number().optional(),
+        maxDurationMs: schema.number().optional(),
+        successCriteria: schema.string().optional(),
+        constraints: schema.string().optional(),
+        mode: schema.string().optional(),
+      },
+      execute: canonicalRun("set", canonicalHandlers.set),
+    }),
+    goal_pause: toolHelper({
+      description: "Pause the current goal without discarding its state.",
+      args: {},
+      execute: canonicalRun("pause", (sessionID) => canonicalHandlers.update(sessionID, { status: "paused" })),
+    }),
+    goal_resume: toolHelper({
+      description: "Resume a stopped goal with a fresh local budget window.",
+      args: {},
+      execute: canonicalRun("resume", (sessionID) => canonicalHandlers.update(sessionID, { status: "resumed" })),
+    }),
+    goal_block: toolHelper({
+      description: "Stop the current goal as blocked and state the concrete external requirement.",
+      args: { blocker: schema.string() },
+      execute: canonicalRun("block", (sessionID, args) =>
+        canonicalHandlers.update(sessionID, { status: "blocked", blocker: args.blocker }),
+      ),
+    }),
+    goal_complete: toolHelper({
+      description: "Submit verified completion evidence and archive the goal only if its completion audit approves.",
+      args: {
+        summary: schema.string(),
+        criteria: schema.array(schema.object({ criterion: schema.string(), evidence: schema.array(schema.string()) })).optional(),
+        checks: schema.array(schema.object({
+          command: schema.string().optional(),
+          result: schema.enum(["passed", "failed", "not-run"]),
+          exitCode: schema.number().optional(),
+          explanation: schema.string().optional(),
+        })).optional(),
+        changedFiles: schema.array(schema.string()).optional(),
+        knownLimitations: schema.array(schema.string()).optional(),
+      },
+      execute: canonicalRun("complete", (sessionID, args) => {
+        const claim = serializeCompletionClaim(args)
+        if (!claim.ok) return goalToolFailure("invalid_completion_claim", `Invalid completion claim: ${claim.error}.`)
+        return canonicalHandlers.update(sessionID, { status: "complete", evidence: claim.evidence })
+      }),
+    }),
     get_goal: toolHelper({
       description:
         "Get the status of the current goal for this session (objective, budget usage, last checkpoint).",
@@ -2061,31 +2377,38 @@ function extractAuditVerdictText(response) {
 }
 
 // Best-effort built-in auditor: spawns an OpenCode child session to verify the
-// completion. Fails OPEN (approves) if the session API is unavailable or errors,
-// so a missing/broken auditor pipeline never blocks legitimate completions.
-// NOTE: the exact child-session SDK shape should be confirmed against a live
-// OpenCode; the orchestration around it is what the tests cover.
-function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120_000 } = {}) {
+// completion. Operational failures reject by default; callers can explicitly
+// opt into the legacy fail-open policy for compatibility.
+function createChildSessionAuditor(
+  client,
+  { agent = "build", timeoutMs = 120_000, sdkShape = "legacy", failurePolicy = "reject" } = {},
+) {
+  if (failurePolicy !== "reject" && failurePolicy !== "approve") {
+    throw new TypeError('auditorOptions.failurePolicy must be "reject" or "approve"')
+  }
+  const operationalFailure = (reason) => ({
+    approved: failurePolicy === "approve",
+    reason: `${reason}; ${failurePolicy === "approve" ? "auto-approved by configured failure policy" : "rejected by default failure policy"}`,
+  })
   return async ({ goal, sessionID, latestText }) => {
+    let childID
     const run = async () => {
-      const sessionApi = client?.session
-      if (!sessionApi?.create || !sessionApi?.prompt) {
-        return { approved: true, reason: "child-session API unavailable; auto-approved" }
+      if (!client?.session?.create || !client?.session?.prompt) {
+        return operationalFailure("child-session API unavailable")
       }
-      const created = await sessionApi.create({
-        body: { parentID: sessionID, title: "goal completion audit" },
-      })
-      const childID = created?.id || created?.data?.id || created?.sessionID
-      if (!childID) return { approved: true, reason: "child session id unavailable; auto-approved" }
+      const sessionApi = createOpenCodeSessionApi(client, { preferredShape: sdkShape })
+      const created = await sessionApi.createChild(sessionID, { title: "goal completion audit" })
+      childID = created?.id || created?.sessionID
+      if (!childID) return operationalFailure("child session id unavailable")
 
-      const response = await sessionApi.prompt({
-        path: { id: childID },
-        body: { parts: [makeTextPart(buildAuditPrompt(goal, latestText))], agent },
+      const response = await sessionApi.prompt(childID, {
+        parts: [makeTextPart(buildAuditPrompt(goal, latestText))],
+        agent,
       })
       let verdictText = extractAuditVerdictText(response)
-      if (!verdictText && sessionApi.messages) {
-        const messages = await sessionApi.messages({ path: { id: childID }, query: { limit: 10 } })
-        verdictText = getText(findLatestAssistantMessage(messages?.data)?.parts)
+      if (!verdictText && client.session.messages) {
+        const messages = await sessionApi.messages(childID, { limit: 10 })
+        verdictText = getText(findLatestAssistantMessage(messages)?.parts)
       }
       return parseAuditVerdict(verdictText)
     }
@@ -2093,7 +2416,16 @@ function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120_00
     let timerID
     const timeout = new Promise((resolve) => {
       timerID = setTimeout(
-        () => resolve({ approved: false, reason: `auditor timed out after ${timeoutMs}ms` }),
+        async () => {
+          if (childID && typeof client?.session?.abort === "function") {
+            try {
+              await createOpenCodeSessionApi(client, { preferredShape: sdkShape }).abort(childID)
+            } catch {
+              // The timeout verdict remains fail-closed even if host cancellation fails.
+            }
+          }
+          resolve(operationalFailure(`auditor timed out after ${timeoutMs}ms`))
+        },
         timeoutMs,
       )
     })
@@ -2102,14 +2434,24 @@ function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120_00
       const result = await Promise.race([run(), timeout])
       return result
     } catch (error) {
-      return { approved: true, reason: `auditor error (auto-approved): ${error?.message || error}` }
+      return operationalFailure(`auditor error: ${error?.message || error}`)
     } finally {
       clearTimeout(timerID)
     }
   }
 }
 
-export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {}) => {
+async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
+  if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
+    throw new TypeError("completionAudit requires registerAgents to remain enabled")
+  }
+  // PluginInput currently supplies the legacy generated SDK client, while
+  // consumers embedding the plugin may provide the flattened v2 client. Keep
+  // the host-native legacy shape as the default and allow explicit flat mode;
+  // the adapter safely probes only on argument-validation TypeErrors.
+  const sessionApi = createOpenCodeSessionApi(client, {
+    preferredShape: pluginOptions.sdkShape === "flat" ? "flat" : "legacy",
+  })
   const defaultGoalOptions = normalizeOptions(pluginOptions)
   // OpenCode's PluginInput carries the active session's project directory
   // separately from the Node process's own process.cwd(), which — when
@@ -2123,6 +2465,9 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
     env: pluginOptions.env,
     cwd: pluginOptions.cwd || directory,
   })
+  if (persistenceOptions.persistState) {
+    currentRuntime().persistenceLease = await acquirePersistenceLease(persistenceOptions.stateFilePath)
+  }
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
   // Serialize all persist() calls through a promise chain so concurrent callers
   // never race on the temp-file rename. persistState returns a boolean and never
@@ -2150,7 +2495,10 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
 
   // Route lifecycle events to the JSONL ledger only when persistence is on.
   if (persistenceOptions.persistState) {
-    setLedgerSink((entry) => appendLedgerLine(persistenceOptions.ledgerFilePath, entry))
+    setLedgerSink((entry) => appendLedgerLine(persistenceOptions.ledgerFilePath, entry, {
+      maxBytes: persistenceOptions.ledgerMaxBytes,
+      retentionFiles: persistenceOptions.ledgerRetentionFiles,
+    }))
   } else {
     setLedgerSink(null)
   }
@@ -2176,7 +2524,10 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
     typeof pluginOptions.auditor === "function"
       ? pluginOptions.auditor
       : pluginOptions.completionAudit
-        ? createChildSessionAuditor(client, pluginOptions.auditorOptions || {})
+        ? createChildSessionAuditor(client, {
+            ...(pluginOptions.auditorOptions || {}),
+            agent: pluginOptions.verifierAgentName || "goal-verify",
+          })
         : null
 
   clearRuntimeState()
@@ -2196,6 +2547,12 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
   const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState, completionAuditor })
 
   const hooks = {
+    config: async (config) => {
+      applyNativeGoalConfig(config, {
+        ...pluginOptions,
+        requireVerifierOwnership: Boolean(pluginOptions.completionAudit),
+      })
+    },
     "command.execute.before": async (input, output) => {
       if (input.command !== commandName) return
 
@@ -2321,6 +2678,10 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
           ]
           return
         }
+        if (newObjective.length > MAX_GOAL_OBJECTIVE_LENGTH) {
+          output.parts = [makeTextPart(`Goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`)]
+          return
+        }
 
         goal.condition = newObjective
         // Editing the objective revises the goal in place: keep the turn,
@@ -2366,6 +2727,10 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
               "No objectives provided. Use `/goal sisyphus <objective 1>; <objective 2>; …` (separate with `;` or newlines).",
             ),
           ]
+          return
+        }
+        if (objectives.some((objective) => objective.length > MAX_GOAL_OBJECTIVE_LENGTH)) {
+          output.parts = [makeTextPart(`Each goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`)]
           return
         }
 
@@ -2577,6 +2942,20 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
     },
 
     event: async ({ event }) => {
+      if (isAbortErrorEvent(event)) {
+        const sessionID = getSessionID(event)
+        const goal = goalStates.get(sessionID)
+        if (!goal) return
+        currentRuntime().continuationControllers.get(sessionID)?.abort()
+        goal.stopped = true
+        goal.stopReason = "user interrupted"
+        goal.lastStatus = `Goal paused after user interruption. Run /${commandName} resume to continue.`
+        pushHistory(goal, "paused", "Paused after OpenCode reported that the user interrupted the active turn.")
+        activeContinues.delete(sessionID)
+        await persist()
+        return
+      }
+
       if (event.type === "message.updated") {
         const message = messageInfoFromEvent(event)
         if (!message) return
@@ -2600,6 +2979,14 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
         const previousOutputTokens = seenOutputTokens.get(currentMessageID) || 0
         const currentTokens = totalTokensForMessage(message)
         const previousTokens = seenTokens.get(currentMessageID) || 0
+        const currentUsage = normalizeMessageUsage(message)
+        const previousUsage = seenUsage.get(currentMessageID) || emptyUsage()
+        if (USAGE_TOKEN_FIELDS.some((field) => currentUsage[field] > previousUsage[field]) || currentUsage.cost > previousUsage.cost) {
+          goal.usage = addUsageDelta(goal.usage, currentUsage, previousUsage)
+          seenUsage.set(currentMessageID, currentUsage)
+          goal.messageIDs.add(currentMessageID)
+          changed = true
+        }
         if (currentTokens > previousTokens) {
           // Track the context window size (peak input+output+reasoning),
           // not cumulative API token consumption. Each message's tokens
@@ -2631,21 +3018,34 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
       if (!isIdleEvent(event)) return
 
       const sessionID = getSessionID(event)
+      const eventID = typeof event?.id === "string" ? event.id : ""
+      const seenIdleEventIDs = currentRuntime().seenIdleEventIDs
+      if (eventID && seenIdleEventIDs.has(eventID)) return
+      if (eventID) {
+        seenIdleEventIDs.add(eventID)
+        // Keep diagnostics bounded for long-running servers. Event IDs are only
+        // needed to coalesce host re-delivery, not as durable history.
+        if (seenIdleEventIDs.size > 256) {
+          seenIdleEventIDs.delete(seenIdleEventIDs.values().next().value)
+        }
+      }
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped || activeContinues.has(sessionID)) return
       const goalID = goal.goalId
+      const runID = goal.runId
 
       const continueToken = randomUUID()
+      const continueController = new AbortController()
       activeContinues.set(sessionID, continueToken)
+      currentRuntime().continuationControllers.set(sessionID, continueController)
       try {
-        const messages = await client.session.messages({
-          path: { id: sessionID },
-          query: { limit: goal.options.maxRecentMessages },
+        const messages = await sessionApi.messages(sessionID, {
+          limit: goal.options.maxRecentMessages,
         })
-        const activeGoalAfterMessages = activeGoal(sessionID, goalID)
+        const activeGoalAfterMessages = activeGoal(sessionID, goalID, runID)
         if (!activeGoalAfterMessages) return
 
-        const latestAssistant = findLatestAssistantMessage(messages.data)
+        const latestAssistant = findLatestAssistantMessage(messages)
         const latestAssistantID = latestAssistant?.info?.id || ""
         const latestText = getText(latestAssistant?.parts)
         const latestOutputTokens = latestAssistant ? outputTokensForMessage(latestAssistant) : null
@@ -2663,7 +3063,7 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
         // Latest instruction wins: if a real (non-plugin) user message arrived
         // since the last auto-continue, stop driving the loop and defer to the
         // human. They can /goal resume to hand control back to the plugin.
-        if (userInterventionDetected(messages.data, activeGoalAfterMessages)) {
+        if (userInterventionDetected(messages, activeGoalAfterMessages)) {
           activeGoalAfterMessages.stopped = true
           activeGoalAfterMessages.stopReason = "user intervention"
           activeGoalAfterMessages.lastStatus =
@@ -2696,7 +3096,7 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
             // for the user to /goal clear or replace the goal. If it's gone,
             // bail out without archiving — archiving a cleared goal would resurrect
             // it in memory and potentially in the persisted state.
-            if (!activeGoal(sessionID, goalID)) return
+            if (!activeGoal(sessionID, goalID, runID)) return
             // Optional independent auditor (item 2.2): an approved verdict
             // archives; a rejected verdict restores (pauses) the goal instead.
             if (completionAuditor) {
@@ -2707,7 +3107,7 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
                 await logPluginError(client, "Completion auditor threw", error)
                 verdict = { approved: false, reason: "auditor error" }
               }
-              const auditedGoal = activeGoal(sessionID, goalID)
+              const auditedGoal = activeGoal(sessionID, goalID, runID)
               if (!auditedGoal) {
                 // The goal was cleared or replaced while the auditor was running.
                 // If the verdict was approved, surface the loss so the user knows
@@ -2804,9 +3204,8 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
             activeGoalAfterMessages.stopReason = limitReason
             activeGoalAfterMessages.lastStatus = `${limitReason}; requested final handoff.`
             pushHistory(activeGoalAfterMessages, "limit", `${limitReason}; requested a final handoff.`)
-            await client.session.promptAsync({
-              path: { id: sessionID },
-              body: { parts: [makeTextPart(buildContinueMessage(activeGoalAfterMessages, { budgetWrapup: true }))] },
+            await sessionApi.promptAsync(sessionID, {
+              parts: [makeContinuationPart(buildContinueMessage(activeGoalAfterMessages, { budgetWrapup: true }))],
             })
           } else {
             activeGoalAfterMessages.stopped = true
@@ -2928,10 +3327,14 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
           activeGoalAfterMessages.lastContinueAt &&
           elapsedSinceLastContinue < activeGoalAfterMessages.options.minDelayMs
         ) {
-          await sleep(activeGoalAfterMessages.options.minDelayMs - elapsedSinceLastContinue)
+          const delayCompleted = await sleep(
+            activeGoalAfterMessages.options.minDelayMs - elapsedSinceLastContinue,
+            continueController.signal,
+          )
+          if (!delayCompleted) return
         }
 
-        const activeGoalBeforePrompt = activeGoal(sessionID, goalID)
+        const activeGoalBeforePrompt = activeGoal(sessionID, goalID, runID)
         if (!activeGoalBeforePrompt) return
 
         const budgetWrapup = budgetWrapupNeeded(activeGoalBeforePrompt)
@@ -2989,23 +3392,20 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
           }
         }
 
-        const response = await client.session.promptAsync({
-          path: { id: sessionID },
-          body: {
-            parts: [
-              makeTextPart(
-                buildContinueMessage(activeGoalBeforePrompt, {
-                  budgetWrapup,
-                  completionUnverified,
-                  blockerUnstated,
-                }),
-              ),
-            ],
-          },
+        const response = await sessionApi.promptAsync(sessionID, {
+          parts: [
+            makeContinuationPart(
+              buildContinueMessage(activeGoalBeforePrompt, {
+                budgetWrapup,
+                completionUnverified,
+                blockerUnstated,
+              }),
+            ),
+          ],
         })
 
         if (response.error) {
-          const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
+          const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
           if (activeGoalAfterPrompt) {
             activeGoalAfterPrompt.promptFailures += 1
@@ -3019,7 +3419,7 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
           }
           await logPluginError(client, message, response.error)
         } else {
-          const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
+          const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           if (activeGoalAfterPrompt) {
             // Decrement rather than reset: an alternating error/success pattern
             // should still accumulate toward the circuit-breaker cap over time,
@@ -3036,7 +3436,7 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
         }
         await persist()
       } catch (error) {
-        const activeGoalAfterError = currentGoal(sessionID, goalID)
+        const activeGoalAfterError = currentGoal(sessionID, goalID, runID)
         if (activeGoalAfterError) {
           activeGoalAfterError.promptFailures += 1
           const message = `Auto-continue failed: ${error?.message || error}`
@@ -3055,6 +3455,9 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
         // the goal completed) and a new handler has since set a fresh token,
         // we must not clobber the new handler's guard.
         if (activeContinues.get(sessionID) === continueToken) activeContinues.delete(sessionID)
+        if (currentRuntime().continuationControllers.get(sessionID) === continueController) {
+          currentRuntime().continuationControllers.delete(sessionID)
+        }
       }
     },
 
@@ -3158,6 +3561,51 @@ export const GoalPlugin = async ({ client, directory } = {}, pluginOptions = {})
   return hooks
 }
 
+function bindRuntime(runtime, handler) {
+  return (...args) => runtimeStorage.run(runtime, () => handler(...args))
+}
+
+function bindHooksToRuntime(hooks, runtime) {
+  const bound = {}
+  for (const [name, value] of Object.entries(hooks)) {
+    if (name === "tool" && value && typeof value === "object") {
+      bound.tool = Object.fromEntries(
+        Object.entries(value).map(([toolName, definition]) => {
+          if (!definition || typeof definition.execute !== "function") return [toolName, definition]
+          return [
+            toolName,
+            {
+              ...definition,
+              execute: bindRuntime(runtime, definition.execute),
+            },
+          ]
+        }),
+      )
+      continue
+    }
+    bound[name] = typeof value === "function" ? bindRuntime(runtime, value) : value
+  }
+
+  bound.dispose = bindRuntime(runtime, async () => {
+    if (runtime.disposed) return
+    runtime.disposed = true
+    clearRuntimeState()
+    setLedgerSink(null)
+    await runtime.persistenceLease?.release()
+    runtime.persistenceLease = null
+  })
+  return bound
+}
+
+export const GoalPlugin = async (context = {}, pluginOptions = {}) => {
+  const runtime = createRuntimeState()
+  lastRuntime = runtime
+  return runtimeStorage.run(runtime, async () => {
+    const hooks = await createGoalPlugin(context, pluginOptions)
+    return bindHooksToRuntime(hooks, runtime)
+  })
+}
+
 export default {
   id: "opencode-goal-plugin",
   server: GoalPlugin,
@@ -3168,6 +3616,7 @@ export const testInternals = {
   agentToolSessionID,
   buildAgentToolHandlers,
   buildAgentTools,
+  serializeCompletionClaim,
   listSessionGoals,
   formatGoalList,
   appendLedgerLine,
@@ -3205,6 +3654,8 @@ export const testInternals = {
   normalizeCommandOptions,
   normalizeMode,
   normalizeOptions,
+  normalizeMessageUsage,
+  normalizeUsage,
   normalizePersistenceOptions,
   userInterventionDetected,
   outputTokensForMessage,
