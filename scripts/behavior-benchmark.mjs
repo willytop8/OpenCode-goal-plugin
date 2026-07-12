@@ -24,17 +24,29 @@ function assistantMessage(sessionID, text, id = `assistant-${sessionID}`) {
 function createHost(messageForSession = () => "Working with tools.") {
   const prompts = []
   const notices = []
+  const sourceTurns = new Map()
   return {
     prompts,
     notices,
     client: {
       app: { log: async () => {} },
       session: {
-        messages: async ({ path }) => ({
-          data: [assistantMessage(path.id, messageForSession(path.id))],
-        }),
+        messages: async ({ path }) => {
+          const turn = sourceTurns.get(path.id) || 0
+          return {
+            data: [
+              assistantMessage(
+                path.id,
+                messageForSession(path.id, turn),
+                `assistant-${path.id}-${turn}`,
+              ),
+            ],
+          }
+        },
         promptAsync: async (input) => {
           prompts.push(input)
+          const sessionID = input?.sessionID || input?.path?.id
+          if (sessionID) sourceTurns.set(sessionID, (sourceTurns.get(sessionID) || 0) + 1)
           return {}
         },
       },
@@ -157,8 +169,7 @@ results.push(await scenario("false-completion", 20, async () => {
 
 results.push(await scenario("loop-circuit-breaker", 15, async () => {
   const sessionID = "benchmark-loop"
-  let turn = 0
-  const host = createHost(() => `Still discussing the work, turn ${turn++}.`)
+  const host = createHost((_sessionID, turn) => `Still discussing the work, turn ${turn}.`)
   const hooks = await createHooks(host)
   await goalCommand(hooks, sessionID, "stop self-chat loops")
   await idle(hooks, sessionID, "loop-1")

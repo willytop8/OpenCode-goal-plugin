@@ -74,12 +74,17 @@ function textPart(text) {
   return { type: "text", text }
 }
 
-function message(text, tokens = { input: 1, output: 100, reasoning: 0 }) {
+function message(
+  text,
+  tokens = { input: 1, output: 100, reasoning: 0 },
+  id = "msg-assistant",
+  sessionID = "session-1",
+) {
   return {
     info: {
-      id: "msg-assistant",
+      id,
       role: "assistant",
-      sessionID: "session-1",
+      sessionID,
       tokens,
     },
     parts: [textPart(text)],
@@ -114,6 +119,7 @@ function pluginContinuationMessage(id = "msg-plugin") {
 
 async function createHooks(overrides = {}) {
   const calls = []
+  const aborts = []
   const logs = []
   const client = {
     app: {
@@ -129,6 +135,13 @@ async function createHooks(overrides = {}) {
         overrides.promptAsync ||
         (async (input) => {
           calls.push(input)
+          overrides.onPromptAsync?.(input)
+          return {}
+        }),
+      abort:
+        overrides.abort ||
+        (async (input) => {
+          aborts.push(input)
           return {}
         }),
     },
@@ -137,7 +150,7 @@ async function createHooks(overrides = {}) {
     { client },
     { persistState: false, ...(overrides.options || {}) },
   )
-  return { calls, hooks, logs }
+  return { aborts, calls, hooks, logs }
 }
 
 test("exports v1 OpenCode plugin module shape", () => {
@@ -778,9 +791,279 @@ test("pause during an in-flight idle handler prevents promptAsync", async () => 
   assert.equal(currentGoal("session-1").stopped, true)
 })
 
-test("near-zero repeated output pauses after the configured grace window", async () => {
+test("different idle event IDs cannot continue the same assistant source turn twice", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { id: "idle-a", type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  await hooks.event({
+    event: { id: "idle-b", type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").turnCount, 1)
+  assert.equal(currentGoal("session-1").noToolCallTurns, 0)
+  assert.equal(currentGoal("session-1").noProgressTurns, 0)
+  assert.equal(currentGoal("session-1").continuationClaim.sourceAssistantMessageID, "msg-assistant")
+})
+
+test("a human message arriving during cooldown is re-read and pauses before promptAsync", async () => {
+  let sourceTurn = 0
+  let fetchCount = 0
+  let secondFetchStarted
+  const secondFetch = new Promise((resolve) => {
+    secondFetchStarted = resolve
+  })
+  const recentMessages = [userMessage("initial request", "user-initial"), message("step zero", undefined, "msg-cooldown-0")]
   const { calls, hooks } = await createHooks({
-    messages: async () => ({ data: [message("ok", { input: 1, output: 5, reasoning: 0 })] }),
+    messages: async () => {
+      fetchCount += 1
+      if (fetchCount === 2) secondFetchStarted()
+      return { data: recentMessages }
+    },
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 100 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { id: "idle-first", type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  recentMessages.splice(
+    0,
+    recentMessages.length,
+    userMessage("initial request", "user-initial"),
+    pluginContinuationMessage("plugin-turn-0"),
+    message("step one", undefined, `msg-cooldown-${sourceTurn}`),
+  )
+
+  const idle = hooks.event({
+    event: { id: "idle-second", type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  await secondFetch
+  recentMessages.push(userMessage("stop and do this instead", "user-during-cooldown"))
+  await idle
+
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, true)
+  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+})
+
+test("a busy status arriving during cooldown suppresses the stale continuation", async () => {
+  let sourceTurn = 0
+  let fetchCount = 0
+  let secondFetchStarted
+  const secondFetch = new Promise((resolve) => {
+    secondFetchStarted = resolve
+  })
+  const recentMessages = [message("step zero", undefined, "msg-status-0")]
+  const { calls, hooks } = await createHooks({
+    messages: async () => {
+      fetchCount += 1
+      if (fetchCount === 2) secondFetchStarted()
+      return { data: recentMessages }
+    },
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 100 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  recentMessages.splice(0, 1, message("step one", undefined, `msg-status-${sourceTurn}`))
+
+  const idle = hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  await secondFetch
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "busy" } } },
+  })
+  await idle
+
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("continuations preserve the goal-initiating agent, model, and variant", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["chat.message"](
+    {
+      sessionID: "session-1",
+      agent: "build",
+      model: { providerID: "openrouter", modelID: "deepseek/deepseek-r1" },
+      variant: "high",
+    },
+    { message: { role: "user" }, parts: [textPart("/goal ship it")] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].body.agent, "build")
+  assert.deepEqual(calls[0].body.model, { providerID: "openrouter", modelID: "deepseek/deepseek-r1" })
+  assert.equal(calls[0].body.variant, "high")
+})
+
+test("switching the active session agent to Plan pauses before continuing", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.updated",
+      properties: {
+        sessionID: "session-1",
+        info: { sessionID: "session-1", agent: "Plan", model: { providerID: "openai", id: "gpt-5" } },
+      },
+    },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 0)
+  assert.equal(currentGoal("session-1").stopped, true)
+  assert.equal(currentGoal("session-1").stopReason, "plan agent active")
+})
+
+test("message aborts and provider errors pause before a following idle", async (t) => {
+  for (const scenario of [
+    {
+      name: "message.updated abort",
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "assistant-aborted",
+            role: "assistant",
+            sessionID: "session-1",
+            error: { name: "MessageAbortedError", data: { message: "interrupted" } },
+          },
+        },
+      },
+      reason: "user interrupted",
+    },
+    {
+      name: "session.error provider failure",
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "session-1",
+          error: { name: "ProviderAuthError", data: { message: "token expired" } },
+        },
+      },
+      reason: "provider error",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+      await hooks["command.execute.before"](
+        { command: "goal", sessionID: "session-1", arguments: "ship it" },
+        { parts: [] },
+      )
+      await hooks.event({ event: scenario.event })
+      await hooks.event({
+        event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+      })
+      assert.equal(calls.length, 0)
+      assert.equal(currentGoal("session-1").stopped, true)
+      assert.equal(currentGoal("session-1").stopReason, scenario.reason)
+    })
+  }
+})
+
+test("legacy and v2 permission rejection shapes both pause the goal", async (t) => {
+  for (const properties of [
+    { sessionID: "session-1", permissionID: "perm-1", response: "rejected" },
+    { sessionID: "session-1", requestID: "perm-2", reply: "reject" },
+  ]) {
+    await t.test(properties.response ? "legacy response" : "v2 reply", async () => {
+      const { hooks } = await createHooks()
+      await hooks["command.execute.before"](
+        { command: "goal", sessionID: "session-1", arguments: "ship it" },
+        { parts: [] },
+      )
+      await hooks.event({ event: { type: "permission.replied", properties } })
+      assert.equal(currentGoal("session-1").stopped, true)
+      assert.equal(currentGoal("session-1").stopReason, "permission rejected")
+    })
+  }
+})
+
+test("a human message aborts an already accepted continuation", async () => {
+  let resolvePrompt
+  let promptStarted
+  const started = new Promise((resolve) => {
+    promptStarted = resolve
+  })
+  const pendingPrompt = new Promise((resolve) => {
+    resolvePrompt = resolve
+  })
+  const { aborts, hooks } = await createHooks({
+    promptAsync: async () => {
+      promptStarted()
+      await pendingPrompt
+      return {}
+    },
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const idle = hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  await started
+  await hooks["chat.message"](
+    {
+      sessionID: "session-1",
+      agent: "build",
+      model: { providerID: "openai", modelID: "gpt-5" },
+    },
+    { message: { role: "user" }, parts: [textPart("stop; I need to change direction")] },
+  )
+  resolvePrompt()
+  await idle
+
+  assert.equal(aborts.length, 1)
+  assert.equal(aborts[0].path.id, "session-1")
+  assert.equal(currentGoal("session-1").stopped, true)
+  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+})
+
+test("near-zero repeated output pauses after the configured grace window", async () => {
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("ok", { input: 1, output: 5, reasoning: 0 }, `msg-low-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
   })
   await hooks["command.execute.before"](
@@ -824,9 +1107,15 @@ test("messageHasToolCall detects tool/subtask parts", () => {
 })
 
 test("continuation turns with no tool calls pause after the grace window", async () => {
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     // High output (so the low-output check never fires) but text-only: no tools.
-    messages: async () => ({ data: [message("Thinking out loud about the plan.")] }),
+    messages: async () => ({
+      data: [message("Thinking out loud about the plan.", undefined, `msg-talk-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, noToolCallTurnsBeforePause: 2 },
   })
   await hooks["command.execute.before"](
@@ -847,8 +1136,16 @@ test("continuation turns with no tool calls pause after the grace window", async
 })
 
 test("continuation turns that use tools do not trip the no-tool-call gate", async () => {
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => ({ data: [toolMessage("Ran the build.")] }),
+    messages: async () => {
+      const next = toolMessage("Ran the build.")
+      next.info.id = `msg-tool-${sourceTurn}`
+      return { data: [next] }
+    },
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, noToolCallTurnsBeforePause: 2 },
   })
   await hooks["command.execute.before"](
@@ -879,23 +1176,23 @@ test("plugin option zero disables the no-tool-call heuristic", () => {
 })
 
 test("short assistant updates that change content do not immediately count as stalled", async () => {
-  let callCount = 0
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => {
-      callCount += 1
-      return {
+    messages: async () => ({
         data: [
           {
             info: {
-              id: `msg-${callCount}`,
+              id: `msg-${sourceTurn}`,
               role: "assistant",
               sessionID: "session-changing",
               tokens: { input: 1, output: 5, reasoning: 0 },
             },
-            parts: [textPart(callCount === 1 ? "step one" : "step two")],
+            parts: [textPart(sourceTurn === 0 ? "step one" : "step two")],
           },
         ],
-      }
+      }),
+    onPromptAsync: () => {
+      sourceTurn += 1
     },
     options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
   })
@@ -927,15 +1224,13 @@ test("tool-calling turns with low output tokens are not counted as stalled", asy
   // tools with very little prose output (< 50 tokens, no text body), so two consecutive
   // such turns would incorrectly pause the goal. The fix: !latestHasToolCall is now
   // a required condition for lowOutputLooksStalled.
-  let callCount = 0
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => {
-      callCount += 1
-      return {
+    messages: async () => ({
         data: [
           {
             info: {
-              id: `msg-tool-${callCount}`,
+              id: `msg-tool-${sourceTurn}`,
               role: "assistant",
               sessionID: "session-tool-stall",
               tokens: { input: 1, output: 5, reasoning: 50000 },
@@ -944,7 +1239,9 @@ test("tool-calling turns with low output tokens are not counted as stalled", asy
             parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }],
           },
         ],
-      }
+      }),
+    onPromptAsync: () => {
+      sourceTurn += 1
     },
     options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
   })
@@ -1035,8 +1332,14 @@ test("maxRecentMessages is forwarded to the recent-message lookup", async () => 
 })
 
 test("stopped goals can be resumed", async () => {
+  let sourceTurn = 0
   const { hooks } = await createHooks({
-    messages: async () => ({ data: [message("ok", { input: 1, output: 5, reasoning: 0 })] }),
+    messages: async () => ({
+      data: [message("ok", { input: 1, output: 5, reasoning: 0 }, `msg-stopped-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 1 },
   })
   await hooks["command.execute.before"](
@@ -1144,7 +1447,12 @@ test("inspection, pause, and clear commands block mutation tools when command te
 })
 
 test("resume after a limit stop starts a fresh local budget", async () => {
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [message("still working", undefined, `msg-limit-${sourceTurn}`)] }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, maxTurns: 1 },
   })
   await hooks["command.execute.before"](
@@ -1594,8 +1902,9 @@ test("adjacent flags do not corrupt each other and still surface missing values"
 })
 
 test("no-progress pause takes precedence over budget wrap-up threshold", async () => {
+  let recentMessage = message("ok", { input: 1, output: 5, reasoning: 0 }, "msg-budget-initial")
   const { calls, hooks } = await createHooks({
-    messages: async () => ({ data: [message("ok", { input: 1, output: 5, reasoning: 0 })] }),
+    messages: async () => ({ data: [recentMessage] }),
     options: {
       minDelayMs: 1,
       maxTokens: 100,
@@ -1615,6 +1924,11 @@ test("no-progress pause takes precedence over budget wrap-up threshold", async (
       properties: { sessionID: "session-1", status: { type: "idle" } },
     },
   })
+  recentMessage = message(
+    "ok",
+    { input: 80, output: 5, reasoning: 0 },
+    "msg-budget-low-output",
+  )
   await hooks.event({
     event: {
       type: "message.updated",
@@ -1801,6 +2115,75 @@ test("persisted running goals are recovered in paused state after restart", asyn
     )
     assert.match(statusOutput.parts[0].text, /Recovered persisted goal state/)
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("continuation source claims and initiating execution context persist before promptAsync", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-claim-test-"))
+  const stateFilePath = join(dir, "state.json")
+  let hooks
+  let recoveredHooks
+
+  try {
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({
+          data: [message("still working", undefined, "assistant-durable-source", "session-durable-claim")],
+        }),
+        promptAsync: async () => ({}),
+      },
+    }
+    hooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await hooks["chat.message"](
+      {
+        sessionID: "session-durable-claim",
+        agent: "build",
+        model: { providerID: "openrouter", modelID: "model-a" },
+        variant: "high",
+      },
+      { message: { role: "user" }, parts: [textPart("/goal ship it")] },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-durable-claim", arguments: "ship it" },
+      { parts: [] },
+    )
+    await hooks.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "session-durable-claim", status: { type: "idle" } },
+      },
+    })
+
+    const persisted = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const goal = persisted.goals.find((entry) => entry.sessionID === "session-durable-claim")
+    assert.deepEqual(goal.executionContext, {
+      agent: "build",
+      model: { providerID: "openrouter", modelID: "model-a" },
+      variant: "high",
+    })
+    assert.deepEqual(goal.continuationClaim, {
+      runId: goal.runId,
+      sourceAssistantMessageID: "assistant-durable-source",
+    })
+
+    await hooks.dispose()
+    hooks = null
+    recoveredHooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    const recovered = currentGoal("session-durable-claim")
+    assert.equal(recovered.stopped, true)
+    assert.equal(recovered.continuationClaim, null)
+    assert.deepEqual(recovered.executionContext, goal.executionContext)
+  } finally {
+    await hooks?.dispose()
+    await recoveredHooks?.dispose()
     await rm(dir, { recursive: true, force: true })
   }
 })
@@ -2039,8 +2422,14 @@ test("repeated [goal:complete]-without-evidence re-prompts pause the goal after 
   // Regression: completionUnverified re-prompts never counted toward promptFailures,
   // so a model that consistently omits [goal:evidence] would loop until a hard limit.
   // formatFailures counter now caps this at maxPromptFailures consecutive format failures.
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => ({ data: [message("All done!\n\n[goal:complete]")] }),
+    messages: async () => ({
+      data: [message("All done!\n\n[goal:complete]", undefined, `msg-fmt-complete-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, maxPromptFailures: 2 },
   })
   await hooks["command.execute.before"](
@@ -2068,8 +2457,14 @@ test("repeated [goal:complete]-without-evidence re-prompts pause the goal after 
 })
 
 test("repeated [goal:blocked]-without-blocker re-prompts pause the goal after maxPromptFailures", async () => {
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => ({ data: [message("[goal:blocked]")] }),
+    messages: async () => ({
+      data: [message("[goal:blocked]", undefined, `msg-fmt-blocked-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1, maxPromptFailures: 2 },
   })
   await hooks["command.execute.before"](
@@ -2094,14 +2489,19 @@ test("repeated [goal:blocked]-without-blocker re-prompts pause the goal after ma
 })
 
 test("formatFailures resets to zero when the model produces a valid response", async () => {
-  let turnCount = 0
+  let sourceTurn = 0
   const { calls, hooks } = await createHooks({
-    messages: async () => {
-      turnCount += 1
-      // Turn 1: invalid (no evidence); Turn 2: valid response
-      return {
-        data: [turnCount < 2 ? message("All done!\n\n[goal:complete]") : message("Still working on it.")],
-      }
+    messages: async () => ({
+      data: [
+        message(
+          sourceTurn === 0 ? "All done!\n\n[goal:complete]" : "Still working on it.",
+          undefined,
+          `msg-fmt-reset-${sourceTurn}`,
+        ),
+      ],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
     },
     options: { minDelayMs: 1, maxPromptFailures: 3 },
   })
@@ -4887,16 +5287,19 @@ test("agent clearGoal removes background goals so they do not resurrect on resta
 test("formatFailures decrements by 1 on a clean turn instead of resetting to 0", async () => {
   // Scenario: 2 consecutive format failures, then one clean turn.
   // Old behavior: formatFailures → 0. New: formatFailures → 1.
-  let msgSeq = 0
+  let sourceTurn = 0
   const { hooks } = await createHooks({
     messages: async () => ({
       data: [
         {
-          info: { id: `msg-ff-${++msgSeq}`, role: "assistant", sessionID: "ff-decrement-s1", tokens: { input: 1, output: 200, reasoning: 0 } },
+          info: { id: `msg-ff-${sourceTurn}`, role: "assistant", sessionID: "ff-decrement-s1", tokens: { input: 1, output: 200, reasoning: 0 } },
           parts: [textPart("Almost done!\n[goal:complete]")], // no [goal:evidence] → format failure
         },
       ],
     }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
     options: { minDelayMs: 1 },
   })
 
@@ -4916,16 +5319,19 @@ test("formatFailures decrements by 1 on a clean turn instead of resetting to 0",
   assert.equal(currentGoal("ff-decrement-s1").formatFailures, 2)
 
   // Now switch to a clean turn (no completion marker, plenty of output).
-  msgSeq = 0
+  let cleanSourceTurn = 0
   const { hooks: hooks2 } = await createHooks({
     messages: async () => ({
       data: [
         {
-          info: { id: `msg-clean-${++msgSeq}`, role: "assistant", sessionID: "ff-decrement-s2", tokens: { input: 1, output: 200, reasoning: 0 } },
+          info: { id: `msg-clean-${cleanSourceTurn}`, role: "assistant", sessionID: "ff-decrement-s2", tokens: { input: 1, output: 200, reasoning: 0 } },
           parts: [textPart("Still working on it, making good progress.")],
         },
       ],
     }),
+    onPromptAsync: () => {
+      cleanSourceTurn += 1
+    },
     options: { minDelayMs: 1 },
   })
   // Set up a fresh goal with formatFailures pre-set to 2 to test the decrement.
