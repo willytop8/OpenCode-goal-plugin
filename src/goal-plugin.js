@@ -74,7 +74,7 @@ const DEFAULT_OPTIONS = {
 // handler drives and that the system-prompt transform injects. `sessionGoals`
 // is the full registry of live goals per session (focused + backgrounded);
 // the focused goal is the same object reference held in both. `sessionArchive`
-// keeps a capped list of completed/cleared goals so they stay readable.
+// keeps a capped list of achieved goals so completed work stays readable.
 function createRuntimeState() {
   return {
     goalStates: new Map(),
@@ -129,7 +129,7 @@ function runtimeCollection(name) {
 const goalStates = runtimeCollection("goalStates")
 const sessionGoals = runtimeCollection("sessionGoals")
 const sessionArchive = runtimeCollection("sessionArchive")
-// Sessions running an ordered (sisyphus) sequence: when the focused goal
+// Sessions running an ordered sequence: when the focused goal
 // completes, the next live goal (in creation order) is auto-promoted to focus
 // so the sequence advances on its own.
 const sessionOrdered = runtimeCollection("sessionOrdered")
@@ -147,6 +147,9 @@ const seenOutputTokens = runtimeCollection("seenOutputTokens")
 const activeContinues = runtimeCollection("activeContinues")
 const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
 const PAUSE_COMMANDS = new Set(["pause"])
+// `sequence` is canonical. The former public spelling remains accepted at
+// the parser boundary so existing scripts do not break.
+const SEQUENCE_COMMANDS = ["sequence", "sisyphus"]
 const READ_ONLY_COMMAND_TOOLS = new Set(["goal_status", "get_goal", "get_goal_history", "read", "glob", "grep"])
 const GOAL_FLAG_SPECS = {
   "--max-turns": {
@@ -211,8 +214,8 @@ function messageHasToolCall(message) {
 
 const GOAL_MODES = new Set(["normal", "ordered"])
 
-// Goal mode: normal vs ordered (a.k.a. sisyphus). `ordered`
-// signals a strict execution sequence; `sisyphus` is accepted as an alias.
+// Goal mode: normal vs ordered. The former public spelling remains accepted
+// as an input alias, while stored state and output always use `ordered`.
 // Returns the canonical mode or null when unrecognized.
 function normalizeMode(value) {
   const normalized = String(value || "").trim().toLowerCase()
@@ -727,7 +730,7 @@ function archiveSessionResult(sessionID, result) {
   sessionArchive.set(sessionID, list.slice(-MAX_ARCHIVED_PER_SESSION))
 }
 
-// Advance an ordered (sisyphus) sequence: focus the next live goal in creation
+// Advance an ordered sequence: focus the next live goal in creation
 // order, clearing any backgrounded state so the idle handler drives it. Returns
 // the promoted goal, or null when the sequence is exhausted (which also clears
 // the session's ordered flag).
@@ -743,7 +746,7 @@ function promoteNextOrderedGoal(sessionID) {
   resumeGoalClock(next)
   next.skipNextTerminalCheck = true
   next.lastStatus = "Promoted as the next ordered goal."
-  pushHistory(next, "focused", "Auto-promoted as the next goal in the ordered (sisyphus) sequence.")
+  pushHistory(next, "focused", "Auto-promoted as the next goal in the ordered sequence.")
   focusGoal(sessionID, next)
   return next
 }
@@ -2463,7 +2466,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
         const ordered = sessionOrdered.has(sessionID)
         rememberGoalResult(sessionID, goal, "achieved", "", evidence)
         cleanupGoal(sessionID)
-        // Advance an ordered (sisyphus) sequence just like the marker path does.
+        // Advance an ordered sequence just like the marker path does.
         if (ordered) promoteNextOrderedGoal(sessionID)
         const durable = await persistFinal("completion", ledgerDurable)
         if (durable === false) {
@@ -2707,7 +2710,7 @@ function formatGoalList(sessionID, commandName = "goal") {
 
   const lines = []
   if (goals.length) {
-    lines.push(`Goals (${goals.length})${sessionOrdered.has(sessionID) ? " — ordered (sisyphus)" : ""}:`)
+    lines.push(`Goals (${goals.length})${sessionOrdered.has(sessionID) ? " — ordered sequence" : ""}:`)
     goals.forEach((goal, index) => {
       const marker = goal.goalId === focusedId ? "focused" : goal.stopped ? "background" : "idle"
       const state = goal.stopped && goal.goalId !== focusedId ? ` — ${goal.stopReason || "stopped"}` : ""
@@ -3347,8 +3350,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         return
       }
 
-      if (args === "sisyphus" || args.toLowerCase().startsWith("sisyphus ")) {
-        const rest = args.slice("sisyphus".length).trim()
+      const sequenceCommand = SEQUENCE_COMMANDS.find(
+        (command) => args.toLowerCase() === command || args.toLowerCase().startsWith(`${command} `),
+      )
+      if (sequenceCommand) {
+        const rest = args.slice(sequenceCommand.length).trim()
         const objectives = rest
           .split(/\n|;/)
           .map((part) => stripWrappingQuotes(part.trim()))
@@ -3356,7 +3362,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!objectives.length) {
           output.parts = [
             makeTextPart(
-              `No objectives provided. Use \`/${commandName} sisyphus <objective 1>; <objective 2>; …\` (separate with \`;\` or newlines).`,
+              `No objectives provided. Use \`/${commandName} sequence <objective 1>; <objective 2>; …\` (separate with \`;\` or newlines).`,
             ),
           ]
           return
@@ -3400,7 +3406,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           pushHistory(
             created,
             "set",
-            `Ordered goal ${index + 1}/${objectives.length} created (sisyphus sequence).`,
+            `Ordered goal ${index + 1}/${objectives.length} created.`,
           )
           registerSessionGoal(created)
         })
@@ -3410,7 +3416,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         output.parts = [
           makeTextPart(
             [
-              `Started an ordered sequence of ${objectives.length} goal(s) (sisyphus mode):`,
+              `Started an ordered sequence of ${objectives.length} goal(s):`,
               ...objectives.map((objective, index) => `${index + 1}. ${objective}`),
               "",
               `Focused goal 1: ${firstGoal.condition}`,
@@ -3560,7 +3566,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // Replace the focused goal (cleanupGoal discards it); backgrounded goals
       // for this session are preserved. Use `/goal add` to keep the current
       // goal and add another. Clear any ordered-sequence flag so the new
-      // standalone goal does not trigger sisyphus auto-promotion of old sequence
+      // standalone goal does not trigger auto-promotion of the old sequence
       // goals that may still be in the registry (matches the agent setGoal path).
       sessionOrdered.delete(sessionID)
       cleanupGoal(sessionID)
@@ -3852,7 +3858,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             const ordered = sessionOrdered.has(sessionID)
             rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved", "", evidence)
             cleanupGoal(sessionID)
-            // Ordered (sisyphus) sequence: auto-promote the next goal so the
+            // Ordered sequence: auto-promote the next goal so the
             // session keeps working through the sequence without manual /goal focus.
             if (ordered) {
               promoteNextOrderedGoal(sessionID)

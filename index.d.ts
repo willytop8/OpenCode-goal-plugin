@@ -48,7 +48,7 @@ export interface GoalAuditSnapshot {
   condition: string
   successCriteria: string
   constraints: string
-  mode: "normal" | "sisyphus"
+  mode: "normal" | "ordered"
   sessionID: string
   turnCount: number
   startedAt: number

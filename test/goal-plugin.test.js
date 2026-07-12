@@ -341,7 +341,7 @@ test("parses success criteria, constraints, and mode into goal meta", () => {
   assert.deepEqual(parsed.errors, [])
 })
 
-test("--non-goals aliases constraints and sisyphus aliases ordered mode", () => {
+test("the legacy mode spelling remains an input-only alias for ordered", () => {
   const parsed = parseGoalArguments('ship it --non-goals "no refactors" --mode=sisyphus', normalizeOptions())
   assert.equal(parsed.condition, "ship it")
   assert.equal(parsed.meta.constraints, "no refactors")
@@ -4231,7 +4231,7 @@ test("createChildSessionAuditor requires an explicit policy to approve operation
   )
 })
 
-// ── Sisyphus ordered goals ─────────────────────────────────────────────────
+// ── Ordered goal sequences ──────────────────────────────────────────────────
 
 async function idleOnce(hooks, sessionID) {
   await hooks.event({
@@ -4239,10 +4239,10 @@ async function idleOnce(hooks, sessionID) {
   })
 }
 
-test("/goal sisyphus sets up an ordered sequence with the first goal focused", async () => {
+test("/goal sequence sets up an ordered sequence with the first goal focused", async () => {
   const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
-  const sid = "sis-s1"
-  const text = await runGoal(hooks, sid, "sisyphus build the parser; write the tests; ship it")
+  const sid = "sequence-s1"
+  const text = await runGoal(hooks, sid, "sequence build the parser; write the tests; ship it")
   assert.match(text, /ordered sequence of 3 goal\(s\)/)
   assert.match(text, /Focused goal 1: build the parser/)
 
@@ -4253,7 +4253,17 @@ test("/goal sisyphus sets up an ordered sequence with the first goal focused", a
   assert.equal(goals[1].stopped, true)
   assert.equal(goals[1].stopReason, "queued")
 
-  assert.match(await runGoal(hooks, sid, "list"), /ordered \(sisyphus\)/)
+  assert.match(await runGoal(hooks, sid, "list"), /ordered sequence/)
+  assert.doesNotMatch(text, /sisyphus/i)
+})
+
+test("the former sequence command remains an input-only compatibility alias", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  const sid = "sequence-compat"
+  const text = await runGoal(hooks, sid, "sisyphus first; second")
+  assert.match(text, /Started an ordered sequence of 2 goal\(s\)/)
+  assert.doesNotMatch(text, /sisyphus/i)
+  assert.match(await runGoal(hooks, sid, "list"), /ordered sequence/)
 })
 
 test("completing the focused ordered goal auto-promotes the next, then ends the sequence", async () => {
@@ -4269,8 +4279,8 @@ test("completing the focused ordered goal auto-promotes the next, then ends the 
     messages: async () => ({ data: [completions[Math.min(messageCall++, completions.length - 1)]] }),
     options: { minDelayMs: 1 },
   })
-  const sid = "sis-s2"
-  await runGoal(hooks, sid, "sisyphus alpha; beta; gamma")
+  const sid = "sequence-s2"
+  await runGoal(hooks, sid, "sequence alpha; beta; gamma")
   assert.equal(currentGoal(sid).condition, "alpha")
 
   await idleOnce(hooks, sid) // completes alpha → promotes beta
@@ -4296,21 +4306,21 @@ test("completing the focused ordered goal auto-promotes the next, then ends the 
 
 test("promoteNextOrderedGoal focuses the next goal or ends the sequence", async () => {
   const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
-  const sid = "sis-s3"
-  await runGoal(hooks, sid, "sisyphus one; two")
+  const sid = "sequence-s3"
+  await runGoal(hooks, sid, "sequence one; two")
   // Drop the focused goal manually, then promote.
   await runGoal(hooks, sid, "clear") // clears focused "one" and the ordered flag
 
   // Re-establish a small ordered set and exercise the helper directly.
-  await runGoal(hooks, sid, "sisyphus solo")
+  await runGoal(hooks, sid, "sequence solo")
   assert.equal(currentGoal(sid).condition, "solo")
   // Remove it and promote → nothing left.
   await runGoal(hooks, sid, "clear")
   assert.equal(promoteNextOrderedGoal(sid), null)
 })
 
-test("ordered (sisyphus) flag survives a persistence round-trip", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-sis-"))
+test("ordered sequence state survives a persistence round-trip", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-sequence-"))
   const stateFilePath = join(dir, "state.json")
   const client = {
     app: { log: async () => {} },
@@ -4318,17 +4328,17 @@ test("ordered (sisyphus) flag survives a persistence round-trip", async () => {
   }
   try {
     const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
-    await runGoal(hooks, "sis-persist", "sisyphus first; second")
+    await runGoal(hooks, "sequence-persist", "sequence first; second")
 
     await hooks.dispose()
     const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
     const reloaded = { parts: [] }
     await recoveredHooks["command.execute.before"](
-      { command: "goal", sessionID: "sis-persist", arguments: "list" },
+      { command: "goal", sessionID: "sequence-persist", arguments: "list" },
       reloaded,
     )
-    assert.match(reloaded.parts[0].text, /ordered \(sisyphus\)/)
-    assert.equal(listSessionGoals("sis-persist").length, 2)
+    assert.match(reloaded.parts[0].text, /ordered sequence/)
+    assert.equal(listSessionGoals("sequence-persist").length, 2)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -5081,7 +5091,7 @@ test("ordered completion storage failure rolls back premature successor promotio
   }
   const hooks = await GoalPlugin({ client }, { persistState: false })
   await hooks["command.execute.before"](
-    { command: "goal", sessionID: "ordered-storage-failure", arguments: "sisyphus first; second" },
+    { command: "goal", sessionID: "ordered-storage-failure", arguments: "sequence first; second" },
     { parts: [] },
   )
   const handlers = buildAgentToolHandlers({
@@ -5164,7 +5174,7 @@ test("ledger-only ordered completion promotes the queued successor during restar
   try {
     first = await GoalPlugin({ client }, { stateFilePath, minDelayMs: 1 })
     await first["command.execute.before"](
-      { command: "goal", sessionID: "ordered-ledger-restart", arguments: "sisyphus first; second" },
+      { command: "goal", sessionID: "ordered-ledger-restart", arguments: "sequence first; second" },
       { parts: [] },
     )
     const firstGoal = currentGoal("ordered-ledger-restart")
@@ -5460,12 +5470,12 @@ test("/goal edit resets formatFailures so the revised objective starts with a cl
   assert.equal(currentGoal(sid).condition, "revised objective")
 })
 
-test("/goal replace clears sessionOrdered so old sisyphus sequence does not auto-promote", async () => {
+test("/goal replace clears sessionOrdered so an old sequence does not auto-promote", async () => {
   const { hooks } = await createHooks()
   const sid = "replace-ordered-s1"
 
-  // Start an ordered sequence via sisyphus.
-  await runGoal(hooks, sid, "sisyphus 'alpha'; 'beta'")
+  // Start an ordered sequence.
+  await runGoal(hooks, sid, "sequence 'alpha'; 'beta'")
   // sessionOrdered should now be set for this session.
   // Replace with a standalone goal.
   await runGoal(hooks, sid, "standalone goal")
