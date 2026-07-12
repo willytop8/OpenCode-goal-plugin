@@ -36,15 +36,16 @@ surface and versioning expectations.
 
 ### OpenCode version compatibility
 
-Manually tested via the OpenCode TUI (`tmux` + real provider credentials, no mocks), verified against the plugin's own persisted state rather than terminal display alone:
+Tested against real OpenCode 1.17.15 processes with live provider credentials and no mocked plugin hooks. State, ledger entries, and workspace files were checked independently of terminal or model prose:
 
 | OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Hook Output Display |
 |---|---|---|---|---|---|
+| 1.17.15 | opencode (`deepseek-v4-flash-free`) | ✅ Canonical tool | ✅ Checkpoint + idle continuation | ✅ Structured `goal_complete` claim | ⚠️ Command text routed to model; mutation guard verified |
 | 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
 | 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
 | 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
 
-`/goal status` and auto-continue are graded on **state correctness** (verified directly against the plugin's persisted state file: correct limits parsed, correct turn/stop accounting, correct completion detection) — not on what's rendered in the terminal, since that's tracked separately as Hook Output Display.
+`/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
 **Note:** Hook output display depends on OpenCode version — on 1.17.15, `command.execute.before`'s `output.parts` text is not rendered in the TUI for any provider tested; the raw command argument is instead routed to the model as a normal chat turn (see [Limitations](#limitations)). State mutations always work regardless of display: goal creation, flag parsing, auto-continue, limit enforcement, and evidence-gated completion detection were all verified correct via the persisted state file in every combination above. Re-test against your own OpenCode build before relying on unattended runs, and see [`docs/providers.md`](docs/providers.md) for the full per-model marker-compliance notes.
 
@@ -89,7 +90,7 @@ Add success criteria, constraints / non-goals, and a mode:
 /goal ship the release --success "tests pass and changelog updated" --constraints "do not touch the public API" --mode ordered
 ```
 
-`--success` (alias `--success-criteria`) and `--constraints` (alias `--non-goals`) take quoted text and are injected alongside the objective so the assistant keeps them in view. `--mode` is `normal` (default) or `ordered` (alias `sisyphus`); `ordered` asks the assistant to work through the objective as a strict sequence. Multi-word values must be quoted.
+`--success` (alias `--success-criteria`) and `--constraints` (alias `--non-goals`) take quoted text and are injected alongside the objective so the assistant keeps them in view. `--mode` is `normal` (default) or `ordered`; `ordered` tells the assistant to preserve step order inside one objective. To queue distinct objectives that auto-promote one at a time, use `/goal sequence`. Multi-word values must be quoted.
 
 Flags accept either `--flag value` or `--flag=value`. If a flag is unknown, missing a value, given a non-positive integer, or (for `--mode`) an unrecognized mode, the plugin rejects the command with a helpful error instead of silently folding the bad flag into the goal text.
 
@@ -125,7 +126,7 @@ Pause without clearing the active goal:
 /goal pause
 ```
 
-Clear the active goal:
+Clear all live goals in the current session and discard their saved status:
 
 ```
 /goal clear
@@ -155,14 +156,14 @@ A session can hold more than one goal. `/goal <condition>` replaces the focused 
 /goal focus 1
 ```
 
-`/goal list` shows the numbered live goals (which is focused, which are backgrounded) and a per-session archive of completed/cleared goals so they stay readable. `/goal focus <number>` switches the active goal, backgrounding the previous one. Focus is tracked per session and survives a restart.
+`/goal list` shows numbered live goals (focused and backgrounded) plus achieved goals retained in the per-session archive. `/goal clear` intentionally removes live goals and saved status from these views; its terminal ledger entries remain available for crash-safe recovery decisions. `/goal focus <number>` switches the active goal, backgrounding the previous one. Focus is tracked per session and survives a restart.
 
-#### Ordered (sisyphus) sequences
+#### Ordered sequences
 
-`/goal sisyphus` sets up a strict execution sequence: separate the objectives with `;` or newlines, and the plugin runs them one at a time, auto-focusing the next as soon as the current one completes.
+`/goal sequence` sets up a strict execution queue: separate objectives with `;` or newlines, and the plugin runs them one at a time, focusing the next as soon as the current one completes.
 
 ```
-/goal sisyphus build the parser; write the tests; ship the release
+/goal sequence build the parser; write the tests; ship the release
 ```
 
 The first goal is focused and the rest are queued. `/goal list` marks the session as ordered. Auto-promotion stops when the sequence is exhausted; `/goal clear` ends the sequence.
@@ -187,7 +188,7 @@ With success criteria, constraints, and a token budget shorthand:
 An ordered sequence, run as a strict pipeline:
 
 ```
-/goal sisyphus build the parser; write the tests; ship the release
+/goal sequence build the parser; write the tests; ship the release
 ```
 
 ## How it works
@@ -272,7 +273,7 @@ Override any limit for a single goal:
 | `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
 | `--success <text>` | Success criteria that define when the goal is satisfied (quote multi-word text) |
 | `--constraints <text>` | Constraints / non-goals to respect (alias `--non-goals`) |
-| `--mode <normal\|ordered>` | Execution mode; `ordered` (alias `sisyphus`) asks for a strict sequence |
+| `--mode <normal\|ordered>` | Prompt mode for one goal; `ordered` preserves step order inside its objective |
 | `--no-tool-turns <n>` | Consecutive tool-free continuation turns before pausing |
 
 Examples:
@@ -343,7 +344,7 @@ Registered tools:
 
 `goal_set` and `set_goal` are explicitly constrained to user-requested goals. `goal_complete` accepts a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`, `failed`, or `not-run`), changed files, and known limitations. Failed checks and empty criterion evidence are rejected before archival; accepted claims are serialized deterministically for the configured completion auditor. The legacy `update_goal` tool retains its string `evidence` field for compatibility.
 
-These operate on the same per-session multi-goal state as the command path: a tool-set goal persists, shows up in `/goal list`, and is driven by the idle auto-continue; completing a goal in an ordered (sisyphus) sequence auto-promotes the next.
+These operate on the same per-session multi-goal state as the command path: a tool-set goal persists, shows up in `/goal list`, and is driven by the idle auto-continue; completing a goal in an ordered sequence auto-promotes the next.
 
 > Integration note: the tool execute-context shape (`ctx.sessionID`) and the `tool.schema` surface follow the OpenCode plugin docs. The tool **logic** is unit-tested independently, but the live registration should be confirmed against a real OpenCode run (see the smoke-test checklist).
 

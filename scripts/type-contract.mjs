@@ -55,10 +55,13 @@ const options = {
   auditorOptions: { timeoutMs: 5_000, failurePolicy: "reject" },
   auditMessages: true,
   auditMessenger: (_sessionID, _text) => {},
-  auditor: async ({ goal, sessionID, latestText }: CompletionAuditContext) => ({
-    approved: goal.sessionID === sessionID && latestText.length > 0,
-    reason: goal.lastCheckpoint?.summary,
-  }),
+  auditor: async ({ goal, sessionID, latestText }: CompletionAuditContext) => {
+    const mode: "normal" | "ordered" = goal.mode
+    return {
+      approved: goal.sessionID === sessionID && latestText.length > 0,
+      reason: goal.lastCheckpoint?.summary || mode,
+    }
+  },
 } satisfies GoalPluginOptions
 
 const hooks: GoalPluginHooks = await GoalPlugin({ client: {}, directory: "/tmp" }, options)

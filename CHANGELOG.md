@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Make `/goal sequence` the canonical ordered multi-goal command, retain the previous command and mode spelling as input-only compatibility aliases, correct the public auditor snapshot mode type to `"normal" | "ordered"`, and align README archive and compatibility claims with verified behavior.
+
 ## 0.6.4 — 2026-07-12
 
 - Re-check session status and recent messages after an auto-continue cooldown, pause immediately for human intervention, Plan-agent switches, permission rejection, aborts, and provider errors, and abort an accepted continuation when the user takes control.
