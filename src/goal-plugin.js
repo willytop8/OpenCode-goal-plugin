@@ -1756,11 +1756,16 @@ function buildContinueMessage(
     )
   } else {
     lines.push(
-      "Continue with the next concrete step; inspect current state and repair failures.",
+      "Continue the next concrete step; inspect and repair failures.",
     )
   }
 
-  lines.push("Complete only after verification: `[goal:evidence] …` then `[goal:complete]`. If only user input can unblock work, state why then `[goal:blocked]`.")
+  lines.push(
+    "Completion format—consecutive plain lines; no Markdown/backticks/blank line:",
+    "[goal:evidence] <proof>",
+    "[goal:complete]",
+    "Need user input? State why before [goal:blocked].",
+  )
   const limitWarning = buildLimitWarning(goal)
   if (limitWarning) lines.push(limitWarning.trim())
 
