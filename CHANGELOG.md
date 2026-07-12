@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.4 — 2026-07-12
 
 - Re-check session status and recent messages after an auto-continue cooldown, pause immediately for human intervention, Plan-agent switches, permission rejection, aborts, and provider errors, and abort an accepted continuation when the user takes control.
 - Persist one continuation claim per goal execution epoch and source assistant turn to prevent sequential duplicate idle events, while preserving the initiating agent, model, and variant on every continuation prompt.
