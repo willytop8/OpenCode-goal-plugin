@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.3 — 2026-07-11
+
 - Clarify the textual completion protocol so models keep evidence and completion on consecutive plain-text lines instead of wrapping markers in Markdown or separating them with blank lines.
 
 ## 0.6.2 — 2026-07-11
