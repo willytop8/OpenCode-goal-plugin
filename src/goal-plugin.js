@@ -87,7 +87,10 @@ function createRuntimeState() {
     seenOutputTokens: new Map(),
     activeContinues: new Map(),
     continuationControllers: new Map(),
+    promptInFlightSessions: new Set(),
     seenIdleEventIDs: new Set(),
+    sessionStatuses: new Map(),
+    sessionExecutionContexts: new Map(),
     readOnlyCommandGuards: new Set(),
     ledgerSink: null,
     persistenceLease: null,
@@ -242,7 +245,13 @@ function makeContinuationPart(text) {
 }
 
 function getSessionID(event) {
-  return event?.properties?.sessionID || event?.properties?.info?.sessionID || null
+  return (
+    event?.properties?.sessionID ||
+    event?.properties?.info?.sessionID ||
+    event?.data?.sessionID ||
+    event?.data?.info?.sessionID ||
+    null
+  )
 }
 
 function isIdleEvent(event) {
@@ -252,12 +261,76 @@ function isIdleEvent(event) {
   )
 }
 
-function isAbortErrorEvent(event) {
-  if (event?.type !== "session.error") return false
-  const error = event?.properties?.error
+function normalizeExecutionContext(value) {
+  if (!isPlainObject(value)) return null
+  const model = isPlainObject(value.model) ? value.model : {}
+  const boundedContextText = (candidate) => {
+    if (typeof candidate !== "string") return ""
+    const normalized = candidate.trim()
+    return normalized.length <= MAX_GOAL_META_LENGTH ? normalized : ""
+  }
+  const agent = boundedContextText(value.agent)
+  const providerID = boundedContextText(model.providerID)
+  const modelID =
+    boundedContextText(model.modelID) || boundedContextText(model.id)
+  const variantValue = value.variant ?? model.variant
+  const variant = boundedContextText(variantValue)
+  if (!agent && !(providerID && modelID) && !variant) return null
+  return {
+    ...(agent ? { agent } : {}),
+    ...(providerID && modelID ? { model: { providerID, modelID } } : {}),
+    ...(variant ? { variant } : {}),
+  }
+}
+
+function continuationContextInput(goal) {
+  const context = normalizeExecutionContext(goal?.executionContext)
+  return context ? { ...context } : {}
+}
+
+function isPlanAgent(agent) {
+  return typeof agent === "string" && agent.trim().toLowerCase() === "plan"
+}
+
+function terminalEvent(event) {
+  const permissionReply = String(
+    event?.properties?.reply ??
+      event?.properties?.response ??
+      event?.data?.reply ??
+      event?.data?.response ??
+      "",
+  )
+  if (event?.type === "permission.replied" && /^(?:reject(?:ed)?|deny|denied)$/i.test(permissionReply)) {
+    return {
+      sessionID: getSessionID(event),
+      stopReason: "permission rejected",
+      status: "Goal paused after a permission request was rejected.",
+      history: "Paused after OpenCode reported a rejected permission request.",
+    }
+  }
+
+  let error = null
+  if (event?.type === "session.error") {
+    error = event?.properties?.error || event?.data?.error
+  } else if (event?.type === "message.updated") {
+    error = messageInfoFromEvent(event)?.error
+  }
+  if (!error) return null
+
   const name = String(error?.name || error?.data?.name || "")
   const message = String(error?.message || error?.data?.message || "")
-  return name === "MessageAbortedError" || /\babort(?:ed)?\b/i.test(`${name} ${message}`)
+  const aborted = name === "MessageAbortedError" || /\babort(?:ed)?\b/i.test(`${name} ${message}`)
+  const summary = summarizeText(`${name}${message ? `: ${message}` : ""}`, 240) || "unknown provider error"
+  return {
+    sessionID: getSessionID(event) || messageSessionID(messageInfoFromEvent(event)),
+    stopReason: aborted ? "user interrupted" : "provider error",
+    status: aborted
+      ? "Goal paused after user interruption."
+      : `Goal paused after a terminal provider error: ${summary}`,
+    history: aborted
+      ? "Paused after OpenCode reported that the active turn was aborted."
+      : `Paused after OpenCode reported a terminal provider error: ${summary}`,
+  }
 }
 
 function summarizeText(text, limit = CHECKPOINT_CHAR_LIMIT) {
@@ -706,7 +779,10 @@ function clearRuntimeState() {
   seenOutputTokens.clear()
   activeContinues.clear()
   runtime.continuationControllers.clear()
+  runtime.promptInFlightSessions.clear()
   runtime.seenIdleEventIDs.clear()
+  runtime.sessionStatuses.clear()
+  runtime.sessionExecutionContexts.clear()
   runtime.readOnlyCommandGuards.clear()
 }
 
@@ -805,6 +881,7 @@ function resetGoalBudget(goal) {
   goal.promptFailures = 0
   goal.formatFailures = 0
   goal.lastAssistantMessageID = ""
+  goal.continuationClaim = null
   goal.skipNextTerminalCheck = false
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
 }
@@ -1109,6 +1186,18 @@ function normalizePersistedGoal(rawGoal) {
     stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
     promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
     formatFailures: toNonNegativeInteger(rawGoal.formatFailures),
+    executionContext: normalizeExecutionContext(rawGoal.executionContext),
+    continuationClaim:
+      isPlainObject(rawGoal.continuationClaim) &&
+      typeof rawGoal.continuationClaim.runId === "string" &&
+      rawGoal.continuationClaim.runId.length <= MAX_GOAL_META_LENGTH &&
+      typeof rawGoal.continuationClaim.sourceAssistantMessageID === "string" &&
+      rawGoal.continuationClaim.sourceAssistantMessageID.length <= MAX_GOAL_META_LENGTH
+        ? {
+            runId: rawGoal.continuationClaim.runId,
+            sourceAssistantMessageID: rawGoal.continuationClaim.sourceAssistantMessageID,
+          }
+        : null,
     messageIDs: Array.isArray(rawGoal.messageIDs)
       ? rawGoal.messageIDs.slice(-MAX_MESSAGE_IDS_PER_GOAL).filter((messageID) => typeof messageID === "string" && messageID.length <= MAX_GOAL_META_LENGTH)
       : [],
@@ -1181,6 +1270,9 @@ function deserializeGoal(goal) {
       "Recovered persisted goal state after plugin restart; auto-continue remains paused until you resume.",
     )
   }
+  // Recovered goals always require an explicit resume, which starts a fresh
+  // execution epoch and makes any pre-crash continuation claim obsolete.
+  hydrated.continuationClaim = null
 
   return hydrated
 }
@@ -1898,7 +1990,8 @@ function messageRole(message) {
 }
 
 function messageID(message) {
-  return message?.info?.id || message?.id || ""
+  const id = message?.info?.id || message?.id || ""
+  return typeof id === "string" && id.length <= MAX_GOAL_META_LENGTH ? id : ""
 }
 
 function messageSessionID(message) {
@@ -1986,6 +2079,9 @@ function messageInfoFromEvent(event) {
     event?.properties?.info,
     event?.properties?.message?.info,
     event?.properties?.message,
+    event?.data?.info,
+    event?.data?.message?.info,
+    event?.data?.message,
   ]
   return candidates.find(isPlainObject) || null
 }
@@ -2047,6 +2143,35 @@ function systemBlockContainsGoal(block, goalId) {
 
 function findLatestAssistantMessage(messages) {
   return [...(messages || [])].reverse().find((message) => messageRole(message) === "assistant") || null
+}
+
+function findLatestExecutionContext(messages) {
+  for (const message of [...(messages || [])].reverse()) {
+    if (messageRole(message) !== "user") continue
+    const info = isPlainObject(message?.info) ? message.info : message
+    const context = normalizeExecutionContext(info)
+    if (context) return context
+  }
+  return null
+}
+
+function continuationSnapshot(messages) {
+  const list = Array.isArray(messages) ? messages : []
+  const latestAssistant = findLatestAssistantMessage(list)
+  const latestRealUser = [...list]
+    .reverse()
+    .find((message) => messageRole(message) === "user" && !isPluginContinuationMessage(message))
+  const latestRelevant = [...list]
+    .reverse()
+    .find((message) =>
+      (messageRole(message) === "assistant" || messageRole(message) === "user") &&
+      !isPluginContinuationMessage(message),
+    )
+  return {
+    latestAssistantID: messageID(latestAssistant),
+    latestRealUserMessageID: messageID(latestRealUser),
+    latestRelevantMessageID: messageID(latestRelevant),
+  }
 }
 
 // The plugin drives auto-continue by sending its own prompts via promptAsync,
@@ -2136,6 +2261,10 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     stopReason: "",
     promptFailures: 0,
     formatFailures: 0,
+    executionContext: normalizeExecutionContext(
+      meta.executionContext || currentRuntime().sessionExecutionContexts.get(sessionID),
+    ),
+    continuationClaim: null,
     messageIDs: new Set(),
     history: [],
     checkpoints: [],
@@ -2882,6 +3011,117 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
   const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState, completionAuditor, commandName })
 
+  const abortAcceptedContinuation = async (sessionID) => {
+    const runtimeState = currentRuntime()
+    runtimeState.continuationControllers.get(sessionID)?.abort()
+    if (
+      !runtimeState.promptInFlightSessions.has(sessionID) ||
+      typeof client?.session?.abort !== "function"
+    ) {
+      return
+    }
+    try {
+      await sessionApi.abort(sessionID)
+    } catch (error) {
+      await logPluginError(client, "Failed to abort an accepted auto-continue after intervention", error)
+    }
+  }
+
+  const pauseActiveGoal = async (
+    sessionID,
+    { stopReason: reason, status, history, abortAccepted = false },
+  ) => {
+    const goal = goalStates.get(sessionID)
+    if (!goal) return false
+    currentRuntime().continuationControllers.get(sessionID)?.abort()
+    goal.stopped = true
+    goal.stopReason = reason
+    goal.lastStatus = `${status} Run /${commandName} resume to continue.`
+    goal.continuationClaim = null
+    pushHistory(goal, "paused", history)
+    activeContinues.delete(sessionID)
+    await persist()
+    if (abortAccepted) await abortAcceptedContinuation(sessionID)
+    return true
+  }
+
+  const claimContinuationSource = async (
+    sessionID,
+    goalID,
+    runID,
+    baselineMessages,
+    { refreshMessages = false } = {},
+  ) => {
+    const goalBeforeRefresh = activeGoal(sessionID, goalID, runID)
+    if (!goalBeforeRefresh) return null
+    const hostMessages = refreshMessages
+      ? await sessionApi.messages(sessionID, {
+          limit: goalBeforeRefresh.options.maxRecentMessages,
+        })
+      : baselineMessages
+    const goal = activeGoal(sessionID, goalID, runID)
+    if (!goal) return null
+    const messages = Array.isArray(hostMessages)
+      ? hostMessages.slice(-goal.options.maxRecentMessages)
+      : []
+    const baseline = continuationSnapshot(baselineMessages)
+    const refreshed = continuationSnapshot(messages)
+
+    if (currentRuntime().sessionStatuses.get(sessionID) !== "idle") return null
+
+    const currentContext = currentRuntime().sessionExecutionContexts.get(sessionID)
+    if (isPlanAgent(currentContext?.agent)) {
+      await pauseActiveGoal(sessionID, {
+        stopReason: "plan agent active",
+        status: "Auto-continue paused because the active agent switched to Plan.",
+        history: "Paused before auto-continue because the active session agent switched to Plan.",
+      })
+      return null
+    }
+
+    const newHumanMessage =
+      refreshed.latestRealUserMessageID &&
+      refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID
+    if (newHumanMessage || userInterventionDetected(messages, goal)) {
+      await pauseActiveGoal(sessionID, {
+        stopReason: "user intervention",
+        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
+        history: "Paused auto-continue after a real user message arrived; latest instruction wins.",
+      })
+      return null
+    }
+
+    if (
+      refreshed.latestAssistantID !== baseline.latestAssistantID ||
+      refreshed.latestRelevantMessageID !== baseline.latestRelevantMessageID
+    ) {
+      return null
+    }
+
+    if (!goal.executionContext) {
+      goal.executionContext = findLatestExecutionContext(messages)
+    }
+    const sourceAssistantMessageID = refreshed.latestAssistantID || "<no-assistant>"
+    if (
+      goal.continuationClaim?.runId === runID &&
+      goal.continuationClaim?.sourceAssistantMessageID === sourceAssistantMessageID
+    ) {
+      return null
+    }
+
+    goal.continuationClaim = { runId: runID, sourceAssistantMessageID }
+    const claimPersisted = await persist()
+    if (!claimPersisted && persistenceOptions.persistState) {
+      goal.continuationClaim = null
+      goal.stopped = true
+      goal.stopReason = "continuation claim persistence failed"
+      goal.lastStatus = `Auto-continue paused because its source-turn claim could not be persisted. Run /${commandName} resume after fixing storage.`
+      pushHistory(goal, "paused", "Paused because the durable continuation source claim could not be persisted.")
+      return null
+    }
+    return goal
+  }
+
   const hooks = {
     config: async (config) => {
       applyNativeGoalConfig(config, {
@@ -2889,6 +3129,36 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         requireVerifierOwnership: Boolean(pluginOptions.completionAudit),
       })
       if (pluginOptions.completionAudit) verifierRegistrationReady = true
+    },
+    "chat.params": async (input) => {
+      if (!input?.sessionID) return
+      const context = normalizeExecutionContext({
+        agent: input.agent,
+        model: input.model,
+        variant: input?.message?.model?.variant,
+      })
+      if (context) currentRuntime().sessionExecutionContexts.set(input.sessionID, context)
+    },
+    "chat.message": async (input, output) => {
+      const sessionID = input?.sessionID
+      if (!sessionID) return
+      const context = normalizeExecutionContext(input)
+      if (context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+
+      const message = { role: "user", parts: Array.isArray(output?.parts) ? output.parts : [] }
+      if (isPluginContinuationMessage(message)) return
+      const text = getText(message.parts)
+      const commandPrefix = `/${commandName}`
+      if (text === commandPrefix || text.startsWith(`${commandPrefix} `)) return
+
+      const goal = goalStates.get(sessionID)
+      if (!goal || goal.stopped) return
+      await pauseActiveGoal(sessionID, {
+        stopReason: "user intervention",
+        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
+        history: "Paused immediately when a new human message arrived; latest instruction wins.",
+        abortAccepted: true,
+      })
     },
     "tool.execute.before": async (input) => {
       const sessionID = input?.sessionID
@@ -2985,11 +3255,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           output.parts = [makeTextPart(`No active goal. Set one with \`/${commandName} <condition>\`.`)]
           return
         }
+        currentRuntime().continuationControllers.get(sessionID)?.abort()
         goal.stopped = true
         goal.stopReason = "paused"
         goal.lastStatus = "Goal paused."
+        goal.continuationClaim = null
+        activeContinues.delete(sessionID)
         pushHistory(goal, "paused", "User paused the active goal.")
         await persist()
+        await abortAcceptedContinuation(sessionID)
         output.parts = [makeTextPart(`Goal paused: ${goal.condition}`)]
         return
       }
@@ -3051,6 +3325,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.noProgressTurns = 0
         goal.noToolCallTurns = 0
         goal.formatFailures = 0
+        goal.continuationClaim = null
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
         await persist()
@@ -3324,17 +3599,33 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
 
     event: async ({ event }) => {
-      if (isAbortErrorEvent(event)) {
+      if (event?.type === "session.status") {
         const sessionID = getSessionID(event)
-        const goal = goalStates.get(sessionID)
-        if (!goal) return
-        currentRuntime().continuationControllers.get(sessionID)?.abort()
-        goal.stopped = true
-        goal.stopReason = "user interrupted"
-        goal.lastStatus = `Goal paused after user interruption. Run /${commandName} resume to continue.`
-        pushHistory(goal, "paused", "Paused after OpenCode reported that the user interrupted the active turn.")
-        activeContinues.delete(sessionID)
-        await persist()
+        const status = event?.properties?.status?.type || event?.data?.status?.type
+        if (sessionID && status) currentRuntime().sessionStatuses.set(sessionID, status)
+      }
+
+      if (event?.type === "session.updated") {
+        const sessionID = getSessionID(event)
+        const context = normalizeExecutionContext(event?.properties?.info || event?.data?.info)
+        if (sessionID && context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+      }
+
+      if (event?.type === "message.updated") {
+        const message = messageInfoFromEvent(event)
+        if (messageRole(message) === "user") {
+          const context = normalizeExecutionContext(message)
+          const sessionID = messageSessionID(message) || getSessionID(event)
+          if (sessionID && context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+        }
+      }
+
+      const terminal = terminalEvent(event)
+      if (terminal?.sessionID) {
+        await pauseActiveGoal(terminal.sessionID, {
+          ...terminal,
+          abortAccepted: true,
+        })
         return
       }
 
@@ -3410,6 +3701,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (!isIdleEvent(event)) return
 
       const sessionID = getSessionID(event)
+      // Deprecated session.idle carries no status object but is itself an
+      // authoritative idle signal. Current session.status events were recorded
+      // above before entering this branch.
+      if (event?.type === "session.idle") {
+        currentRuntime().sessionStatuses.set(sessionID, "idle")
+      }
       currentRuntime().readOnlyCommandGuards.delete(sessionID)
       const eventID = typeof event?.id === "string" ? event.id : ""
       const seenIdleEventIDs = currentRuntime().seenIdleEventIDs
@@ -3429,6 +3726,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const continueToken = randomUUID()
       const continueController = new AbortController()
+      let claimedSourceAssistantMessageID = ""
       activeContinues.set(sessionID, continueToken)
       currentRuntime().continuationControllers.set(sessionID, continueController)
       try {
@@ -3440,9 +3738,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           : []
         const activeGoalAfterMessages = activeGoal(sessionID, goalID, runID)
         if (!activeGoalAfterMessages) return
+        if (!activeGoalAfterMessages.executionContext) {
+          activeGoalAfterMessages.executionContext = findLatestExecutionContext(messages)
+        }
 
         const latestAssistant = findLatestAssistantMessage(messages)
-        const latestAssistantID = latestAssistant?.info?.id || ""
+        const latestAssistantID = messageID(latestAssistant)
         const latestText = getText(latestAssistant?.parts)
         const latestOutputTokens = latestAssistant ? outputTokensForMessage(latestAssistant) : null
         const previousAssistantText = activeGoalAfterMessages.lastAssistantText
@@ -3462,16 +3763,20 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // since the last auto-continue, stop driving the loop and defer to the
         // human. They can /goal resume to hand control back to the plugin.
         if (userInterventionDetected(messages, activeGoalAfterMessages)) {
-          activeGoalAfterMessages.stopped = true
-          activeGoalAfterMessages.stopReason = "user intervention"
-          activeGoalAfterMessages.lastStatus =
-            `Auto-continue paused: you sent a new message, so the latest instruction wins. Run /${commandName} resume to continue the goal.`
-          pushHistory(
-            activeGoalAfterMessages,
-            "paused",
-            "Paused auto-continue after a real user message arrived; latest instruction wins.",
-          )
-          await persist()
+          await pauseActiveGoal(sessionID, {
+            stopReason: "user intervention",
+            status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
+            history: "Paused auto-continue after a real user message arrived; latest instruction wins.",
+          })
+          return
+        }
+
+        const sourceAssistantMessageID = latestAssistantID || "<no-assistant>"
+        if (
+          activeGoalAfterMessages.continuationClaim?.runId === runID &&
+          activeGoalAfterMessages.continuationClaim?.sourceAssistantMessageID ===
+            sourceAssistantMessageID
+        ) {
           return
         }
 
@@ -3612,14 +3917,35 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const limitReason = stopReason(activeGoalAfterMessages)
         if (limitReason) {
           if (!activeGoalAfterMessages.budgetWrapupSent) {
-            activeGoalAfterMessages.budgetWrapupSent = true
-            activeGoalAfterMessages.stopped = true
-            activeGoalAfterMessages.stopReason = limitReason
-            activeGoalAfterMessages.lastStatus = `${limitReason}; requested final handoff.`
-            pushHistory(activeGoalAfterMessages, "limit", `${limitReason}; requested a final handoff.`)
-            await sessionApi.promptAsync(sessionID, {
-              parts: [makeContinuationPart(buildContinueMessage(activeGoalAfterMessages, { budgetWrapup: true }))],
-            })
+            const claimedGoal = await claimContinuationSource(
+              sessionID,
+              goalID,
+              runID,
+              messages,
+            )
+            if (!claimedGoal) return
+            claimedSourceAssistantMessageID =
+              claimedGoal.continuationClaim?.sourceAssistantMessageID || ""
+            claimedGoal.budgetWrapupSent = true
+            claimedGoal.stopped = true
+            claimedGoal.stopReason = limitReason
+            claimedGoal.lastStatus = `${limitReason}; requested final handoff.`
+            pushHistory(claimedGoal, "limit", `${limitReason}; requested a final handoff.`)
+            await persist()
+            currentRuntime().promptInFlightSessions.add(sessionID)
+            let response
+            try {
+              response = await sessionApi.promptAsync(sessionID, {
+                ...continuationContextInput(claimedGoal),
+                parts: [makeContinuationPart(buildContinueMessage(claimedGoal, { budgetWrapup: true }))],
+              })
+            } finally {
+              currentRuntime().promptInFlightSessions.delete(sessionID)
+            }
+            if (response?.error) {
+              claimedGoal.lastStatus = `${limitReason}; final handoff request failed: ${response.error.name || "unknown error"}.`
+              pushHistory(claimedGoal, "error", claimedGoal.lastStatus)
+            }
           } else {
             activeGoalAfterMessages.stopped = true
             activeGoalAfterMessages.stopReason = limitReason
@@ -3741,6 +4067,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
 
         const elapsedSinceLastContinue = Date.now() - activeGoalAfterMessages.lastContinueAt
+        let cooldownWaited = false
         if (
           activeGoalAfterMessages.lastContinueAt &&
           elapsedSinceLastContinue < activeGoalAfterMessages.options.minDelayMs
@@ -3750,10 +4077,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             continueController.signal,
           )
           if (!delayCompleted) return
+          cooldownWaited = true
         }
 
-        const activeGoalBeforePrompt = activeGoal(sessionID, goalID, runID)
+        const activeGoalBeforePrompt = await claimContinuationSource(
+          sessionID,
+          goalID,
+          runID,
+          messages,
+          { refreshMessages: cooldownWaited },
+        )
         if (!activeGoalBeforePrompt) return
+        claimedSourceAssistantMessageID =
+          activeGoalBeforePrompt.continuationClaim?.sourceAssistantMessageID || ""
 
         const budgetWrapup = budgetWrapupNeeded(activeGoalBeforePrompt)
         if (budgetWrapup) {
@@ -3810,22 +4146,33 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
         }
 
-        const response = await sessionApi.promptAsync(sessionID, {
-          parts: [
-            makeContinuationPart(
-              buildContinueMessage(activeGoalBeforePrompt, {
-                budgetWrapup,
-                completionUnverified,
-                blockerUnstated,
-              }),
-            ),
-          ],
-        })
+        currentRuntime().promptInFlightSessions.add(sessionID)
+        let response
+        try {
+          response = await sessionApi.promptAsync(sessionID, {
+            ...continuationContextInput(activeGoalBeforePrompt),
+            parts: [
+              makeContinuationPart(
+                buildContinueMessage(activeGoalBeforePrompt, {
+                  budgetWrapup,
+                  completionUnverified,
+                  blockerUnstated,
+                }),
+              ),
+            ],
+          })
+        } finally {
+          currentRuntime().promptInFlightSessions.delete(sessionID)
+        }
 
         if (response.error) {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
-          if (activeGoalAfterPrompt) {
+          if (
+            activeGoalAfterPrompt?.continuationClaim?.sourceAssistantMessageID ===
+            claimedSourceAssistantMessageID
+          ) {
+            activeGoalAfterPrompt.continuationClaim = null
             activeGoalAfterPrompt.promptFailures += 1
             activeGoalAfterPrompt.lastStatus = message
             pushHistory(activeGoalAfterPrompt, "error", message)
@@ -3838,7 +4185,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           await logPluginError(client, message, response.error)
         } else {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
-          if (activeGoalAfterPrompt) {
+          if (
+            activeGoalAfterPrompt?.continuationClaim?.sourceAssistantMessageID ===
+            claimedSourceAssistantMessageID
+          ) {
             // Decrement rather than reset: an alternating error/success pattern
             // should still accumulate toward the circuit-breaker cap over time,
             // matching the formatFailures approach for the same reason.
@@ -3856,6 +4206,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       } catch (error) {
         const activeGoalAfterError = currentGoal(sessionID, goalID, runID)
         if (activeGoalAfterError) {
+          if (
+            claimedSourceAssistantMessageID &&
+            activeGoalAfterError.continuationClaim?.sourceAssistantMessageID ===
+              claimedSourceAssistantMessageID
+          ) {
+            activeGoalAfterError.continuationClaim = null
+          }
           activeGoalAfterError.promptFailures += 1
           const message = `Auto-continue failed: ${error?.message || error}`
           activeGoalAfterError.lastStatus = message
@@ -3869,6 +4226,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         await logPluginError(client, "Auto-continue failed", error)
       } finally {
+        currentRuntime().promptInFlightSessions.delete(sessionID)
         // Only delete our own entry. If cleanupGoal already removed it (because
         // the goal completed) and a new handler has since set a fresh token,
         // we must not clobber the new handler's guard.
