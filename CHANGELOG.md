@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clarify the textual completion protocol so models keep evidence and completion on consecutive plain-text lines instead of wrapping markers in Markdown or separating them with blank lines.
+
 ## 0.6.2 — 2026-07-11
 
 - Keep paused, blocked, and crash-recovered goals inert in model turns with a stopped-goal system guard, and enforce status/history/list/pause/clear control turns as read-only through the host's tool-execution hook so routed command text cannot mutate or resurrect work.

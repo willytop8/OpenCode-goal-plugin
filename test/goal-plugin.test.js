@@ -409,8 +409,15 @@ test("continue message includes budget context and completion audit", () => {
   })
   assert.match(messageText, /<progress_budget>/)
   assert.match(messageText, /tokens_remaining: 75/)
-  assert.match(messageText, /Complete only after verification/)
-  assert.match(messageText, /\[goal:evidence\].*\[goal:complete\]/)
+  assert.match(messageText, /Completion format/)
+  assert.match(
+    messageText,
+    /consecutive plain lines; no Markdown\/backticks\/blank line/,
+  )
+  assert.match(
+    messageText,
+    /\[goal:evidence\] <proof>\n\[goal:complete\]/,
+  )
   assert.match(messageText, /Limits are near:/)
 })
 
