@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.5 — 2026-07-12
 
 - Make `/goal sequence` the canonical ordered multi-goal command, retain the previous command and mode spelling as input-only compatibility aliases, correct the public auditor snapshot mode type to `"normal" | "ordered"`, and align README archive and compatibility claims with verified behavior.
 
