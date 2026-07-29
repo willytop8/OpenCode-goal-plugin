@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { promises as fs } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -62,6 +63,11 @@ function promptCharacters(prompts) {
     ),
     0,
   )
+}
+
+function sessionStatePath(stateFilePath, sessionID) {
+  const key = createHash("sha256").update(sessionID).digest("hex")
+  return join(`${stateFilePath}.sessions`, key, "state.json")
 }
 
 async function makeDirectory(label) {
@@ -244,7 +250,7 @@ results.push(await scenario("restart-recovery", 15, async () => {
   assert.match(status, /Recovered persisted goal state|recovered after restart/i)
   await idle(second, sessionID, "restart-idle")
   assert.equal(host.prompts.length, 0, "recovered goals must not resume without user consent")
-  const stateBytes = (await fs.stat(stateFilePath)).size
+  const stateBytes = (await fs.stat(sessionStatePath(stateFilePath, sessionID))).size
   await second.dispose()
   return { continuationPrompts: 0, persistedStateBytes: stateBytes, status: "recovered-paused" }
 }))

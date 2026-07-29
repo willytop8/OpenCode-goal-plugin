@@ -5,6 +5,10 @@ import { join } from "node:path"
 import test from "node:test"
 import { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 
+function sessionPaths(stateFilePath, sessionID) {
+  return testInternals.sessionPathsFor({ sessionDirectory: `${stateFilePath}.sessions` }, sessionID)
+}
+
 function assistantMessage(sessionID, text = "Still working.") {
   return {
     info: {
@@ -310,7 +314,12 @@ test("disposed instance cannot persist over a replacement instance after a late 
     releasePrompt()
     await oldIdle
 
-    const raw = JSON.parse(await fs.readFile(join(directory, ".opencode", "goals", "state.json"), "utf8"))
+    const raw = JSON.parse(
+      await fs.readFile(
+        sessionPaths(join(directory, ".opencode", "goals", "state.json"), "late-session").stateFilePath,
+        "utf8",
+      ),
+    )
     assert.deepEqual(raw.goals.map((goal) => goal.condition), ["replacement objective"])
   } finally {
     releasePrompt?.()
@@ -340,20 +349,26 @@ test("workspace persistence and lifecycle ledgers remain isolated", async () => 
   await setGoal(second, "session-persist-two", "persist only workspace two")
 
   const firstState = JSON.parse(
-    await fs.readFile(join(firstDirectory, ".opencode", "goals", "state.json"), "utf8"),
+    await fs.readFile(
+      sessionPaths(join(firstDirectory, ".opencode", "goals", "state.json"), "session-persist-one").stateFilePath,
+      "utf8",
+    ),
   )
   const secondState = JSON.parse(
-    await fs.readFile(join(secondDirectory, ".opencode", "goals", "state.json"), "utf8"),
+    await fs.readFile(
+      sessionPaths(join(secondDirectory, ".opencode", "goals", "state.json"), "session-persist-two").stateFilePath,
+      "utf8",
+    ),
   )
   assert.deepEqual(firstState.goals.map((goal) => goal.sessionID), ["session-persist-one"])
   assert.deepEqual(secondState.goals.map((goal) => goal.sessionID), ["session-persist-two"])
 
   const firstLedger = await fs.readFile(
-    join(firstDirectory, ".opencode", "goals", "state.json.ledger.jsonl"),
+    sessionPaths(join(firstDirectory, ".opencode", "goals", "state.json"), "session-persist-one").ledgerFilePath,
     "utf8",
   )
   const secondLedger = await fs.readFile(
-    join(secondDirectory, ".opencode", "goals", "state.json.ledger.jsonl"),
+    sessionPaths(join(secondDirectory, ".opencode", "goals", "state.json"), "session-persist-two").ledgerFilePath,
     "utf8",
   )
   assert.match(firstLedger, /session-persist-one/)

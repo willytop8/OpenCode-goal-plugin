@@ -222,17 +222,19 @@ export interface GoalPluginOptions {
   persistState?: boolean
 
   /**
-   * Filesystem path where persisted goal state is written when
-   * `persistState` is enabled. Overrides both the project-local default
-   * and the `OPENCODE_GOAL_STATE_PATH` environment variable.
+   * Root filesystem path for persisted session-shard state when
+   * `persistState` is enabled. Each session is written below
+   * `<stateFilePath>.sessions/<sha256(sessionID)>/state.json`. Overrides both
+   * the project-local default and the `OPENCODE_GOAL_STATE_PATH` environment
+   * variable.
    * @default "<cwd>/.opencode/goals/state.json"
    */
   stateFilePath?: string
 
   /**
-   * Filesystem path for the append-only lifecycle ledger
-   * (`<event> per line`, used to reconstruct active goals if the main
-   * state file is missing or corrupted).
+   * Legacy aggregate filesystem path for the append-only lifecycle ledger.
+   * During migration, events are partitioned into per-session shard ledgers;
+   * new writes use `<shard>/state.json.ledger.jsonl`.
    * @default "<stateFilePath>.ledger.jsonl"
    */
   ledgerFilePath?: string

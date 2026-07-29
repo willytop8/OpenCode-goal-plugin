@@ -47,12 +47,21 @@ const {
   readLedgerEntries,
   reconstructGoalsFromLedger,
   resolveStateFilePath,
+  sessionPathsFor,
   setLedgerSink,
   stopReason,
   totalTokensForMessage,
   userInterventionDetected,
   xdgStateFilePath,
 } = testInternals
+
+function sessionStatePath(stateFilePath, sessionID) {
+  return sessionPathsFor({ sessionDirectory: `${stateFilePath}.sessions` }, sessionID).stateFilePath
+}
+
+function sessionLedgerPath(stateFilePath, sessionID) {
+  return sessionPathsFor({ sessionDirectory: `${stateFilePath}.sessions` }, sessionID).ledgerFilePath
+}
 
 test("normalizeMessageUsage extracts current and flattened OpenCode usage safely", () => {
   assert.deepEqual(
@@ -2091,7 +2100,7 @@ test("persisted running goals are recovered in paused state after restart", asyn
       { parts: [] },
     )
 
-    const persisted = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const persisted = JSON.parse(await readFile(sessionStatePath(stateFilePath, "session-persist"), "utf8"))
     assert.equal(
       persisted.goals.some(
         (goal) => goal.sessionID === "session-persist" && goal.condition === "ship it",
@@ -2103,6 +2112,10 @@ test("persisted running goals are recovered in paused state after restart", asyn
     const recoveredHooks = await GoalPlugin(
       { client },
       { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "session-persist", arguments: "status" },
+      { parts: [] },
     )
     const recoveredGoal = currentGoal("session-persist")
     assert.equal(recoveredGoal.stopped, true)
@@ -2159,7 +2172,7 @@ test("continuation source claims and initiating execution context persist before
       },
     })
 
-    const persisted = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const persisted = JSON.parse(await readFile(sessionStatePath(stateFilePath, "session-durable-claim"), "utf8"))
     const goal = persisted.goals.find((entry) => entry.sessionID === "session-durable-claim")
     assert.deepEqual(goal.executionContext, {
       agent: "build",
@@ -2176,6 +2189,10 @@ test("continuation source claims and initiating execution context persist before
     recoveredHooks = await GoalPlugin(
       { client },
       { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "session-durable-claim", arguments: "status" },
+      { parts: [] },
     )
     const recovered = currentGoal("session-durable-claim")
     assert.equal(recovered.stopped, true)
@@ -2232,7 +2249,7 @@ test("persisted state file is written with owner-only permissions", async () => 
       { parts: [] },
     )
 
-    const fileMode = (await stat(stateFilePath)).mode & 0o777
+    const fileMode = (await stat(sessionStatePath(stateFilePath, "session-perms"))).mode & 0o777
     assert.equal(fileMode, 0o600)
   } finally {
     await rm(dir, { recursive: true, force: true })
@@ -2263,13 +2280,18 @@ test("plugin reinitialization with a missing state file does not retain stale in
     )
     assert.notEqual(currentGoal("session-stale"), null)
 
-    await GoalPlugin(
+    const replacement = await GoalPlugin(
       { client },
       { persistState: true, stateFilePath: missingStateFilePath, minDelayMs: 1 },
     )
 
+    await replacement["command.execute.before"](
+      { command: "goal", sessionID: "session-stale", arguments: "status" },
+      { parts: [] },
+    )
+
     assert.equal(currentGoal("session-stale"), null)
-    assert.equal(JSON.parse(await readFile(missingStateFilePath, "utf8")).goals.length, 0)
+    assert.equal(JSON.parse(await readFile(sessionStatePath(missingStateFilePath, "session-stale"), "utf8")).goals.length, 0)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -2757,6 +2779,72 @@ test("two sessions run independent goals without interference", async () => {
   assert.equal(currentGoal("session-B").condition, "task B")
 })
 
+test("loading one persisted session does not reset another session's focus", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "goal-plugin-session-focus-"))
+  const stateFilePath = join(directory, "state.json")
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  let seedHooks
+  let hooks
+  try {
+    seedHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await runGoal(seedHooks, "session-B", "persist session B")
+    await seedHooks.dispose()
+    seedHooks = null
+
+    hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await runGoal(hooks, "session-A", "first session A goal")
+    await runGoal(hooks, "session-A", "add second session A goal")
+    assert.equal(currentGoal("session-A").condition, "second session A goal")
+
+    await runGoal(hooks, "session-B", "status")
+    assert.equal(currentGoal("session-B").condition, "persist session B")
+    assert.equal(currentGoal("session-A").condition, "second session A goal")
+  } finally {
+    await hooks?.dispose()
+    await seedHooks?.dispose()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("concurrent first sessions share one legacy-state migration", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "goal-plugin-migration-race-"))
+  const stateFilePath = join(directory, "state.json")
+  await writeFile(
+    stateFilePath,
+    JSON.stringify({
+      version: 1,
+      goals: [{ sessionID: "legacy-A", condition: "migrated goal", startedAt: Date.now(), options: {} }],
+      results: [],
+    }),
+  )
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  let hooks
+  try {
+    hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await Promise.all([
+      runGoal(hooks, "legacy-A", "status"),
+      runGoal(hooks, "legacy-B", "new goal"),
+    ])
+    assert.equal(currentGoal("legacy-A").condition, "migrated goal")
+    assert.equal(currentGoal("legacy-B").condition, "new goal")
+  } finally {
+    await hooks?.dispose()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test("buildLimitWarning reports remaining seconds when duration is nearly exhausted", () => {
   const warning = buildLimitWarning({
     turnCount: 0,
@@ -3021,6 +3109,10 @@ test("persisted state skips malformed entries while keeping valid ones", async (
       { persistState: true, stateFilePath, minDelayMs: 1 },
     )
 
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-valid-goal", arguments: "status" },
+      { parts: [] },
+    )
     const loadedGoal = currentGoal("session-valid-goal")
     assert.equal(loadedGoal.condition, "valid goal")
     assert.equal(loadedGoal.options.maxTurns, 7)
@@ -3134,18 +3226,22 @@ test("missing client.app.log falls back to console.error", async () => {
 
 test("persistence ownership failures reject initialization without corrupting state", async () => {
   const logs = []
-  await assert.rejects(
-    GoalPlugin(
-      {
-        client: {
-          app: { log: async (input) => logs.push(input) },
-          session: {
-            messages: async () => ({ data: [] }),
-            promptAsync: async () => ({}),
-          },
+  const hooks = await GoalPlugin(
+    {
+      client: {
+        app: { log: async (input) => logs.push(input) },
+        session: {
+          messages: async () => ({ data: [] }),
+          promptAsync: async () => ({}),
         },
       },
-      { persistState: true, stateFilePath: "/dev/null/state.json", minDelayMs: 1 },
+    },
+    { persistState: true, stateFilePath: "/dev/null/state.json", minDelayMs: 1 },
+  )
+  await assert.rejects(
+    hooks["command.execute.before"](
+      { command: "goal", sessionID: "bad-path", arguments: "ship it" },
+      { parts: [] },
     ),
     /EEXIST|ENOTDIR|not a directory/i,
   )
@@ -3223,8 +3319,17 @@ test("migrates state from a legacy XDG path to the project-local default", async
     xdgStatePath,
     JSON.stringify({
       version: 1,
-      goals: [{ sessionID: "session-migrated", condition: "old goal", startedAt: Date.now(), options: {} }],
-      results: [],
+      goals: [
+        { sessionID: "session-migrated", condition: "old goal", startedAt: Date.now(), options: {} },
+        { sessionID: "session-migrated-two", condition: "second old goal", startedAt: Date.now(), options: {} },
+      ],
+      results: [{
+        sessionID: "session-migrated-result",
+        condition: "old result",
+        state: "achieved",
+        startedAt: Date.now() - 1000,
+        finishedAt: Date.now(),
+      }],
     }),
     "utf8",
   )
@@ -3241,14 +3346,30 @@ test("migrates state from a legacy XDG path to the project-local default", async
       session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
     }
     const first = await GoalPlugin({ client }, { persistState: true, minDelayMs: 1, env, cwd: projDir })
+    await first["command.execute.before"](
+      { command: "goal", sessionID: "session-migrated", arguments: "status" },
+      { parts: [] },
+    )
 
     // The goal was recovered from the legacy XDG location...
     assert.notEqual(currentGoal("session-migrated"), null)
     // ...and migrated forward to the project-local default path.
-    const projStatePath = join(projDir, ".opencode", "goals", "state.json")
+    const projStatePath = sessionStatePath(join(projDir, ".opencode", "goals", "state.json"), "session-migrated")
     const migrated = JSON.parse(await readFile(projStatePath, "utf8"))
     assert.equal(migrated.goals.length, 1)
     assert.equal(migrated.goals[0].sessionID, "session-migrated")
+    assert.equal(
+      JSON.parse(
+        await readFile(sessionStatePath(join(projDir, ".opencode", "goals", "state.json"), "session-migrated-two"), "utf8"),
+      ).goals[0].condition,
+      "second old goal",
+    )
+    assert.equal(
+      JSON.parse(
+        await readFile(sessionStatePath(join(projDir, ".opencode", "goals", "state.json"), "session-migrated-result"), "utf8"),
+      ).results[0].condition,
+      "old result",
+    )
     await first.dispose()
 
     // A successful migration retires the shared fallback into a preserved
@@ -3294,7 +3415,7 @@ test("GoalPlugin resolves project-local state against the host-provided director
       output,
     )
 
-    const expectedPath = join(sessionDir, ".opencode", "goals", "state.json")
+    const expectedPath = sessionStatePath(join(sessionDir, ".opencode", "goals", "state.json"), "session-dir-aware")
     const written = JSON.parse(await readFile(expectedPath, "utf8"))
     assert.equal(written.goals[0].condition, "directory-aware persistence")
 
@@ -3784,7 +3905,11 @@ test("multiple live goals and focus survive a persistence round-trip", async () 
 
     // Reload from disk: both goals present, "goal two" still focused.
     await hooks.dispose()
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "persist-s", arguments: "list" },
+      { parts: [] },
+    )
     const goals = listSessionGoals("persist-s")
     assert.equal(goals.length, 2)
     // Recovered goals load paused, but focus is preserved.
@@ -3878,7 +4003,7 @@ test("reconstructGoalsFromLedger recovers non-terminal goals and ignores complet
 test("lifecycle events are written to the ledger and a missing state file recovers from it", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ledger-"))
   const stateFilePath = join(dir, "state.json")
-  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, "ledger-s1")
   const client = {
     app: { log: async () => {} },
     session: {
@@ -3911,16 +4036,20 @@ test("lifecycle events are written to the ledger and a missing state file recove
       { command: "goal", sessionID: "ledger-s2", arguments: "recover me" },
       { parts: [] },
     )
-    await rm(stateFilePath, { force: true })
+    await rm(sessionStatePath(stateFilePath, "ledger-s2"), { force: true })
 
     await hooks.dispose()
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "ledger-s2", arguments: "status" },
+      { parts: [] },
+    )
     const recovered = currentGoal("ledger-s2")
     assert.ok(recovered)
     assert.equal(recovered.condition, "recover me")
     assert.equal(recovered.stopped, true) // recovered goals load paused
     // Reconstruction persisted a fresh state file.
-    const rebuilt = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const rebuilt = JSON.parse(await readFile(sessionStatePath(stateFilePath, "ledger-s2"), "utf8"))
     assert.ok(rebuilt.goals.some((g) => g.sessionID === "ledger-s2"))
   } finally {
     setLedgerSink(null)
@@ -3942,14 +4071,19 @@ test("corrupt primary state is quarantined and valid ledger state recovers pause
     await runGoal(first, "recover-corrupt", "preserve this objective")
     await first.dispose()
     first = null
-    await writeFile(stateFilePath, "{truncated")
+    const sessionPath = sessionStatePath(stateFilePath, "recover-corrupt")
+    await writeFile(sessionPath, "{truncated")
 
     second = await GoalPlugin({ client }, { persistState: true, stateFilePath, registerTools: false })
+    await second["command.execute.before"](
+      { command: "goal", sessionID: "recover-corrupt", arguments: "status" },
+      { parts: [] },
+    )
     assert.equal(currentGoal("recover-corrupt").condition, "preserve this objective")
     assert.equal(currentGoal("recover-corrupt").stopped, true)
-    const quarantined = (await readdir(dir)).find((name) => name.startsWith("state.json.corrupt."))
+    const quarantined = (await readdir(dirname(sessionPath))).find((name) => name.startsWith("state.json.corrupt."))
     assert.ok(quarantined)
-    assert.equal(await readFile(join(dir, quarantined), "utf8"), "{truncated")
+    assert.equal(await readFile(join(dirname(sessionPath), quarantined), "utf8"), "{truncated")
   } finally {
     await first?.dispose()
     await second?.dispose()
@@ -4699,7 +4833,7 @@ test("resuming a backgrounded goal preserves creation order", async () => {
 test("/goal clear records a 'cleared' ledger event so cleared goals are not reconstructed after restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-clear-ledger-"))
   const stateFilePath = join(dir, "state.json")
-  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, "clear-ledger-1")
   const client = {
     app: { log: async () => {} },
     session: {
@@ -4725,9 +4859,13 @@ test("/goal clear records a 'cleared' ledger event so cleared goals are not reco
 
     // Simulate a missing state file: reconstructFromLedger must NOT revive a
     // cleared goal (LEDGER_TERMINAL_TYPES includes "cleared").
-    await rm(stateFilePath, { force: true })
+    await rm(sessionStatePath(stateFilePath, "clear-ledger-1"), { force: true })
     await hooks.dispose()
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "clear-ledger-1", arguments: "status" },
+      { parts: [] },
+    )
     assert.equal(currentGoal("clear-ledger-1"), null)
   } finally {
     setLedgerSink(null)
@@ -4738,7 +4876,7 @@ test("/goal clear records a 'cleared' ledger event so cleared goals are not reco
 test("agent clearGoal tool records a 'cleared' ledger event", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-agent-clear-ledger-"))
   const stateFilePath = join(dir, "state.json")
-  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, "agent-clear-ledger")
   const client = {
     app: { log: async () => {} },
     session: {
@@ -4748,7 +4886,11 @@ test("agent clearGoal tool records a 'cleared' ledger event", async () => {
   }
   try {
     // GoalPlugin sets the global ledger sink to write to ledgerFilePath.
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "agent-clear-ledger", arguments: "status" },
+      { parts: [] },
+    )
 
     // Create handlers that share the global goalStates (same module) so
     // pushHistory writes to the ledger sink set by GoalPlugin above.
@@ -4889,12 +5031,16 @@ test("formatFailures is preserved through a persistence round-trip", async () =>
     assert.equal(goalMid.formatFailures, 1)
 
     // State file must include formatFailures.
-    const raw = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const raw = JSON.parse(await readFile(sessionStatePath(stateFilePath, "ff-persist"), "utf8"))
     assert.equal(raw.goals.find((g) => g.sessionID === "ff-persist").formatFailures, 1)
 
     // Reload: formatFailures must be restored, not reset to zero.
     await hooks.dispose()
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "ff-persist", arguments: "status" },
+      { parts: [] },
+    )
     const goalReloaded = currentGoal("ff-persist")
     assert.ok(goalReloaded)
     assert.equal(goalReloaded.formatFailures, 1)
@@ -5113,7 +5259,7 @@ test("ordered completion storage failure rolls back premature successor promotio
 test("ledger cross-check removes completed goals still active in a stale state file on restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ledger-xcheck-"))
   const stateFilePath = join(dir, "state.json")
-  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, "xcheck-s1")
   const client = {
     app: { log: async () => {} },
     session: {
@@ -5141,7 +5287,8 @@ test("ledger cross-check removes completed goals still active in a stale state f
     const completedLedger = await readLedgerEntries(ledgerFilePath)
     assert.ok(completedLedger.some((e) => e.type === "completed"))
 
-    const stateRaw = JSON.parse(await readFile(stateFilePath, "utf8"))
+    const statePath = sessionStatePath(stateFilePath, "xcheck-s1")
+    const stateRaw = JSON.parse(await readFile(statePath, "utf8"))
     // Inject a stale active copy of the goal into the state file.
     stateRaw.goals.push({
       sessionID: "xcheck-s1",
@@ -5149,11 +5296,15 @@ test("ledger cross-check removes completed goals still active in a stale state f
       condition: "ship it",
       stopped: false,
     })
-    await writeFile(stateFilePath, JSON.stringify(stateRaw))
+    await writeFile(statePath, JSON.stringify(stateRaw))
 
     // Phase 3: reload. The cross-check must remove the stale active goal.
     await hooks.dispose()
-    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const recoveredHooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "xcheck-s1", arguments: "status" },
+      { parts: [] },
+    )
     assert.equal(currentGoal("xcheck-s1"), null)
   } finally {
     setLedgerSink(null)
@@ -5164,7 +5315,7 @@ test("ledger cross-check removes completed goals still active in a stale state f
 test("ledger-only ordered completion promotes the queued successor during restart recovery", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-ordered-ledger-xcheck-"))
   const stateFilePath = join(dir, "state.json")
-  const ledgerFilePath = ledgerPathFor(stateFilePath)
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, "ordered-ledger-restart")
   const client = {
     app: { log: async () => {} },
     session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
@@ -5191,6 +5342,10 @@ test("ledger-only ordered completion promotes the queued successor during restar
     }), true)
 
     second = await GoalPlugin({ client }, { stateFilePath, minDelayMs: 1 })
+    await second["command.execute.before"](
+      { command: "goal", sessionID: "ordered-ledger-restart", arguments: "status" },
+      { parts: [] },
+    )
     const recovered = currentGoal("ordered-ledger-restart")
     assert.ok(recovered)
     assert.equal(recovered.condition, "second")

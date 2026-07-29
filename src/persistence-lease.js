@@ -23,9 +23,9 @@ async function readOwner(lockPath) {
 }
 
 /**
- * Hold an exclusive workspace lease for the plugin instance lifetime. This
- * deliberately rejects a second writer instead of allowing stale full-state
- * snapshots to overwrite each other.
+ * Hold an exclusive session lease for the plugin instance lifetime. This
+ * deliberately rejects a second writer instead of allowing stale snapshots to
+ * overwrite the same session's state.
  */
 export async function acquirePersistenceLease(
   stateFilePath,

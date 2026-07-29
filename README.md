@@ -239,7 +239,7 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 
 **Wrap-up vs. hard stop.** When a limit is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step — rather than stopping silently. Use `/goal resume` to continue after any stop, including limit stops and no-progress pauses.
 
-Goal state is persisted by default to a **project-local** path, `.opencode/goals/state.json` relative to the working directory, so goals follow the project rather than your home directory. It is only a local workflow checkpoint and is not synchronized across machines or OpenCode instances. You may want to add `.opencode/goals/` to your `.gitignore`.
+Goal state is persisted by default to a **project-local** namespace rooted at `.opencode/goals/state.json` relative to the working directory, so goals follow the project rather than your home directory. Each OpenCode session gets a separate hashed shard at `<stateFilePath>.sessions/<sha256(sessionID)>/state.json`, allowing unrelated sessions in the same project to run concurrently. The state is local and is not synchronized across machines. You may want to add `.opencode/goals/` to your `.gitignore`.
 
 The state-file location is resolved with this precedence:
 
@@ -247,11 +247,11 @@ The state-file location is resolved with this precedence:
 2. the `OPENCODE_GOAL_STATE_PATH` environment variable, if set;
 3. the project-local default `<cwd>/.opencode/goals/state.json`.
 
-When the default path has no state yet, the plugin migrates forward from older locations on first load: the legacy `~/.opencode-goal-plugin/state.json` and the XDG path `${XDG_STATE_HOME:-~/.local/state}/opencode-goal-plugin/state.json`. Migration is exclusively claimed; after the project-local write succeeds, the legacy file is retired to a timestamped `.migrated…` backup so another project cannot import the same private goal state. An explicit `stateFilePath` or `OPENCODE_GOAL_STATE_PATH` is used literally with no migration fallback.
+When a project has no shard namespace yet, the plugin migrates all sessions from older locations on first session access: the legacy `~/.opencode-goal-plugin/state.json` and the XDG path `${XDG_STATE_HOME:-~/.local/state}/opencode-goal-plugin/state.json`. Migration is exclusively claimed; after every session shard is written, the source files are retired to timestamped `.migrated…` backups so another project cannot import the same private goal state. An explicit `stateFilePath` or `OPENCODE_GOAL_STATE_PATH` is used as the shard namespace root and has no migration fallback.
 
 The state directory is created with owner-only permissions, and the JSON state file is written as `0600` because it may contain goal text, assistant checkpoints, and workflow history.
 
-Alongside the state file the plugin keeps an **append-only lifecycle ledger** (`<stateFile>.ledger.jsonl`, also `0600`). Every lifecycle event — set, edit, auto-continue, pause, resume, blocked, completed, limit — is appended as one JSON line. Because the in-memory history is capped, the ledger is the durable record: if the main state file is missing or corrupted, the plugin reconstructs still-active (non-completed) goals from the ledger on startup and reloads them in the paused recovery state. Terminal events (complete/blocked) are written to the ledger *before* the main state write, so a goal's terminal outcome survives even if that write fails (**fail-closed**); such a failure is logged at error level.
+Alongside each session shard the plugin keeps an **append-only lifecycle ledger** (`<shard>/state.json.ledger.jsonl`, also `0600`). Every lifecycle event — set, edit, auto-continue, pause, resume, blocked, completed, limit — is appended as one JSON line. Because the in-memory history is capped, the ledger is the durable record: if a session state file is missing or corrupted, the plugin reconstructs still-active (non-completed) goals from that session's ledger on startup and reloads them in the paused recovery state. Terminal events (complete/blocked) are written to the ledger *before* the state write, so a goal's terminal outcome survives even if that write fails (**fail-closed**); such a failure is logged at error level.
 
 Recovered active goals are loaded in a **paused** state with a recovery note, so unattended auto-continue does not resume blindly after a restart. Set `"persistState": false` to keep purely in-memory behavior (this also disables the ledger).
 
@@ -328,7 +328,7 @@ Additional plugin-level options:
 - `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with a default-deny tool policy; only `read`, `glob`, and `grep` are allowed.
 - `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
 - `persistState` — whether to persist active goals and recent goal results to disk.
-- `stateFilePath` — where the persisted state JSON is written. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default is `<cwd>/.opencode/goals/state.json` (see the persistence section above), and `OPENCODE_GOAL_STATE_PATH` can override it without editing config.
+- `stateFilePath` — root path for the persisted session-shard namespace. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default root is `<cwd>/.opencode/goals/state.json`; shards are written below `<stateFilePath>.sessions/` (see the persistence section above).
 - `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
@@ -389,7 +389,7 @@ OpenCode's current `command.execute.before` hook does not fully intercept comman
 
 The plugin depends on `experimental.chat.system.transform` and other OpenCode plugin hooks that may change between OpenCode versions.
 
-Only one persistence-enabled OpenCode plugin instance may own a given `stateFilePath` at a time. A second process fails initialization with the owning PID/host instead of risking last-writer-wins state loss. Dispose the first host or configure a different path.
+Distinct OpenCode sessions may own shards under the same `stateFilePath` concurrently. A second process using the same session shard is still rejected with the owning PID/host instead of risking last-writer-wins state loss; use the original session or wait for its owner to dispose.
 
 ## Diagnostics and recovery
 
