@@ -3093,10 +3093,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
   const ensureSessionLoaded = async (sessionID) => {
     if (!persistenceOptions.persistState || !sessionID) return true
-    if (runtime.sessionPersistence.has(sessionID)) return true
-
     const existingLoad = runtime.sessionLoadPromises.get(sessionID)
     if (existingLoad) return existingLoad
+    if (runtime.sessionPersistence.has(sessionID)) return true
 
     const load = (async () => {
       const paths = sessionPathsFor(persistenceOptions, sessionID)

@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import test from "node:test"
 import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
+import { acquirePersistenceLease } from "../src/persistence-lease.js"
 
 const {
   agentToolSessionID,
@@ -2840,6 +2841,70 @@ test("concurrent first sessions share one legacy-state migration", async () => {
     assert.equal(currentGoal("legacy-A").condition, "migrated goal")
     assert.equal(currentGoal("legacy-B").condition, "new goal")
   } finally {
+    await hooks?.dispose()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("overlapping hooks for one session await its in-flight lazy load", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "goal-plugin-same-session-load-race-"))
+  const stateFilePath = join(directory, "state.json")
+  const sessionID = "same-session-load-race"
+  await writeFile(
+    stateFilePath,
+    JSON.stringify({
+      version: 1,
+      goals: [{ sessionID, condition: "legacy goal", startedAt: Date.now(), options: {} }],
+      results: [],
+    }),
+  )
+
+  const migrationBlocker = await acquirePersistenceLease(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  let hooks
+  let loading
+  let creating
+  try {
+    hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    loading = hooks["chat.params"]({ sessionID, agent: "build" })
+
+    const shardLockPath = `${sessionStatePath(stateFilePath, sessionID)}.lock`
+    let shardLeaseObserved = false
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await stat(shardLockPath)
+        shardLeaseObserved = true
+        break
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    }
+    assert.equal(shardLeaseObserved, true)
+
+    let creationFinished = false
+    creating = runGoal(hooks, sessionID, "new goal created during load").then((text) => {
+      creationFinished = true
+      return text
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(creationFinished, false, "the second hook must wait for the session load")
+
+    await migrationBlocker.release()
+    await loading
+    const creationText = await creating
+    assert.match(creationText, /New active goal: new goal created during load/)
+    assert.equal(currentGoal(sessionID).condition, "new goal created during load")
+    assert.equal(currentGoal(sessionID).stopped, false)
+  } finally {
+    await migrationBlocker.release().catch(() => false)
+    await Promise.allSettled([loading, creating].filter(Boolean))
     await hooks?.dispose()
     await rm(directory, { recursive: true, force: true })
   }
