@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { AsyncLocalStorage } from "node:async_hooks"
 import {
   promises as fs,
@@ -51,6 +51,8 @@ const MAX_TRACKED_MESSAGE_IDS = 20_000
 const DEFAULT_LEDGER_MAX_BYTES = 2 * 1024 * 1024
 const DEFAULT_LEDGER_RETENTION_FILES = 3
 const MAX_LEDGER_LINE_BYTES = 16 * 1024
+const MIGRATION_LEASE_RETRIES = 200
+const MIGRATION_LEASE_DELAY_MS = 25
 
 const DEFAULT_OPTIONS = {
   maxTurns: 10,
@@ -93,9 +95,8 @@ function createRuntimeState() {
     sessionExecutionContexts: new Map(),
     readOnlyCommandGuards: new Set(),
     ledgerSink: null,
-    persistenceLease: null,
-    migrationLease: null,
-    drainPersistence: null,
+    sessionPersistence: new Map(),
+    sessionLoadPromises: new Map(),
     disposed: false,
   }
 }
@@ -684,12 +685,6 @@ function listSessionGoals(sessionID) {
   return map ? [...map.values()] : []
 }
 
-function totalLiveGoals() {
-  let total = 0
-  for (const goals of sessionGoals.values()) total += goals.size
-  return total
-}
-
 function rememberMessageID(goal, messageID) {
   goal.messageIDs.add(messageID)
   while (goal.messageIDs.size > MAX_MESSAGE_IDS_PER_GOAL) {
@@ -787,6 +782,29 @@ function clearRuntimeState() {
   runtime.sessionStatuses.clear()
   runtime.sessionExecutionContexts.clear()
   runtime.readOnlyCommandGuards.clear()
+}
+
+function clearSessionRuntimeState(sessionID) {
+  const runtime = currentRuntime()
+  for (const goal of sessionGoals.get(sessionID)?.values() || []) {
+    for (const messageID of goal.messageIDs || []) {
+      seenTokens.delete(messageID)
+      seenUsage.delete(messageID)
+      seenOutputTokens.delete(messageID)
+    }
+  }
+  runtime.continuationControllers.get(sessionID)?.abort()
+  goalStates.delete(sessionID)
+  sessionGoals.delete(sessionID)
+  sessionArchive.delete(sessionID)
+  sessionOrdered.delete(sessionID)
+  lastGoalResults.delete(sessionID)
+  activeContinues.delete(sessionID)
+  runtime.continuationControllers.delete(sessionID)
+  runtime.promptInFlightSessions.delete(sessionID)
+  runtime.sessionStatuses.delete(sessionID)
+  runtime.sessionExecutionContexts.delete(sessionID)
+  runtime.readOnlyCommandGuards.delete(sessionID)
 }
 
 function pruneGoalResults(options) {
@@ -997,6 +1015,26 @@ function ledgerPathFor(stateFilePath) {
   return `${stateFilePath}.ledger.jsonl`
 }
 
+// Persist each OpenCode session in its own directory. Session IDs are hashed so
+// arbitrary host-provided IDs cannot become path components, and the resulting
+// paths are portable across POSIX and Windows filesystems.
+function sessionDirectoryFor(stateFilePath) {
+  return `${stateFilePath}.sessions`
+}
+
+function sessionKey(sessionID) {
+  return createHash("sha256").update(sessionID).digest("hex")
+}
+
+function sessionPathsFor(persistenceOptions, sessionID) {
+  const directory = join(persistenceOptions.sessionDirectory, sessionKey(sessionID))
+  const stateFilePath = join(directory, "state.json")
+  return {
+    stateFilePath,
+    ledgerFilePath: ledgerPathFor(stateFilePath),
+  }
+}
+
 // XDG-style state path: $XDG_STATE_HOME/opencode-goal-plugin/state.json,
 // defaulting to ~/.local/state when XDG_STATE_HOME is unset.
 function xdgStateFilePath(env = process.env) {
@@ -1047,11 +1085,14 @@ function normalizePersistenceOptions(options = {}, { env = process.env, cwd } = 
       : ledgerPathFor(stateFilePath)
   const ledgerMaxBytes = toPositiveInteger(options.ledgerMaxBytes, DEFAULT_LEDGER_MAX_BYTES)
   const ledgerRetentionFiles = Number.isSafeInteger(options.ledgerRetentionFiles) && options.ledgerRetentionFiles >= 0
-    ? Math.min(options.ledgerRetentionFiles, 10)
-    : DEFAULT_LEDGER_RETENTION_FILES
+      ? Math.min(options.ledgerRetentionFiles, 10)
+      : DEFAULT_LEDGER_RETENTION_FILES
+  const sessionDirectory = sessionDirectoryFor(stateFilePath)
   return {
     persistState,
     stateFilePath,
+    sessionDirectory,
+    migrationMarkerPath: join(sessionDirectory, ".migration-v1-complete"),
     fallbackPaths,
     ledgerFilePath,
     ledgerMaxBytes,
@@ -1283,7 +1324,7 @@ function deserializeGoal(goal) {
 // Parse one state-file body and apply it to runtime state. Returns "loaded" on
 // success or "invalid" when the version/shape is unsupported. Throws on
 // JSON.parse failure (handled by the caller).
-async function applyParsedStateFile(raw, client) {
+async function applyParsedStateFile(raw, client, onlySessionID = null) {
   const parsed = JSON.parse(raw)
   if (parsed?.version !== STATE_FILE_VERSION) {
     await logPluginError(
@@ -1303,6 +1344,7 @@ async function applyParsedStateFile(raw, client) {
   const loadedGoalCounts = new Map()
   for (const rawGoal of parsed.goals.slice(0, MAX_PERSISTED_ENTRIES)) {
     const normalizedGoal = normalizePersistedGoal(rawGoal)
+    if (onlySessionID && normalizedGoal?.sessionID !== onlySessionID) continue
     const sessionCount = normalizedGoal
       ? loadedGoalCounts.get(normalizedGoal.sessionID) || 0
       : 0
@@ -1318,6 +1360,7 @@ async function applyParsedStateFile(raw, client) {
   let skippedResults = 0
   for (const rawResult of parsed.results.slice(-MAX_PERSISTED_ENTRIES)) {
     const normalizedResult = normalizePersistedResult(rawResult)
+    if (onlySessionID && normalizedResult?.sessionID !== onlySessionID) continue
     if (normalizedResult) {
       loadedResults.push(normalizedResult)
     } else {
@@ -1332,7 +1375,8 @@ async function applyParsedStateFile(raw, client) {
     )
   }
 
-  clearRuntimeState()
+  if (onlySessionID) clearSessionRuntimeState(onlySessionID)
+  else clearRuntimeState()
 
   const focusBySession = new Map()
   for (const { goal, focused } of loadedGoals) {
@@ -1345,6 +1389,7 @@ async function applyParsedStateFile(raw, client) {
   // Restore focus. Older single-goal state files have no `focused` flag, so
   // fall back to focusing a session's first (typically only) goal.
   for (const [sessionID, goalMap] of sessionGoals.entries()) {
+    if (onlySessionID && sessionID !== onlySessionID) continue
     const focusTarget = focusBySession.get(sessionID) || goalMap.values().next().value
     if (focusTarget) focusGoal(sessionID, focusTarget)
   }
@@ -1356,6 +1401,7 @@ async function applyParsedStateFile(raw, client) {
   if (Array.isArray(parsed.archives)) {
     for (const entry of parsed.archives.slice(-MAX_PERSISTED_ENTRIES)) {
       if (!isPlainObject(entry) || typeof entry.sessionID !== "string" || !entry.sessionID) continue
+      if (onlySessionID && entry.sessionID !== onlySessionID) continue
       const results = Array.isArray(entry.results)
         ? entry.results.map(normalizePersistedResult).filter(Boolean)
         : []
@@ -1367,6 +1413,7 @@ async function applyParsedStateFile(raw, client) {
 
   if (Array.isArray(parsed.orderedSessions)) {
     for (const sessionID of parsed.orderedSessions) {
+      if (onlySessionID && sessionID !== onlySessionID) continue
       // Only honor the ordered flag for sessions that still have goals loaded.
       if (typeof sessionID === "string" && sessionGoals.has(sessionID)) {
         sessionOrdered.add(sessionID)
@@ -1381,7 +1428,7 @@ async function applyParsedStateFile(raw, client) {
 // terminal events. If a goal has a "completed" or "cleared" entry in the ledger
 // but still appears active in the state file (because the state write failed
 // after the terminal ledger write), remove it so it is not re-driven.
-async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
+async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySessionID = null) {
   const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
     maxBytes: persistenceOptions.ledgerMaxBytes,
     retentionFiles: persistenceOptions.ledgerRetentionFiles,
@@ -1395,6 +1442,7 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
       typeof entry.sessionID === "string" && entry.sessionID &&
       typeof entry.goalId === "string" && entry.goalId
     ) {
+      if (onlySessionID && entry.sessionID !== onlySessionID) continue
       terminalGoals.add(`${entry.sessionID}\0${entry.goalId}`)
     }
   }
@@ -1402,6 +1450,7 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
 
   let removed = 0
   for (const [sessionID, goals] of sessionGoals.entries()) {
+    if (onlySessionID && sessionID !== onlySessionID) continue
     for (const goal of [...goals.values()]) {
       if (!terminalGoals.has(`${sessionID}\0${goal.goalId}`)) continue
       removeSessionGoal(sessionID, goal.goalId)
@@ -1420,114 +1469,250 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client) {
   }
 }
 
-async function loadPersistedState(persistenceOptions, client) {
-  if (!persistenceOptions.persistState) return "disabled"
+async function pathExists(path) {
+  try {
+    await fs.lstat(path)
+    return true
+  } catch (error) {
+    if (error?.code === "ENOENT") return false
+    throw error
+  }
+}
 
-  const candidates = [
-    { path: persistenceOptions.stateFilePath, primary: true },
-    ...(persistenceOptions.fallbackPaths || []).map((path) => ({ path, primary: false })),
-  ]
-  const recoverInvalidPrimary = async () => {
-    const status = await reconstructFromLedger(persistenceOptions, client)
-    if (status !== "reconstructed") return "invalid"
-    const quarantinePath = `${persistenceOptions.stateFilePath}.corrupt.${Date.now()}.${randomUUID()}`
+async function acquireMigrationLease(stateFilePath, migrationMarkerPath) {
+  let lastError
+  for (let attempt = 0; attempt < MIGRATION_LEASE_RETRIES; attempt += 1) {
+    if (await pathExists(migrationMarkerPath)) return null
     try {
-      await fs.rename(persistenceOptions.stateFilePath, quarantinePath)
+      return await acquirePersistenceLease(stateFilePath)
+    } catch (error) {
+      if (!String(error?.message || error).includes("goal persistence is already owned")) throw error
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, MIGRATION_LEASE_DELAY_MS))
+    }
+  }
+  throw lastError || new Error("could not acquire goal migration lease")
+}
+
+async function readPersistedStateFile(path, client) {
+  let raw
+  try {
+    const info = await fs.lstat(path)
+    if (info.isSymbolicLink() || !info.isFile() || info.size > MAX_STATE_FILE_BYTES) {
+      await logPluginError(
+        client,
+        `Skipped persisted goal state: file is not regular or exceeds ${MAX_STATE_FILE_BYTES} bytes.`,
+      )
+      return { status: "invalid" }
+    }
+    raw = await fs.readFile(path, "utf8")
+  } catch (error) {
+    if (error?.code === "ENOENT") return { status: "missing" }
+    await logPluginError(client, "Failed to load persisted goal state", error)
+    return { status: "invalid" }
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed?.version !== STATE_FILE_VERSION || !Array.isArray(parsed.goals) || !Array.isArray(parsed.results)) {
+      await logPluginError(client, `Skipped persisted goal state: unsupported or malformed state at ${path}.`)
+      return { status: "invalid" }
+    }
+  } catch (error) {
+    await logPluginError(client, "Failed to parse persisted goal state", error)
+    return { status: "invalid" }
+  }
+  return { status: "loaded", raw }
+}
+
+function migrationCandidates(persistenceOptions) {
+  return [
+    {
+      stateFilePath: persistenceOptions.stateFilePath,
+      ledgerFilePath: persistenceOptions.ledgerFilePath,
+    },
+    ...(persistenceOptions.fallbackPaths || []).map((stateFilePath) => ({
+      stateFilePath,
+      ledgerFilePath: ledgerPathFor(stateFilePath),
+    })),
+  ]
+}
+
+function sessionStatePayload(sessionID, parsedState, ledgerEntries = []) {
+  const goals = []
+  const results = []
+  const archives = []
+  const orderedSessions = []
+
+  for (const rawGoal of parsedState?.goals || []) {
+    const goal = normalizePersistedGoal(rawGoal)
+    if (!goal || goal.sessionID !== sessionID) continue
+    goals.push({ ...serializeGoal(goal), focused: rawGoal?.focused === true })
+  }
+
+  for (const rawResult of parsedState?.results || []) {
+    const result = normalizePersistedResult(rawResult)
+    if (result?.sessionID === sessionID) results.push(result)
+  }
+
+  for (const rawArchive of parsedState?.archives || []) {
+    if (!isPlainObject(rawArchive) || rawArchive.sessionID !== sessionID) continue
+    const archiveResults = Array.isArray(rawArchive.results)
+      ? rawArchive.results.map(normalizePersistedResult).filter((result) => result?.sessionID === sessionID)
+      : []
+    if (archiveResults.length) archives.push({ sessionID, results: archiveResults.slice(-MAX_ARCHIVED_PER_SESSION) })
+  }
+
+  if (parsedState?.orderedSessions?.includes(sessionID)) orderedSessions.push(sessionID)
+
+  const sessionLedger = ledgerEntries.filter((entry) => entry?.sessionID === sessionID)
+  const knownGoalIDs = new Set(goals.map((goal) => goal.goalId))
+  for (const reconstructed of reconstructGoalsFromLedger(sessionLedger)) {
+    const goal = normalizePersistedGoal(reconstructed)
+    if (!goal || knownGoalIDs.has(goal.goalId)) continue
+    goals.push({ ...serializeGoal(goal), focused: true })
+    knownGoalIDs.add(goal.goalId)
+    if (reconstructed.ordered === true && !orderedSessions.includes(sessionID)) orderedSessions.push(sessionID)
+  }
+
+  return {
+    version: STATE_FILE_VERSION,
+    goals: goals.slice(-MAX_PERSISTED_ENTRIES),
+    results: results.slice(-MAX_PERSISTED_ENTRIES),
+    archives,
+    orderedSessions,
+  }
+}
+
+async function writeStateSnapshot(stateFilePath, payload) {
+  const tmpPath = `${stateFilePath}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await fs.mkdir(dirname(stateFilePath), { recursive: true, mode: 0o700 })
+    await fs.writeFile(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 })
+    await fs.rename(tmpPath, stateFilePath)
+    await fs.chmod(stateFilePath, 0o600)
+    return true
+  } catch (error) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+async function writeMigrationMarker(path) {
+  await writeStateSnapshot(path, { version: 1, migratedAt: Date.now() })
+}
+
+async function migrateLegacyState(persistenceOptions, client) {
+  if (await pathExists(persistenceOptions.migrationMarkerPath)) return
+
+  for (const candidate of migrationCandidates(persistenceOptions)) {
+    const sourceHasState = await pathExists(candidate.stateFilePath)
+    const sourceHasLedger = await pathExists(candidate.ledgerFilePath)
+    if (!sourceHasState && !sourceHasLedger) continue
+
+    const migrationLease = await acquireMigrationLease(
+      candidate.stateFilePath,
+      persistenceOptions.migrationMarkerPath,
+    )
+    if (!migrationLease) return
+    try {
+      if (await pathExists(persistenceOptions.migrationMarkerPath)) return
+
+      const state = await readPersistedStateFile(candidate.stateFilePath, client)
+      const ledgerEntries = await readLedgerEntries(candidate.ledgerFilePath, {
+        maxBytes: persistenceOptions.ledgerMaxBytes,
+        retentionFiles: persistenceOptions.ledgerRetentionFiles,
+      })
+      if (state.status === "invalid" && ledgerEntries.length === 0) return
+      if (state.status === "missing" && ledgerEntries.length === 0) return
+
+      const parsedState = state.status === "loaded" ? JSON.parse(state.raw) : null
+      const sessionIDs = new Set(ledgerEntries.map((entry) => entry?.sessionID).filter(Boolean))
+      for (const rawGoal of parsedState?.goals || []) if (rawGoal?.sessionID) sessionIDs.add(rawGoal.sessionID)
+      for (const rawResult of parsedState?.results || []) if (rawResult?.sessionID) sessionIDs.add(rawResult.sessionID)
+      for (const rawArchive of parsedState?.archives || []) if (rawArchive?.sessionID) sessionIDs.add(rawArchive.sessionID)
+      for (const orderedSession of parsedState?.orderedSessions || []) if (orderedSession) sessionIDs.add(orderedSession)
+
+      for (const sessionID of [...sessionIDs].sort()) {
+        const targetPaths = sessionPathsFor(persistenceOptions, sessionID)
+        if (await pathExists(targetPaths.stateFilePath)) continue
+
+        const payload = sessionStatePayload(sessionID, parsedState, ledgerEntries)
+        const sessionLedger = ledgerEntries.filter((entry) => entry?.sessionID === sessionID)
+        if (sessionLedger.length && !(await pathExists(targetPaths.ledgerFilePath))) {
+          for (const entry of sessionLedger) {
+            if (!appendLedgerLine(targetPaths.ledgerFilePath, entry, {
+              maxBytes: persistenceOptions.ledgerMaxBytes,
+              retentionFiles: persistenceOptions.ledgerRetentionFiles,
+            })) {
+              throw new Error(`could not migrate the goal ledger for session ${sessionID}`)
+            }
+          }
+        }
+        await writeStateSnapshot(targetPaths.stateFilePath, payload)
+      }
+
+      await writeMigrationMarker(persistenceOptions.migrationMarkerPath)
+      for (const sourcePath of [candidate.stateFilePath, candidate.ledgerFilePath]) {
+        if (!(await pathExists(sourcePath))) continue
+        const backupPath = `${sourcePath}.migrated.${Date.now()}.${randomUUID()}`
+        try {
+          await fs.rename(sourcePath, backupPath)
+        } catch (error) {
+          await logPluginError(client, `Could not retire migrated goal persistence at ${sourcePath}.`, error)
+        }
+      }
+      return
+    } finally {
+      await migrationLease.release()
+    }
+  }
+
+  // A fresh project has no aggregate or legacy state. Mark the namespace so a
+  // later session does not repeatedly probe global fallback paths.
+  await writeMigrationMarker(persistenceOptions.migrationMarkerPath)
+}
+
+async function loadPersistedSessionState(persistence, client, sessionID) {
+  const state = await readPersistedStateFile(persistence.stateFilePath, client)
+  if (state.status === "loaded") {
+    await applyParsedStateFile(state.raw, client, sessionID)
+    await reconcileLoadedStateWithLedger(persistence, client, sessionID)
+    return "loaded"
+  }
+  const recovered = await reconstructFromLedger(persistence, client, sessionID)
+  if (state.status === "invalid" && recovered === "reconstructed") {
+    const quarantinePath = `${persistence.stateFilePath}.corrupt.${Date.now()}.${randomUUID()}`
+    try {
+      await fs.rename(persistence.stateFilePath, quarantinePath)
       await logPluginError(
         client,
         `Preserved invalid persisted goal state at ${quarantinePath} before ledger recovery.`,
       )
     } catch (error) {
       await logPluginError(client, "Could not quarantine invalid persisted goal state", error)
-      return "invalid"
     }
-    return status
   }
-
-  for (const { path, primary } of candidates) {
-    let migrationLease = null
-    if (!primary) {
-      try {
-        migrationLease = await acquirePersistenceLease(path)
-        currentRuntime().migrationLease = migrationLease
-      } catch (error) {
-        await logPluginError(client, `Skipped legacy state migration because another process owns ${path}.`, error)
-        continue
-      }
-    }
-    let raw
-    try {
-      const info = await fs.lstat(path)
-      if (info.isSymbolicLink() || !info.isFile() || info.size > MAX_STATE_FILE_BYTES) {
-        await logPluginError(
-          client,
-          `Skipped persisted goal state: file is not regular or exceeds ${MAX_STATE_FILE_BYTES} bytes.`,
-        )
-        if (primary) return recoverInvalidPrimary()
-        await migrationLease?.release()
-        continue
-      }
-      raw = await fs.readFile(path, "utf8")
-    } catch (error) {
-      if (error?.code === "ENOENT") {
-        await migrationLease?.release()
-        continue
-      }
-      // A present-but-unreadable primary file should not be silently
-      // overwritten, so report it as invalid rather than missing.
-      await logPluginError(client, "Failed to load persisted goal state", error)
-      if (primary) return "invalid"
-      await migrationLease?.release()
-      continue
-    }
-
-    let status
-    try {
-      status = await applyParsedStateFile(raw, client)
-    } catch (error) {
-      await logPluginError(client, "Failed to load persisted goal state", error)
-      if (primary) return recoverInvalidPrimary()
-      await migrationLease?.release()
-      continue
-    }
-
-    if (status === "loaded") {
-      // Cross-check: the ledger is written before the state file for terminal
-      // events (completed, cleared). If the terminal persist succeeded in the
-      // ledger but the state file write failed (e.g. process killed between the
-      // two writes), the reloaded state may still have the goal as active. Remove
-      // any loaded active goals whose goalId has a terminal ledger entry.
-      await reconcileLoadedStateWithLedger(persistenceOptions, client)
-      if (primary) return "loaded"
-      persistenceOptions.migrationClaim = { path, lease: migrationLease }
-      currentRuntime().migrationLease = migrationLease
-      return "migrated"
-    }
-    // status === "invalid": preserve a present-but-corrupt primary; for a
-    // fallback, keep trying the next candidate.
-    if (primary) return recoverInvalidPrimary()
-    await migrationLease?.release()
-  }
-
-  // No state file found at any candidate path → try reconstructing from the
-  // append-only ledger before giving up.
-  return reconstructFromLedger(persistenceOptions, client)
+  return recovered
 }
 
 // Last-resort recovery: when the main state file is absent, rebuild still-active
 // goals from the append-only ledger so a lost/rotated state file does not drop
 // in-flight goals. Recovered goals are paused (via deserializeGoal).
-async function reconstructFromLedger(persistenceOptions, client) {
+async function reconstructFromLedger(persistenceOptions, client, onlySessionID = null) {
   const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
     maxBytes: persistenceOptions.ledgerMaxBytes,
     retentionFiles: persistenceOptions.ledgerRetentionFiles,
   })
   if (!entries.length) return "missing"
 
-  const reconstructed = reconstructGoalsFromLedger(entries)
+  const reconstructed = reconstructGoalsFromLedger(entries).filter(
+    (goal) => !onlySessionID || goal.sessionID === onlySessionID,
+  )
   if (!reconstructed.length) return "missing"
 
-  clearRuntimeState()
+  if (onlySessionID) clearSessionRuntimeState(onlySessionID)
+  else clearRuntimeState()
   const focusCandidates = new Map()
   for (const stub of reconstructed) {
     const normalized = normalizePersistedGoal(stub)
@@ -1539,6 +1724,7 @@ async function reconstructFromLedger(persistenceOptions, client) {
     }
   }
   for (const [sessionID, goals] of sessionGoals.entries()) {
+    if (onlySessionID && sessionID !== onlySessionID) continue
     const preferred = focusCandidates.get(sessionID)
     const focused = (preferred && goals.get(preferred)) || goals.values().next().value
     if (focused) focusGoal(sessionID, focused)
@@ -1550,55 +1736,46 @@ async function reconstructFromLedger(persistenceOptions, client) {
   return goalStates.size > 0 ? "reconstructed" : "missing"
 }
 
-async function persistState(persistenceOptions, client) {
-  if (!persistenceOptions.persistState) return true
-
-  const tmpPath = `${persistenceOptions.stateFilePath}.${process.pid}.${randomUUID()}.tmp`
-  try {
-    await fs.mkdir(dirname(persistenceOptions.stateFilePath), { recursive: true, mode: 0o700 })
-    await fs.writeFile(
-      tmpPath,
-      JSON.stringify(
-        {
-          version: STATE_FILE_VERSION,
-          // All live goals across sessions, each flagged whether it is the
-          // session's focused goal so focus survives a restart.
-          goals: [...sessionGoals.values()]
-            .flatMap((map) => [...map.values()])
-            .slice(-MAX_PERSISTED_ENTRIES)
-            .map((goal) => ({
-              ...serializeGoal(goal),
-              focused: goalStates.get(goal.sessionID)?.goalId === goal.goalId,
-            })),
-          results: [...lastGoalResults.entries()].slice(-MAX_PERSISTED_ENTRIES).map(([sessionID, result]) => ({
+function currentSessionStatePayload(sessionID) {
+  return {
+    version: STATE_FILE_VERSION,
+    goals: (listSessionGoals(sessionID) || [])
+      .slice(-MAX_LIVE_GOALS_PER_SESSION)
+      .map((goal) => ({
+        ...serializeGoal(goal),
+        focused: goalStates.get(sessionID)?.goalId === goal.goalId,
+      })),
+    results: lastGoalResults.has(sessionID)
+      ? [{
+          ...lastGoalResults.get(sessionID),
+          sessionID,
+          history: [...(lastGoalResults.get(sessionID).history || [])],
+          checkpoints: [...(lastGoalResults.get(sessionID).checkpoints || [])],
+          lastCheckpoint: lastGoalResults.get(sessionID).lastCheckpoint || null,
+        }]
+      : [],
+    archives: sessionArchive.has(sessionID)
+      ? [{
+          sessionID,
+          results: sessionArchive.get(sessionID).map((result) => ({
             ...result,
             sessionID,
             history: [...(result.history || [])],
             checkpoints: [...(result.checkpoints || [])],
             lastCheckpoint: result.lastCheckpoint || null,
           })),
-          archives: [...sessionArchive.entries()].slice(-MAX_PERSISTED_ENTRIES).map(([sessionID, results]) => ({
-            sessionID,
-            results: results.map((result) => ({
-              ...result,
-              sessionID,
-              history: [...(result.history || [])],
-              checkpoints: [...(result.checkpoints || [])],
-              lastCheckpoint: result.lastCheckpoint || null,
-            })),
-          })),
-          orderedSessions: [...sessionOrdered].slice(-MAX_PERSISTED_ENTRIES),
-        },
-        null,
-        2,
-      ),
-      { encoding: "utf8", mode: 0o600 },
-    )
-    await fs.rename(tmpPath, persistenceOptions.stateFilePath)
-    await fs.chmod(persistenceOptions.stateFilePath, 0o600)
+        }]
+      : [],
+    orderedSessions: sessionOrdered.has(sessionID) ? [sessionID] : [],
+  }
+}
+
+async function persistState(persistence, client, sessionID) {
+  if (!persistence.persistState) return true
+  try {
+    await writeStateSnapshot(persistence.stateFilePath, currentSessionStatePayload(sessionID))
     return true
   } catch (error) {
-    await fs.rm(tmpPath, { force: true }).catch(() => {})
     await logPluginError(client, "Failed to persist goal state", error)
     return false
   }
@@ -2342,10 +2519,6 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
       return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
     if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
       return `Invalid mode: ${args.mode} (expected ${[...GOAL_MODES].join(" or ")}).`
-    if (!goalStates.has(sessionID) && totalLiveGoals() >= MAX_PERSISTED_ENTRIES) {
-      return `The plugin already tracks ${MAX_PERSISTED_ENTRIES} live goals; clear or complete one before creating another.`
-    }
-
     const options = normalizeOptions({
       ...defaultGoalOptions,
       ...(Number.isFinite(args.maxTurns) ? { maxTurns: args.maxTurns } : {}),
@@ -2371,7 +2544,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     lastGoalResults.delete(sessionID)
     registerSessionGoal(goal)
     focusGoal(sessionID, goal)
-    await persist()
+    await persist(sessionID)
     // Escape in the tool result only: goal.condition is stored raw so callers
     // that build XML (buildGoalBlock, buildContinueMessage) can apply escaping
     // themselves. Escaping here prevents XML metacharacters in user-supplied
@@ -2453,7 +2626,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
             goal.stopReason = "audit rejected"
             goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
             pushHistory(goal, "audit-rejected", `Agent tool completion audit rejected: ${summarizeText(reason, 300)}`)
-            await persist()
+            await persist(sessionID)
             return `Completion audit rejected: ${summarizeText(reason, 200)}. Goal paused; use /${commandName} resume after addressing the issue.`
           }
         }
@@ -2468,7 +2641,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
         cleanupGoal(sessionID)
         // Advance an ordered sequence just like the marker path does.
         if (ordered) promoteNextOrderedGoal(sessionID)
-        const durable = await persistFinal("completion", ledgerDurable)
+        const durable = await persistFinal(sessionID, "completion", ledgerDurable)
         if (durable === false) {
           restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered })
           return "Completion verified, but terminal state could not be persisted. Goal remains paused."
@@ -2512,7 +2685,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     if (!messages.length) {
       return "Nothing to update. Provide `objective` and/or `status`."
     }
-    await persist()
+    await persist(sessionID)
     return messages.join(" ")
   }
 
@@ -2528,7 +2701,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     sessionGoals.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
-    await persistFinal("clear")
+    await persistFinal(sessionID, "clear")
     return "Goal cleared."
   }
 
@@ -2553,11 +2726,12 @@ async function loadOpencodePluginModule() {
   return opencodePluginModulePromise
 }
 
-function buildAgentTools(toolHelper, handlers) {
+function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () => true) {
   const schema = toolHelper.schema
   const run = (handler) => async (args, ctx) => {
     const sessionID = agentToolSessionID(ctx)
     if (!sessionID) return "No session id available for the goal tool."
+    await ensureSessionLoaded(sessionID)
     return handler(sessionID, args || {})
   }
   // Canonical tools use a small, versioned machine-readable envelope. Keep the
@@ -2571,6 +2745,7 @@ function buildAgentTools(toolHelper, handlers) {
         goalToolFailure("missing_session", "No session id available for the goal tool."),
       )
     }
+    await ensureSessionLoaded(sessionID)
     return serializeGoalToolResult(operation, await handler(sessionID, args || {}))
   }
 
@@ -2902,30 +3077,67 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     env: pluginOptions.env,
     cwd: pluginOptions.cwd || directory,
   })
-  if (persistenceOptions.persistState) {
-    await assertSafeProjectPersistencePath(persistenceOptions)
-    currentRuntime().persistenceLease = await acquirePersistenceLease(persistenceOptions.stateFilePath)
-  }
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
-  // Serialize all persist() calls through a promise chain so concurrent callers
-  // never race on the temp-file rename. persistState returns a boolean and never
-  // rejects, so the chain cannot stall on a thrown error.
-  let persistChain = Promise.resolve(true)
-  const persist = () => {
-    if (runtime.disposed) return Promise.resolve(false)
-    persistChain = persistChain
+
+  // Each session owns an independent snapshot, ledger, write chain, and
+  // lifetime lease. A project can therefore host any number of unrelated goal
+  // sessions without allowing two processes to drive the same session.
+  const persist = (sessionID) => {
+    const persistence = runtime.sessionPersistence.get(sessionID)
+    if (runtime.disposed || !persistence) return Promise.resolve(false)
+    persistence.persistChain = persistence.persistChain
       .catch(() => false)
-      .then(() => persistState(persistenceOptions, client))
-    return persistChain
+      .then(() => persistState(persistence, client, sessionID))
+    return persistence.persistChain
   }
-  runtime.drainPersistence = () => persistChain.catch(() => false)
+
+  const ensureSessionLoaded = async (sessionID) => {
+    if (!persistenceOptions.persistState || !sessionID) return true
+    const existingLoad = runtime.sessionLoadPromises.get(sessionID)
+    if (existingLoad) return existingLoad
+    if (runtime.sessionPersistence.has(sessionID)) return true
+
+    const load = (async () => {
+      const paths = sessionPathsFor(persistenceOptions, sessionID)
+      await assertSafeProjectPersistencePath({
+        ...persistenceOptions,
+        stateFilePath: paths.stateFilePath,
+      })
+      const lease = await acquirePersistenceLease(paths.stateFilePath)
+      const persistence = {
+        ...persistenceOptions,
+        ...paths,
+        persistChain: Promise.resolve(true),
+        lease,
+      }
+      runtime.sessionPersistence.set(sessionID, persistence)
+      try {
+        await migrateLegacyState(persistenceOptions, client)
+        const status = await loadPersistedSessionState(persistence, client, sessionID)
+        pruneGoalResults(defaultGoalOptions)
+        if (status === "loaded" || status === "missing" || status === "reconstructed") await persist(sessionID)
+        return true
+      } catch (error) {
+        runtime.sessionPersistence.delete(sessionID)
+        await lease.release().catch(() => false)
+        throw error
+      }
+    })()
+
+    runtime.sessionLoadPromises.set(sessionID, load)
+    try {
+      return await load
+    } finally {
+      runtime.sessionLoadPromises.delete(sessionID)
+    }
+  }
 
   // Fail closed when persisting a terminal state (complete/blocked)
   // fails, surface it loudly. The terminal event is already in the append-only
   // ledger, so it stays recoverable across a restart even though the main state
   // file write did not land.
-  const persistTerminalState = async (label, ledgerDurable = false) => {
-    const stateDurable = await persist()
+  const persistTerminalState = async (sessionID, label, ledgerDurable = false) => {
+    const stateDurable = await persist(sessionID)
     if (!stateDurable && persistenceOptions.persistState) {
       await logPluginError(
         client,
@@ -2939,10 +3151,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
   // Route lifecycle events to the JSONL ledger only when persistence is on.
   if (persistenceOptions.persistState) {
-    setLedgerSink((entry) => appendLedgerLine(persistenceOptions.ledgerFilePath, entry, {
-      maxBytes: persistenceOptions.ledgerMaxBytes,
-      retentionFiles: persistenceOptions.ledgerRetentionFiles,
-    }))
+    setLedgerSink((entry) => {
+      const persistence = runtime.sessionPersistence.get(entry.sessionID)
+      if (!persistence) return false
+      return appendLedgerLine(persistence.ledgerFilePath, entry, {
+        maxBytes: persistence.ledgerMaxBytes,
+        retentionFiles: persistence.ledgerRetentionFiles,
+      })
+    })
   } else {
     setLedgerSink(null)
   }
@@ -2985,34 +3201,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         : null
 
   clearRuntimeState()
-  const persistedStateStatus = await loadPersistedState(persistenceOptions, client)
-  pruneGoalResults(defaultGoalOptions)
-  // "migrated" = loaded from a legacy/XDG fallback path; "reconstructed" =
-  // rebuilt from the ledger. Both persist forward to the resolved path.
-  if (
-    persistedStateStatus === "loaded" ||
-    persistedStateStatus === "missing" ||
-    persistedStateStatus === "migrated" ||
-    persistedStateStatus === "reconstructed"
-  ) {
-    const initialPersisted = await persist()
-    if (persistedStateStatus === "migrated" && persistenceOptions.migrationClaim) {
-      const { path, lease } = persistenceOptions.migrationClaim
-      if (initialPersisted) {
-        const backupPath = `${path}.migrated.${Date.now()}.${randomUUID()}`
-        try {
-          await fs.rename(path, backupPath)
-        } catch (error) {
-          await logPluginError(client, `Could not retire migrated legacy goal state at ${path}.`, error)
-        }
-      }
-      await lease.release()
-      runtime.migrationLease = null
-      persistenceOptions.migrationClaim = null
-    }
-  }
 
-  const agentToolHandlers = buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState, completionAuditor, commandName })
+  const agentToolHandlers = buildAgentToolHandlers({
+    defaultGoalOptions,
+    persist,
+    persistTerminalState,
+    completionAuditor,
+    commandName,
+  })
 
   const abortAcceptedContinuation = async (sessionID) => {
     const runtimeState = currentRuntime()
@@ -3043,7 +3239,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     goal.continuationClaim = null
     pushHistory(goal, "paused", history)
     activeContinues.delete(sessionID)
-    await persist()
+    await persist(sessionID)
     if (abortAccepted) await abortAcceptedContinuation(sessionID)
     return true
   }
@@ -3113,7 +3309,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     }
 
     goal.continuationClaim = { runId: runID, sourceAssistantMessageID }
-    const claimPersisted = await persist()
+    const claimPersisted = await persist(sessionID)
     if (!claimPersisted && persistenceOptions.persistState) {
       goal.continuationClaim = null
       goal.stopped = true
@@ -3135,6 +3331,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "chat.params": async (input) => {
       if (!input?.sessionID) return
+      await ensureSessionLoaded(input.sessionID)
       const context = normalizeExecutionContext({
         agent: input.agent,
         model: input.model,
@@ -3145,6 +3342,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     "chat.message": async (input, output) => {
       const sessionID = input?.sessionID
       if (!sessionID) return
+      await ensureSessionLoaded(sessionID)
       const context = normalizeExecutionContext(input)
       if (context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
 
@@ -3165,7 +3363,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "tool.execute.before": async (input) => {
       const sessionID = input?.sessionID
-      if (!sessionID || !currentRuntime().readOnlyCommandGuards.has(sessionID)) return
+      if (!sessionID) return
+      await ensureSessionLoaded(sessionID)
+      if (!currentRuntime().readOnlyCommandGuards.has(sessionID)) return
       if (READ_ONLY_COMMAND_TOOLS.has(input?.tool)) return
       throw new Error(
         `This /${commandName} control command is read-only for the routed model turn. Tool "${input?.tool || "unknown"}" was blocked. Wait for a separate user turn; do not modify work or goal state now.`,
@@ -3184,6 +3384,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       const args = input.arguments.trim()
       const sessionID = input.sessionID
+      await ensureSessionLoaded(sessionID)
       currentRuntime().readOnlyCommandGuards.delete(sessionID)
       pruneGoalResults(defaultGoalOptions)
 
@@ -3246,7 +3447,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         sessionGoals.delete(sessionID)
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
-        await persist()
+        await persist(sessionID)
         output.parts = [makeTextPart("Goal cleared.")]
         return
       }
@@ -3265,7 +3466,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.continuationClaim = null
         activeContinues.delete(sessionID)
         pushHistory(goal, "paused", "User paused the active goal.")
-        await persist()
+        await persist(sessionID)
         await abortAcceptedContinuation(sessionID)
         output.parts = [makeTextPart(`Goal paused: ${goal.condition}`)]
         return
@@ -3291,7 +3492,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.blockedReason = ""
         goal.lastStatus = "Goal resumed with a fresh local budget."
         pushHistory(goal, "resumed", "User resumed the goal with a fresh local budget window.")
-        await persist()
+        await persist(sessionID)
         output.parts = [makeTextPart(`Goal resumed with fresh limits: ${goal.condition}`)]
         return
       }
@@ -3331,7 +3532,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.continuationClaim = null
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
-        await persist()
+        await persist(sessionID)
         output.parts = [
           makeTextPart(
             [
@@ -3371,11 +3572,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           output.parts = [makeTextPart(`An ordered sequence may contain at most ${MAX_LIVE_GOALS_PER_SESSION} goals.`)]
           return
         }
-        const existingCount = listSessionGoals(sessionID).length
-        if (totalLiveGoals() - existingCount + objectives.length > MAX_PERSISTED_ENTRIES) {
-          output.parts = [makeTextPart(`The plugin may track at most ${MAX_PERSISTED_ENTRIES} live goals across sessions.`)]
-          return
-        }
         if (objectives.some((objective) => objective.length > MAX_GOAL_OBJECTIVE_LENGTH)) {
           output.parts = [makeTextPart(`Each goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`)]
           return
@@ -3412,7 +3608,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         })
         focusGoal(sessionID, firstGoal)
         sessionOrdered.add(sessionID)
-        await persist()
+        await persist(sessionID)
         output.parts = [
           makeTextPart(
             [
@@ -3471,7 +3667,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         resumeGoalClock(target)
         pushHistory(target, "focused", "Brought into focus as the session's active goal.")
         focusGoal(sessionID, target)
-        await persist()
+        await persist(sessionID)
         output.parts = [
           makeTextPart(
             [
@@ -3511,10 +3707,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           output.parts = [makeTextPart(`A session may contain at most ${MAX_LIVE_GOALS_PER_SESSION} live goals.`)]
           return
         }
-        if (totalLiveGoals() >= MAX_PERSISTED_ENTRIES) {
-          output.parts = [makeTextPart(`The plugin may track at most ${MAX_PERSISTED_ENTRIES} live goals across sessions.`)]
-          return
-        }
         // Keep the current goal (background it) and focus a new one.
         const current = goalStates.get(sessionID)
         if (current) {
@@ -3531,7 +3723,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         )
         registerSessionGoal(added)
         focusGoal(sessionID, added)
-        await persist()
+        await persist(sessionID)
         const total = listSessionGoals(sessionID).length
         output.parts = [
           makeTextPart(
@@ -3551,10 +3743,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
 
       const replacedGoal = goalStates.get(sessionID)
-      if (!replacedGoal && totalLiveGoals() >= MAX_PERSISTED_ENTRIES) {
-        output.parts = [makeTextPart(`The plugin may track at most ${MAX_PERSISTED_ENTRIES} live goals across sessions.`)]
-        return
-      }
       const goal = buildGoalState(sessionID, parsed.condition, parsed.options, parsed.meta)
 
       pushHistory(
@@ -3573,7 +3761,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       lastGoalResults.delete(sessionID)
       registerSessionGoal(goal)
       focusGoal(sessionID, goal)
-      await persist()
+      await persist(sessionID)
       output.parts = [
         makeTextPart(
           [
@@ -3605,6 +3793,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
 
     event: async ({ event }) => {
+      const eventSessionID = getSessionID(event) || messageSessionID(messageInfoFromEvent(event))
+      if (eventSessionID) await ensureSessionLoaded(eventSessionID)
+
       if (event?.type === "session.status") {
         const sessionID = getSessionID(event)
         const status = event?.properties?.status?.type || event?.data?.status?.type
@@ -3641,7 +3832,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!goal) return
         goal.messageIDs = new Set()
         goal.totalTokens = 0
-        await persist()
+        await persist(sessionID)
         return
       }
 
@@ -3700,7 +3891,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           changed = true
         }
 
-        if (changed) await persist()
+        if (changed) await persist(messageSessionID(message))
         return
       }
 
@@ -3835,7 +4026,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 auditedGoal.stopReason = "audit rejected"
                 auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
                 pushHistory(auditedGoal, "audit-rejected", `Completion audit rejected: ${summarizeText(reason, 300)}`)
-                await persist()
+                await persist(sessionID)
                 await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
                 return
               }
@@ -3863,7 +4054,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             if (ordered) {
               promoteNextOrderedGoal(sessionID)
             }
-            const durable = await persistTerminalState("completion", ledgerDurable)
+            const durable = await persistTerminalState(sessionID, "completion", ledgerDurable)
             if (durable === false) {
               restoreAfterTerminalPersistenceFailure(sessionID, activeGoalAfterMessages, { ordered })
               await announceAudit(
@@ -3897,7 +4088,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             blockedGoal.stopped = true
             blockedGoal.stopReason = "blocked"
             const ledgerDurable = pushHistory(blockedGoal, "blocked", reason)
-            const durable = await persistTerminalState("blocked", ledgerDurable)
+            const durable = await persistTerminalState(sessionID, "blocked", ledgerDurable)
             if (durable === false) {
               blockedGoal.stopReason = "terminal persistence failed"
               blockedGoal.lastStatus = "Blocked state could not be persisted; goal remains paused."
@@ -3937,7 +4128,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             claimedGoal.stopReason = limitReason
             claimedGoal.lastStatus = `${limitReason}; requested final handoff.`
             pushHistory(claimedGoal, "limit", `${limitReason}; requested a final handoff.`)
-            await persist()
+            await persist(sessionID)
             currentRuntime().promptInFlightSessions.add(sessionID)
             let response
             try {
@@ -3958,7 +4149,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterMessages.lastStatus = limitReason
             pushHistory(activeGoalAfterMessages, "limit", limitReason)
           }
-          await persist()
+          await persist(sessionID)
           return
         }
 
@@ -4013,7 +4204,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               "paused",
               `Paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens.`,
             )
-            await persist()
+            await persist(sessionID)
             return
           }
 
@@ -4058,7 +4249,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               "paused",
               `Paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) that produced no tool calls.`,
             )
-            await persist()
+            await persist(sessionID)
             return
           }
 
@@ -4107,7 +4298,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // promptAsync doesn't cause a duplicate wrapup on resume. This mirrors
           // the hard-limit path which also persists before its promptAsync call.
           pushHistory(activeGoalBeforePrompt, "budget-wrapup", "Budget threshold reached; sending final handoff prompt.")
-          await persist()
+          await persist(sessionID)
         }
 
         activeGoalBeforePrompt.turnCount += 1
@@ -4147,7 +4338,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               "paused",
               `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s).`,
             )
-            await persist()
+            await persist(sessionID)
             return
           }
         }
@@ -4208,7 +4399,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             )
           }
         }
-        await persist()
+        await persist(sessionID)
       } catch (error) {
         const activeGoalAfterError = currentGoal(sessionID, goalID, runID)
         if (activeGoalAfterError) {
@@ -4228,7 +4419,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterError.stopReason = "auto-continue failures"
             activeGoalAfterError.lastStatus = `${message}; paused after ${activeGoalAfterError.promptFailures} failure(s). Run /${commandName} resume to retry.`
           }
-          await persist()
+          await persist(sessionID)
         }
         await logPluginError(client, "Auto-continue failed", error)
       } finally {
@@ -4245,6 +4436,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
+      await ensureSessionLoaded(input.sessionID)
 
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
@@ -4294,6 +4486,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     "experimental.session.compacting": async (input, output) => {
       if (!input?.sessionID || !output) return
+      await ensureSessionLoaded(input.sessionID)
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
       const context = buildCompactionContext(goal)
@@ -4313,6 +4506,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // auto-continue to avoid two continuations racing after a compaction.
       // Paused/stopped goals leave the native behavior untouched.
       if (!input?.sessionID || !output) return
+      await ensureSessionLoaded(input.sessionID)
       const goal = goalStates.get(input.sessionID)
       if (!goal || goal.stopped) return
       output.enabled = false
@@ -4334,7 +4528,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const toolModule = await loadOpencodePluginModule()
     if (toolModule?.tool?.schema) {
       try {
-        hooks.tool = buildAgentTools(toolModule.tool, agentToolHandlers)
+        hooks.tool = buildAgentTools(toolModule.tool, agentToolHandlers, ensureSessionLoaded)
       } catch (error) {
         await logPluginError(client, "Failed to register goal agent tools", error)
       }
@@ -4376,13 +4570,17 @@ function bindHooksToRuntime(hooks, runtime) {
     if (runtime.disposed) return
     runtime.disposed = true
     for (const controller of runtime.continuationControllers.values()) controller.abort()
-    await runtime.drainPersistence?.()
+    await Promise.allSettled([...runtime.sessionLoadPromises.values()])
+    for (const persistence of runtime.sessionPersistence.values()) {
+      await persistence.persistChain.catch(() => false)
+    }
     clearRuntimeState()
     setLedgerSink(null)
-    await runtime.persistenceLease?.release()
-    runtime.persistenceLease = null
-    await runtime.migrationLease?.release()
-    runtime.migrationLease = null
+    for (const persistence of runtime.sessionPersistence.values()) {
+      await persistence.lease?.release().catch(() => false)
+    }
+    runtime.sessionPersistence.clear()
+    runtime.sessionLoadPromises.clear()
   })
   return bound
 }
@@ -4396,11 +4594,13 @@ export const GoalPlugin = async (context = {}, pluginOptions = {}) => {
       return bindHooksToRuntime(hooks, runtime)
     } catch (error) {
       runtime.disposed = true
-      await runtime.drainPersistence?.()
-      await runtime.persistenceLease?.release().catch(() => false)
-      runtime.persistenceLease = null
-      await runtime.migrationLease?.release().catch(() => false)
-      runtime.migrationLease = null
+      await Promise.allSettled([...runtime.sessionLoadPromises.values()])
+      for (const persistence of runtime.sessionPersistence.values()) {
+        await persistence.persistChain.catch(() => false)
+        await persistence.lease?.release().catch(() => false)
+      }
+      runtime.sessionPersistence.clear()
+      runtime.sessionLoadPromises.clear()
       throw error
     }
   })
@@ -4457,6 +4657,7 @@ export const testInternals = {
   normalizeMessageUsage,
   normalizeUsage,
   normalizePersistenceOptions,
+  sessionPathsFor,
   userInterventionDetected,
   outputTokensForMessage,
   parseGoalArguments,

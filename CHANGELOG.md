@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Shard persisted goal state and lifecycle ledgers by hashed OpenCode session ID so independent sessions can run concurrently in one project. Keep same-session single-writer leases, lazy session loading, crash recovery, and safe migration of aggregate, legacy, and XDG state.
+
 ## 0.6.5 — 2026-07-12
 
 - Make `/goal sequence` the canonical ordered multi-goal command, retain the previous command and mode spelling as input-only compatibility aliases, correct the public auditor snapshot mode type to `"normal" | "ordered"`, and align README archive and compatibility claims with verified behavior.

@@ -10,6 +10,8 @@ The latest published release is the supported line. Public compatibility covers:
 - the documented OpenCode hook names
 - the six canonical goal tools and five legacy tool aliases
 - persisted-state recovery from versions documented in the changelog
+- concurrent persistence for distinct OpenCode sessions in one project, with
+  single-writer protection retained per session
 
 The package requires Node.js 18 or newer and OpenCode 1.17.15 through the latest
 compatible 1.x release. CI runs the complete unit suite on Node 18, 20, 22, and
