@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.6 — 2026-07-29
 
 - Shard persisted goal state and lifecycle ledgers by hashed OpenCode session ID so independent sessions can run concurrently in one project. Keep same-session single-writer leases, lazy session loading, crash recovery, and safe migration of aggregate, legacy, and XDG state.
 
