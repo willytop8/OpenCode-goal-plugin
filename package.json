@@ -55,14 +55,6 @@
     "agent",
     "goal"
   ],
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17.15 <2"
-  },
-  "peerDependenciesMeta": {
-    "@opencode-ai/plugin": {
-      "optional": true
-    }
-  },
   "license": "MIT",
   "engines": {
     "node": ">=18",
@@ -80,7 +72,9 @@
     "name": "willytop8"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.17.18",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
   }
 }

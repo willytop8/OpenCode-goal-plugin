@@ -14,7 +14,7 @@ artifact after all checks pass.
 
 `release:check` runs the unit and coverage suites, consumer type compilation,
 critical mutation contract, behavior benchmark, source and installed-artifact
-smoke tests, full optional-peer tool registration, and package-content check.
+smoke tests, clean-install default tool registration, and package-content check.
 
 ## Publish
 

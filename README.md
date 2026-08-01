@@ -38,7 +38,7 @@ surface and versioning expectations.
 
 Tested against real OpenCode 1.17.15 processes with live provider credentials and no mocked plugin hooks. State, ledger entries, and workspace files were checked independently of terminal or model prose:
 
-| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Hook Output Display |
+| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | v0.6.6 Hook Output Display |
 |---|---|---|---|---|---|
 | 1.17.15 | opencode (`deepseek-v4-flash-free`) | ✅ Canonical tool | ✅ Checkpoint + idle continuation | ✅ Structured `goal_complete` claim | ⚠️ Command text routed to model; mutation guard verified |
 | 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
@@ -47,7 +47,7 @@ Tested against real OpenCode 1.17.15 processes with live provider credentials an
 
 `/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
-**Note:** Hook output display depends on OpenCode version — on 1.17.15, `command.execute.before`'s `output.parts` text is not rendered in the TUI for any provider tested; the raw command argument is instead routed to the model as a normal chat turn (see [Limitations](#limitations)). State mutations always work regardless of display: goal creation, flag parsing, auto-continue, limit enforcement, and evidence-gated completion detection were all verified correct via the persisted state file in every combination above. Re-test against your own OpenCode build before relying on unattended runs, and see [`docs/providers.md`](docs/providers.md) for the full per-model marker-compliance notes.
+**Note:** The table records the v0.6.6 live-provider matrix. In that release, OpenCode 1.17.15 retained the original command-parts array, so assigning a new `output.parts` array did not replace the raw command argument sent to the model. The current implementation mutates that retained array in place, making the plugin-generated command result the prompt for the turn. OpenCode custom commands still run through the model rather than rendering hook output directly, so the visible response may summarize or paraphrase the result (see [Limitations](#limitations)). Re-test against the exact OpenCode build and provider/backend stack you rely on for unattended work, and see [`docs/providers.md`](docs/providers.md) for the full historical model matrix.
 
 ## Install
 
@@ -193,8 +193,8 @@ An ordered sequence, run as a strict pipeline:
 
 ## How it works
 
-1. When you set a goal, the plugin stores it in session memory and injects it into the system prompt so the assistant keeps it in view on every turn.
-2. Each time the session goes idle, the plugin sends a continuation prompt containing the goal, the remaining budget, and a completion audit asking the assistant to verify the current state before declaring done. Continuations retain the agent, provider/model, and variant that initiated the goal. Before sending after a cooldown, the plugin re-checks that the session is still idle and no human message, newer assistant turn, Plan-agent switch, rejected permission, abort, or provider error has superseded the request.
+1. When you set a goal, the plugin stores it in per-session state and replaces the custom-command turn with a plugin-generated work instruction containing that objective. On hosts that invoke `experimental.chat.system.transform`, it also reinforces the active goal in the system prompt; command correctness does not rely on that experimental hook.
+2. Each time the session goes idle, the plugin sends a continuation prompt containing the remaining budget and completion audit while the original goal remains in conversation history. Continuations retain the agent, provider/model, and variant that initiated the goal. Before sending after a cooldown, the plugin re-checks that the session is still idle and no human message, newer assistant turn, Plan-agent switch, rejected permission, abort, or provider error has superseded the request.
 3. The plugin stops auto-continuing when the assistant ends a response with a substantiated `[goal:complete]` or `[goal:blocked]`, or when a safety limit is reached. A `[goal:complete]` is only honored when it is preceded by a `[goal:evidence]` line; a `[goal:blocked]` is only honored when a concrete blocker is stated. Unsubstantiated claims are rejected and the plugin re-prompts for the missing evidence or blocker.
 4. If OpenCode compacts the session, the plugin injects a deterministic summary into the compaction context so the goal survives the compaction and the assistant keeps the thread. The summary — objective, status, budget usage, recent checkpoints, and recent lifecycle events — is reconstructed from the plugin's persisted goal record rather than from chat memory, so it is stable and reproducible. While a goal is active, the plugin also disables OpenCode's generic post-compaction auto-continue so it does not race the plugin's own continuation.
 5. If you send a message of your own while the goal is running, the plugin treats it as the latest instruction, pauses auto-continue, and asks OpenCode to abort an already accepted continuation so it does not talk over you. The plugin's own continuation prompts are ignored for this check (they are not "your" messages). A durable claim on the source assistant turn also prevents different idle event IDs from sending the same continuation twice. Run `/goal resume` to hand control back to the goal loop.
@@ -323,7 +323,7 @@ Additional plugin-level options:
 - `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `60000` ms, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier.
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
-- `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Requires the optional `@opencode-ai/plugin` peer dependency to be present; when it is absent, tool registration is skipped and the command/event hooks still work. Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools-optional).
+- `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
 - `registerAgents` — whether the config hook adds native `goal` and `goal-verify` agents (default `true`). Existing agents with those names are preserved unchanged; the plugin never changes your default agent.
 - `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with a default-deny tool policy; only `read`, `glob`, and `grep` are allowed.
 - `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
@@ -333,9 +333,9 @@ Additional plugin-level options:
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
 
-## Agent tools (optional)
+## Agent tools
 
-In addition to the `/goal` command, the plugin can expose the same workflow to the model as callable tools, so the agent can inspect and manage the goal itself. This requires the optional `@opencode-ai/plugin` peer dependency (it provides the `tool` helper and schema). When that package isn't installed the tools are simply not registered and everything else keeps working. Disable them explicitly with `registerTools: false`.
+In addition to the `/goal` command, the plugin registers the same workflow as callable model tools by default, so the agent can inspect and manage the goal itself. A normal `opencode-goal-plugin` install includes the schema dependency needed for these definitions; no separate OpenCode helper package is required. Disable the tool surface explicitly with `registerTools: false`.
 
 Registered tools:
 
@@ -346,7 +346,7 @@ Registered tools:
 
 These operate on the same per-session multi-goal state as the command path: a tool-set goal persists, shows up in `/goal list`, and is driven by the idle auto-continue; completing a goal in an ordered sequence auto-promotes the next.
 
-> Integration note: the tool execute-context shape (`ctx.sessionID`) and the `tool.schema` surface follow the OpenCode plugin docs. The tool **logic** is unit-tested independently, but the live registration should be confirmed against a real OpenCode run (see the smoke-test checklist).
+> Integration note: the tool execute-context shape (`ctx.sessionID`) and Zod argument definitions follow the OpenCode plugin docs. The tool **logic** is unit-tested independently, but live registration should still be confirmed against the exact OpenCode host used in production (see the smoke-test checklist).
 
 ## Audit messages
 
@@ -385,9 +385,13 @@ The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided
 
 The assistant still signals candidate outcomes with `[goal:complete]` or `[goal:blocked]`. Completion can additionally be checked by a custom `auditor` callback or the built-in child-session auditor before the goal becomes terminal. Marker quality therefore remains model-dependent when auditing is disabled, and audit quality depends on the configured verifier model and evidence available in the session. The built-in verifier performs static inspection with `read`, `glob`, and `grep`; it cannot execute shell commands.
 
-OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update. The plugin therefore guards `/goal status`, `/goal history`, `/goal list`, `/goal pause`, and `/goal clear` (including its aliases) with `tool.execute.before`: inspection tools remain available, while mutation-capable tools are rejected for that routed command turn. Paused goals also inject a system guard that omits the objective and requires an explicit resume before goal work continues.
+OpenCode custom commands are prompts, not direct plugin-rendered TUI responses. After `command.execute.before` runs, OpenCode sends its retained command-parts array through a normal model turn. The plugin mutates that array in place so the model receives the deterministic plugin-generated result instead of the raw `/goal` argument. The model still produces the visible response and may summarize or paraphrase that result.
 
-The plugin depends on `experimental.chat.system.transform` and other OpenCode plugin hooks that may change between OpenCode versions.
+Objective-bearing commands preserve file attachments. OpenCode may expand those files into synthetic Read/MCP text and file parts before `chat.message`; the plugin accepts that expansion only when it matches the one-shot command correlation, retained-file count, and generated message/session identity. Other mixed text is treated as a new human instruction and pauses an active loop. If OpenCode reports an attachment-read error during that expansion, the goal pauses with `attachment resolution error` while retaining the correct command provenance.
+
+For `/goal status`, `/goal history`, `/goal list`, `/goal pause`, and `/goal clear` (including aliases), the rewritten user turn carries an escaped control-result envelope with direct instructions to report the supplied data without treating it as new work. `tool.execute.before` rejects every tool call for that reporting turn, and the parent-correlated assistant response is excluded from checkpoint, completion, blocker, and stall analysis. These protections do not depend on the model following the reporting instruction.
+
+The plugin still registers `experimental.chat.system.transform` as defense in depth for hosts that invoke it. Real OpenCode 1.17.15 and 1.18.10 do not call that hook, so the command-control protections above are deliberately self-contained. Other OpenCode plugin hooks may change between versions.
 
 Distinct OpenCode sessions may own shards under the same `stateFilePath` concurrently. A second process using the same session shard is still rejected with the owning PID/host instead of risking last-writer-wins state loss; use the original session or wait for its owner to dispose.
 

@@ -282,9 +282,9 @@ export interface GoalPluginOptions {
    * (canonical `goal_status`, `goal_set`, `goal_pause`, `goal_resume`,
    * `goal_block`, `goal_complete`, plus legacy `get_goal`,
    * `get_goal_history`, `set_goal`, `update_goal`, `clear_goal`).
-   * Canonical tools return versioned JSON envelopes. Requires the optional `@opencode-ai/plugin` peer
-   * dependency; when it is absent, tool registration is silently skipped
-   * and the command/event hooks still work.
+   * Canonical tools return versioned JSON envelopes. The tools are registered
+   * by default from dependencies included with this package; set this to
+   * `false` to omit the tool surface.
    * @default true
    */
   registerTools?: boolean
@@ -348,9 +348,19 @@ export interface GoalPluginOptions {
 export interface GoalPluginHooks {
   /** Registers collision-safe native goal and verifier agents. */
   config: (config: unknown) => Promise<void>
-  /** Omitted entirely when {@link GoalPluginOptions.registerCommand} is `false`. */
+  /** Remembers the initiating agent, model, and variant for later continuation turns. */
+  "chat.params": (input: unknown) => Promise<void>
+  /** Distinguishes real user input from plugin-generated command and continuation messages. */
+  "chat.message": (input: unknown, output: unknown) => Promise<void>
+  /**
+   * Handles the configured OpenCode custom command by replacing its retained
+   * prompt parts in place. OpenCode still submits those parts as a model turn
+   * rather than rendering the hook result directly; handled control results
+   * include a self-contained reporting frame. Omitted entirely when
+   * {@link GoalPluginOptions.registerCommand} is `false`.
+   */
   "command.execute.before"?: (input: unknown, output: unknown) => Promise<void>
-  /** Enforces read-only tool behavior when inspection, pause, or clear command text is routed to the model. */
+  /** Blocks tool execution while an already-handled control-command result is being reported. */
   "tool.execute.before": (input: unknown, output: unknown) => Promise<void>
   event: (input: unknown) => Promise<void>
   "experimental.chat.system.transform": (input: unknown, output: unknown) => Promise<void>
@@ -358,8 +368,7 @@ export interface GoalPluginHooks {
   "experimental.session.compacting": (input: unknown, output: unknown) => Promise<void>
   /**
    * Agent-facing tool definitions, present only when
-   * {@link GoalPluginOptions.registerTools} is enabled (default) and the
-   * optional `@opencode-ai/plugin` peer dependency is installed.
+   * {@link GoalPluginOptions.registerTools} is enabled (default).
    */
   tool?: Record<string, unknown>
   /** Cancels pending continuation work and releases this plugin instance. */

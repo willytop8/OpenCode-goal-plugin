@@ -12,20 +12,23 @@ vary by provider and model:
    real safety net, not just documentation: a model that initially skips the
    evidence line gets one automatic correction cycle before hitting its
    turn/time/token budget.
-2. **Hook output display** — whether the plugin's own response text (e.g.
-   `No active goal. Set one with...`) is rendered in the OpenCode TUI, or
-   whether the raw command argument is instead routed to the model as a
-   normal chat turn. This is an OpenCode-host behavior, not model-specific,
-   but is included here since it's most visible while testing a new model.
-   See the [OpenCode version compatibility table](../README.md#opencode-version-compatibility)
-   in the README for the current findings.
+2. **Custom-command presentation** — OpenCode sends custom commands through a
+   normal model turn rather than directly rendering plugin-hook output. The
+   plugin now mutates OpenCode's retained command-parts array in place, so that
+   turn contains the deterministic plugin-generated result instead of raw
+   `$ARGUMENTS`. Control results include an escaped reporting frame, backed by
+   tool blocking and lifecycle suppression; the model may still summarize or
+   paraphrase the supplied data.
+   This is primarily host behavior, but it remains worth checking with each
+   provider/backend. See the [OpenCode version compatibility table](../README.md#opencode-version-compatibility)
+   for the historical v0.6.6 findings.
 
 All rows below were verified against real OpenCode processes with live
-provider credentials and no mocked plugin hooks on OpenCode 1.17.15, driving
-the plugin through `/goal status`, `/goal <condition> --max-turns N`, and
-inspecting the plugin's persisted state file to confirm state mutations
-(limit parsing, turn/stop accounting, evidence-gated completion detection)
-independent of what was rendered in the terminal.
+provider credentials and no mocked plugin hooks on OpenCode 1.17.15 before the
+in-place command-parts change. They drove the plugin through `/goal status`,
+`/goal <condition> --max-turns N`, and inspected the persisted state file to
+confirm state mutations (limit parsing, turn/stop accounting, evidence-gated
+completion detection) independent of what was rendered in the terminal.
 
 ## Tested models
 
@@ -64,9 +67,11 @@ Some backends (notably certain Qwen deployments on vLLM, and several
 Llama.cpp/Mistral chat templates) reject a `system` role message that isn't
 the very first message in the conversation, with an error like `"System
 message must be at the beginning."` opencode-goal-plugin's
-`experimental.chat.system.transform` hook merges the goal continuation block
-into the primary system entry instead of appending a separate one, which
-avoids this. This is covered by regression tests in
+`experimental.chat.system.transform` hook, on hosts that invoke it, merges the
+goal continuation block into the primary system entry instead of appending a
+separate one, which avoids this. OpenCode 1.17.15 and 1.18.10 do not invoke that
+experimental hook; command control on those releases uses the self-contained
+reporting frame described above. The merge behavior is covered by regression tests in
 [`test/goal-plugin.test.js`](../test/goal-plugin.test.js) and does not
 require any provider-specific configuration.
 
@@ -91,9 +96,10 @@ specific provider/model:
    before `[goal:complete]`. If not, confirm the plugin rejects it and
    re-prompts with `<evidence_required>` — then check whether the model
    self-corrects within its remaining turn budget, or exhausts it.
-5. Run `/goal status` and check whether the plugin's text (e.g. `No active
-   goal...` or `Active goal: ...`) is rendered directly, or whether the
-   command text was instead routed to the model as a chat turn.
+5. Run `/goal status` and confirm the model turn reports the plugin-generated
+   status rather than interpreting the raw word `status` as a new request.
+   The final wording may be summarized or paraphrased because OpenCode custom
+   commands still run through the selected model.
 6. Cross-check state mutations directly against the persisted state file
    (`.opencode/goals/state.json`, project-local by default) to confirm the
    goal's `options` reflect the flags you passed and `state`/`stopReason`

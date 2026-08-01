@@ -12,6 +12,30 @@ const projectDirectory = join(root, "host-project")
 const cacheDirectory = join(root, "npm-cache")
 const npmEnvironment = { ...process.env, npm_config_cache: cacheDirectory }
 
+function execNpm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options)
+  }
+  if (process.platform === "win32") {
+    return execFileSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], options)
+  }
+  return execFileSync("npm", args, options)
+}
+
+const expectedTools = [
+  "clear_goal",
+  "get_goal",
+  "get_goal_history",
+  "goal_block",
+  "goal_complete",
+  "goal_pause",
+  "goal_resume",
+  "goal_set",
+  "goal_status",
+  "set_goal",
+  "update_goal",
+]
+
 try {
   await Promise.all([
     mkdir(packDirectory, { recursive: true }),
@@ -24,8 +48,7 @@ try {
   )
 
   const packResult = JSON.parse(
-    execFileSync(
-      "npm",
+    execNpm(
       ["pack", "--json", "--pack-destination", packDirectory],
       { cwd: repository, encoding: "utf8", env: npmEnvironment },
     ),
@@ -33,18 +56,16 @@ try {
   assert.equal(packResult.length, 1)
   const tarball = join(packDirectory, packResult[0].filename)
 
-  // Install only the artifact npm produced. The optional peer is omitted so this
-  // contract test is offline-safe and cannot mutate the user's OpenCode install.
-  execFileSync(
-    "npm",
+  // Install only the artifact npm produced. A fresh cache forces npm to resolve
+  // every runtime dependency declared by that artifact instead of borrowing the
+  // repository's development dependency tree.
+  execNpm(
     [
       "install",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
       "--no-package-lock",
-      "--omit=peer",
-      "--offline",
       "--cache",
       cacheDirectory,
       tarball,
@@ -71,6 +92,7 @@ try {
   assert.equal(installed.default.server, installed.GoalPlugin)
 
   const sessionID = "packed-host-contract"
+  const commandMessageID = "command-packed-contract"
   const promptCalls = []
   const client = {
     app: { log: async () => {} },
@@ -82,6 +104,7 @@ try {
               id: "assistant-packed-contract",
               role: "assistant",
               sessionID: path.id,
+              parentID: commandMessageID,
               tokens: { input: 1, output: 1, reasoning: 0 },
             },
             parts: [{ type: "text", text: "Work remains." }],
@@ -98,7 +121,6 @@ try {
     { client, directory: projectDirectory },
     {
       persistState: false,
-      registerTools: false,
       minDelayMs: 1,
       noToolCallTurnsBeforePause: 10,
     },
@@ -106,6 +128,8 @@ try {
 
   for (const hook of [
     "config",
+    "chat.params",
+    "chat.message",
     "command.execute.before",
     "tool.execute.before",
     "event",
@@ -116,17 +140,44 @@ try {
   ]) {
     assert.equal(typeof hooks[hook], "function", `${hook} must be callable`)
   }
+  assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), expectedTools)
+  for (const name of expectedTools) {
+    assert.equal(typeof hooks.tool[name].execute, "function", `${name} must be executable`)
+  }
   const config = {}
   await hooks.config(config)
   assert.equal(config.agent.goal.mode, "primary")
   assert.equal(config.agent["goal-verify"].tools.edit, false)
 
-  const output = { parts: [] }
+  const hostParts = [{ type: "text", text: "verify the installed artifact --max-turns 1" }]
+  const output = {
+    message: { id: commandMessageID, role: "user", sessionID },
+    parts: hostParts,
+  }
   await hooks["command.execute.before"](
     { command: "goal", sessionID, arguments: "verify the installed artifact --max-turns 1" },
     output,
   )
-  assert.match(output.parts[0]?.text, /New active goal/)
+  assert.strictEqual(output.parts, hostParts)
+  assert.match(hostParts[0]?.text, /New active goal/)
+  assert.equal(hostParts[0]?.synthetic, true)
+  assert.equal(hostParts[0]?.metadata?.["opencode-goal-plugin"]?.kind, "command")
+  assert.match(hostParts[0]?.metadata?.["opencode-goal-plugin"]?.id, /^[0-9a-f-]{36}$/)
+  output.parts = hostParts.map((part, index) => ({
+    ...part,
+    id: `part-packed-contract-${index}`,
+    messageID: commandMessageID,
+    sessionID,
+  }))
+  await hooks["chat.message"](
+    {
+      sessionID,
+      messageID: commandMessageID,
+      agent: "build",
+      model: { providerID: "test", modelID: "test" },
+    },
+    output,
+  )
 
   // Let the configured throttle window elapse before idle. This avoids leaving
   // the contract dependent on the host's event-loop/timer shutdown behavior.
@@ -145,9 +196,14 @@ try {
   // flattened v2 clients separately.
   assert.deepEqual(promptCalls[0].path, { id: sessionID })
   assert.equal(promptCalls[0].body.parts.length, 1)
-  assert.deepEqual(promptCalls[0].body.parts[0].metadata, {
-    "opencode-goal-plugin": { kind: "continuation" },
-  })
+  assert.equal(
+    promptCalls[0].body.parts[0].metadata?.["opencode-goal-plugin"]?.kind,
+    "continuation",
+  )
+  assert.match(
+    promptCalls[0].body.parts[0].metadata?.["opencode-goal-plugin"]?.id,
+    /^[0-9a-f-]{36}$/,
+  )
   assert.equal(promptCalls[0].body.parts[0].synthetic, true)
 
   await hooks.dispose()
