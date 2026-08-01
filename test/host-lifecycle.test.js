@@ -218,9 +218,8 @@ test("plugin continuation prompt is synthetic and carries namespaced metadata", 
   const part = promptCalls[0].body.parts[0]
   assert.equal(part.type, "text")
   assert.equal(part.synthetic, true)
-  assert.deepEqual(part.metadata, {
-    "opencode-goal-plugin": { kind: "continuation" },
-  })
+  assert.equal(part.metadata["opencode-goal-plugin"].kind, "continuation")
+  assert.match(part.metadata["opencode-goal-plugin"].id, /^[0-9a-f-]{36}$/)
 })
 
 test("dispose prevents a delayed idle continuation from reaching the host", async () => {

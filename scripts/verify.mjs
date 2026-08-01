@@ -8,12 +8,28 @@ import assert from "node:assert/strict"
 
 const REQUIRED_HOOKS = [
   "config",
+  "chat.params",
+  "chat.message",
   "command.execute.before",
   "tool.execute.before",
   "event",
   "experimental.chat.system.transform",
   "experimental.compaction.autocontinue",
   "experimental.session.compacting",
+]
+
+const EXPECTED_TOOLS = [
+  "clear_goal",
+  "get_goal",
+  "get_goal_history",
+  "goal_block",
+  "goal_complete",
+  "goal_pause",
+  "goal_resume",
+  "goal_set",
+  "goal_status",
+  "set_goal",
+  "update_goal",
 ]
 
 const results = []
@@ -70,11 +86,9 @@ const client = {
 }
 
 let hooks
+let commandMessageCounter = 0
 
 await check(`plugin initializes and registers all ${REQUIRED_HOOKS.length} required hooks`, async () => {
-  // registerTools defaults to true but silently no-ops without the optional
-  // @opencode-ai/plugin peer dependency, so it is not asserted here — the
-  // These hooks are always present regardless of that peer dependency.
   hooks = await GoalPlugin({ client }, { minDelayMs: 1, persistState: false })
   for (const hookName of REQUIRED_HOOKS) {
     assert.equal(
@@ -83,16 +97,42 @@ await check(`plugin initializes and registers all ${REQUIRED_HOOKS.length} requi
       `missing or non-function hook: ${hookName}`,
     )
   }
+  assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), EXPECTED_TOOLS)
+  for (const name of EXPECTED_TOOLS) {
+    assert.equal(typeof hooks.tool[name].execute, "function", `${name} must be executable`)
+  }
 })
 
 async function runGoalCommand(args) {
-  const output = { parts: [] }
+  // Match OpenCode's host contract: it retains this exact array after the hook
+  // returns, so replacing output.parts would leave the raw command untouched.
+  const hostParts = [{ type: "text", text: args }]
+  commandMessageCounter += 1
+  const messageID = `verify-command-${commandMessageCounter}`
+  const output = {
+    message: { id: messageID, role: "user", sessionID },
+    parts: hostParts,
+  }
   await hooks["command.execute.before"](
     { command: "goal", sessionID, arguments: args },
     output,
   )
-  assert.equal(output.parts.length, 1)
-  assert.equal(output.parts[0].type, "text")
+  assert.strictEqual(output.parts, hostParts)
+  assert.equal(hostParts.length, 1)
+  assert.equal(hostParts[0].type, "text")
+  assert.equal(hostParts[0].synthetic, true)
+  assert.equal(hostParts[0].metadata?.["opencode-goal-plugin"]?.kind, "command")
+  assert.match(hostParts[0].metadata?.["opencode-goal-plugin"]?.id, /^[0-9a-f-]{36}$/)
+  output.parts = hostParts.map((part, index) => ({
+    ...part,
+    id: `verify-command-part-${commandMessageCounter}-${index}`,
+    messageID,
+    sessionID,
+  }))
+  await hooks["chat.message"](
+    { sessionID, messageID, agent: "build", model: { providerID: "test", modelID: "test" } },
+    output,
+  )
   return output.parts[0].text
 }
 
@@ -106,6 +146,7 @@ await check("/goal set works", async () => {
   assert.match(text, /New active goal: verify the installation/)
   const statusText = await runGoalCommand("status")
   assert.match(statusText, /Active goal: verify the installation/)
+  assert.doesNotMatch(statusText, /State: Paused/)
 })
 
 await check("no model calls were made during verification", () => {

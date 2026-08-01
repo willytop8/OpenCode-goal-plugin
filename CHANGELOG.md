@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fix `/goal` routing on OpenCode 1.17.15 and 1.18.10 by replacing the host-retained prompt parts in place, authenticating each resolved command turn (including host-expanded file attachments), framing control results with direct reporting instructions, blocking tools during those reporting turns, and excluding control responses from goal completion and progress analysis. Unreadable command attachments now become read-only error reports and pause safely without losing command provenance.
+- Register all 11 agent-facing goal tools in a standard clean install through the package's direct Zod dependency; a separate optional `@opencode-ai/plugin` install is no longer required.
+
 ## 0.6.6 — 2026-07-29
 
 - Shard persisted goal state and lifecycle ledgers by hashed OpenCode session ID so independent sessions can run concurrently in one project. Keep same-session single-writer leases, lazy session loading, crash recovery, and safe migration of aggregate, legacy, and XDG state.

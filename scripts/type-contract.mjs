@@ -14,6 +14,16 @@ const cacheDirectory = join(root, "npm-cache")
 const npmEnvironment = { ...process.env, npm_config_cache: cacheDirectory }
 const tsc = join(repositoryPath, "node_modules", "typescript", "bin", "tsc")
 
+function execNpm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options)
+  }
+  if (process.platform === "win32") {
+    return execFileSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], options)
+  }
+  return execFileSync("npm", args, options)
+}
+
 const fixture = `
 import goalPlugin, {
   GoalPlugin,
@@ -67,6 +77,8 @@ const options = {
 const hooks: GoalPluginHooks = await GoalPlugin({ client: {}, directory: "/tmp" }, options)
 hooks.config({})
 hooks.event({})
+hooks["chat.params"]({})
+hooks["chat.message"]({}, {})
 hooks["experimental.chat.system.transform"]({}, {})
 hooks["tool.execute.before"]({}, {})
 hooks["experimental.compaction.autocontinue"]({}, {})
@@ -94,16 +106,14 @@ try {
   await writeFile(join(consumerDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
   await writeFile(join(consumerDirectory, "contract.ts"), fixture)
 
-  const packResult = JSON.parse(execFileSync(
-    "npm",
+  const packResult = JSON.parse(execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },
   ))
   assert.equal(packResult.length, 1)
   const tarball = join(packDirectory, packResult[0].filename)
-  execFileSync(
-    "npm",
-    ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=peer", "--offline", "--cache", cacheDirectory, tarball],
+  execNpm(
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--cache", cacheDirectory, tarball],
     { cwd: consumerDirectory, stdio: "pipe", env: npmEnvironment },
   )
 

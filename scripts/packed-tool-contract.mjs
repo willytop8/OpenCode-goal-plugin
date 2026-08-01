@@ -11,9 +11,16 @@ const packDirectory = join(root, "pack")
 const projectDirectory = join(root, "consumer")
 const cacheDirectory = join(root, "npm-cache")
 const npmEnvironment = { ...process.env, npm_config_cache: cacheDirectory }
-const sourceManifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
-const peerVersion = sourceManifest.devDependencies?.["@opencode-ai/plugin"]
-assert.match(peerVersion ?? "", /^\d+\.\d+\.\d+$/, "a pinned @opencode-ai/plugin devDependency is required")
+
+function execNpm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options)
+  }
+  if (process.platform === "win32") {
+    return execFileSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], options)
+  }
+  return execFileSync("npm", args, options)
+}
 
 const expectedTools = [
   "clear_goal",
@@ -37,17 +44,15 @@ try {
   ])
   await writeFile(join(projectDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
 
-  const packResult = JSON.parse(execFileSync(
-    "npm",
+  const packResult = JSON.parse(execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },
   ))
   assert.equal(packResult.length, 1)
   const tarball = join(packDirectory, packResult[0].filename)
 
-  execFileSync(
-    "npm",
-    ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--cache", cacheDirectory, tarball, `@opencode-ai/plugin@${peerVersion}`],
+  execNpm(
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--cache", cacheDirectory, tarball],
     { cwd: projectDirectory, stdio: "pipe", env: npmEnvironment },
   )
 

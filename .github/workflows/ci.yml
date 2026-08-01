@@ -90,3 +90,12 @@ jobs:
         run: npm ci
       - name: Run portable lifecycle and filesystem tests
         run: node --test test/host-lifecycle.test.js test/persistence-lease.test.js test/public-hook-cancellation.test.js
+      - name: Compile installed-package type contracts on Windows
+        if: runner.os == 'Windows'
+        run: npm run type:check
+      - name: Verify installed tarball host contract on Windows
+        if: runner.os == 'Windows'
+        run: npm run smoke:packed-host
+      - name: Verify installed tarball tool contract on Windows
+        if: runner.os == 'Windows'
+        run: npm run smoke:packed-tools
