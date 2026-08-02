@@ -1788,9 +1788,22 @@ async function migrateLegacyState(persistenceOptions, client) {
   }
 
   // A fresh project has no aggregate or legacy state. Mark the namespace so a
-  // later session does not repeatedly probe global fallback paths.
+  // later session does not repeatedly probe global fallback paths. Separate
+  // session processes must still serialize this shared marker: POSIX rename
+  // replaces an existing destination, while Windows can reject that race.
   if (currentRuntime().disposed) return
-  await writeMigrationMarker(persistenceOptions.migrationMarkerPath)
+  const freshMigrationLease = await acquireMigrationLease(
+    persistenceOptions.stateFilePath,
+    persistenceOptions.migrationMarkerPath,
+  )
+  if (!freshMigrationLease) return
+  try {
+    if (currentRuntime().disposed) return
+    if (await pathExists(persistenceOptions.migrationMarkerPath)) return
+    await writeMigrationMarker(persistenceOptions.migrationMarkerPath)
+  } finally {
+    await freshMigrationLease.release()
+  }
 }
 
 async function loadPersistedSessionState(persistence, client, sessionID) {

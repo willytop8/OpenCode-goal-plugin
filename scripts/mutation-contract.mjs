@@ -267,6 +267,20 @@ const mutants = [
     test: "test/goal-plugin.test.js",
   },
   {
+    name: "fresh migration markers require aggregate lease ownership",
+    file: "src/goal-plugin.js",
+    from: "  const freshMigrationLease = await acquireMigrationLease(\n    persistenceOptions.stateFilePath,\n    persistenceOptions.migrationMarkerPath,\n  )",
+    to: "  const freshMigrationLease = { release: async () => false }",
+    test: "test/session-concurrency.test.js",
+  },
+  {
+    name: "fresh migration marker leases are released",
+    file: "src/goal-plugin.js",
+    from: "    await freshMigrationLease.release()",
+    to: "    await Promise.resolve()",
+    test: "test/session-concurrency.test.js",
+  },
+  {
     name: "disposed command continuations cannot mutate state",
     file: "src/goal-plugin.js",
     from: "      const loadResult = await ensureSessionLoaded(sessionID, {\n        retryPassive: true,\n        freshCommandBoundary: true,\n      })\n      if (currentRuntime().disposed || loadResult.kind === \"disposed\") return\n      const commandTurn = registerPendingCommandTurn(sessionID, output)",
