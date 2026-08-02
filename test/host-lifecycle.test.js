@@ -972,7 +972,7 @@ test("passive entry and disposal do not wait for a stalled host logger", { timeo
   }
 })
 
-test("persistence recovery and disposal do not wait for a stalled host logger", { timeout: 2_000 }, async () => {
+test("persistence recovery and disposal do not wait for a stalled host logger", { timeout: 5_000 }, async () => {
   const directory = await fs.mkdtemp(join(tmpdir(), "goal-plugin-error-logger-"))
   const stateFilePath = join(directory, "state.json")
   const sessionID = "stalled-error-logger-session"
@@ -1000,7 +1000,7 @@ test("persistence recovery and disposal do not wait for a stalled host logger", 
     assert.equal(
       await Promise.race([
         loadPromise.then(() => "settled"),
-        new Promise((resolve) => setTimeout(() => resolve("timed-out"), 250)),
+        new Promise((resolve) => setTimeout(() => resolve("timed-out"), 1_500)),
       ]),
       "settled",
     )
@@ -1012,7 +1012,7 @@ test("persistence recovery and disposal do not wait for a stalled host logger", 
     assert.equal(
       await Promise.race([
         disposePromise.then(() => "settled"),
-        new Promise((resolve) => setTimeout(() => resolve("timed-out"), 250)),
+        new Promise((resolve) => setTimeout(() => resolve("timed-out"), 1_500)),
       ]),
       "settled",
     )

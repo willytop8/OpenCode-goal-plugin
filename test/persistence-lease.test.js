@@ -135,7 +135,8 @@ test("persistence lease rejects a concurrent owner and releases by token", async
     assert.equal(Object.isFrozen(error.owner), true)
     assert.equal(error.reason, "owned_elsewhere")
     assert.equal("token" in error.owner, false)
-    assert.doesNotMatch(error.message, /state\.json|[0-9a-f]{8}-[0-9a-f-]{27}/i)
+    assert.doesNotMatch(error.message, /state\.json/i)
+    assert.equal(error.message.includes(first.owner.token), false)
     return true
   })
   const sentinelBeforeRelease = await readFile(`${state}.lock`, "utf8")
