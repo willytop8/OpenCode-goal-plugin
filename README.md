@@ -39,7 +39,7 @@ surface and versioning expectations.
 
 Tested against real OpenCode 1.17.15 processes with live provider credentials and no mocked plugin hooks. State, ledger entries, and workspace files were checked independently of terminal or model prose:
 
-| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | v0.6.6 Hook Output Display |
+| OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Historical custom-command presentation (v0.6.6) |
 |---|---|---|---|---|---|
 | 1.17.15 | opencode (`deepseek-v4-flash-free`) | ✅ Canonical tool | ✅ Checkpoint + idle continuation | ✅ Structured `goal_complete` claim | ⚠️ Command text routed to model; mutation guard verified |
 | 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
@@ -49,6 +49,8 @@ Tested against real OpenCode 1.17.15 processes with live provider credentials an
 `/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
 **Note:** The table records the v0.6.6 live-provider matrix. In that release, OpenCode 1.17.15 retained the original command-parts array, so assigning a new `output.parts` array did not replace the raw command argument sent to the model. The current implementation mutates that retained array in place, making the plugin-generated command result the prompt for the turn. OpenCode custom commands still run through the model rather than rendering hook output directly, so the visible response may summarize or paraphrase the result (see [Limitations](#limitations)). Re-test against the exact OpenCode build and provider/backend stack you rely on for unattended work, and see [`docs/providers.md`](docs/providers.md) for the full historical model matrix.
+
+Separately, the lifecycle-feedback implementation included in v0.7.0 passed a real OpenCode 1.18.11 host canary covering create, status, pause, resume, edit, and default lifecycle logging with a deterministic localhost provider. That canary validates host integration, not another live-provider compatibility row.
 
 ## Install
 
