@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.8 — 2026-08-01
 
 - Keep a second OpenCode process usable when it opens a session whose goal-state shard is already leased: ordinary chat and unrelated tools remain available, while goal commands and tools fail safely without reading, changing, or prompting from that session's goal state. After the owner exits, the next explicit goal command or tool retries ownership and reloads any active goal paused. Lease contention is now typed and owner metadata is sanitized; unrelated filesystem failures still fail closed.
 - Harden the single-writer lease with immutable per-owner claims so delayed publication, simultaneous stale reclaim, and concurrent release cannot remove a replacement owner's lease. A complete compatibility guard is published atomically with no replacement, preventing old/current startup races; legacy, incomplete, tampered, or unsupported lease layouts fail closed for explicit manual recovery. Owner reads remain bounded and symlink-safe, slow passive command guards keep blocking tools until an authenticated new boundary, delayed control errors cannot pause a newer goal run, takeover retains Plan/model execution context, and advisory host logging cannot stall loading or disposal.
