@@ -38,8 +38,15 @@ const mutants = [
   {
     name: "terminal completion requires durable storage",
     file: "src/goal-plugin.js",
-    from: "if (durable === false) {\n          restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered })",
-    to: "if (false) {\n          restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered })",
+    from: 'const durable = await persistFinal(sessionID, "completion", ledgerDurable)\n        if (durable === false) {',
+    to: 'const durable = await persistFinal(sessionID, "completion", ledgerDurable)\n        if (false) {',
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "terminal rollback detects same-session mutation without cross-session coupling",
+    file: "src/goal-plugin.js",
+    from: "if ((sessionMutationVersions.get(sessionID) || 0) !== snapshot?.mutationVersion) return false",
+    to: "if (false) return false",
     test: "test/goal-plugin.test.js",
   },
   {

@@ -65,6 +65,8 @@ const options = {
   auditorOptions: { timeoutMs: 5_000, failurePolicy: "reject" },
   auditMessages: true,
   auditMessenger: (_sessionID, _text) => {},
+  lifecycleMessages: true,
+  lifecycleMessenger: (_sessionID, _text) => {},
   auditor: async ({ goal, sessionID, latestText }: CompletionAuditContext) => {
     const mode: "normal" | "ordered" = goal.mode
     return {
@@ -73,6 +75,10 @@ const options = {
     }
   },
 } satisfies GoalPluginOptions
+
+// @ts-expect-error lifecycleMessages must be boolean
+const invalidLifecycleMessages: GoalPluginOptions = { lifecycleMessages: "yes" }
+void invalidLifecycleMessages
 
 const hooks: GoalPluginHooks = await GoalPlugin({ client: {}, directory: "/tmp" }, options)
 hooks.config({})

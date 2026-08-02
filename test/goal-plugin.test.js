@@ -23,11 +23,14 @@ const {
   budgetWrapupNeeded,
   currentGoal,
   defaultAuditMessenger,
+  defaultLifecycleMessenger,
   escapeGoalText,
   extractBlockedReason,
   extractCompletionEvidence,
+  formatGoalList,
   formatStatus,
   getSessionID,
+  goalDisplayState,
   goalIsBlocked,
   goalIsComplete,
   isIdleEvent,
@@ -2631,6 +2634,53 @@ test("resume after a limit stop starts a fresh local budget", async () => {
   assert.equal(calls.length, 3)
 })
 
+test("hard-limit lifecycle notice is visible before the final-handoff prompt resolves", async () => {
+  let promptCount = 0
+  let signalFinalPrompt
+  let releaseFinalPrompt
+  const finalPromptStarted = new Promise((resolve) => { signalFinalPrompt = resolve })
+  const finalPromptGate = new Promise((resolve) => { releaseFinalPrompt = resolve })
+  const lifecycle = []
+  const sessionID = "hard-limit-notice-order"
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("still working", undefined, `msg-hard-limit-${promptCount}`, sessionID)],
+    }),
+    promptAsync: async () => {
+      promptCount += 1
+      if (promptCount === 2) {
+        signalFinalPrompt()
+        await finalPromptGate
+      }
+      return {}
+    },
+    options: {
+      minDelayMs: 1,
+      maxTurns: 1,
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+
+  await runGoal(hooks, sessionID, "ship it")
+  lifecycle.length = 0
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  const finalIdle = hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  try {
+    await finalPromptStarted
+    assert.equal(currentGoal(sessionID).stopped, true)
+    assert.match(currentGoal(sessionID).stopReason, /max turns/)
+    assert.equal(lifecycle.filter((text) => /max turns.*final handoff/i.test(text)).length, 1)
+  } finally {
+    releaseFinalPrompt()
+    await finalIdle
+  }
+  assert.equal(lifecycle.filter((text) => /max turns.*final handoff/i.test(text)).length, 1)
+})
+
 test("/goal pause stops auto-continue until resumed", async () => {
   const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
   await hooks["command.execute.before"](
@@ -3167,6 +3217,8 @@ test("formatStatus includes all key fields", () => {
   }
   const status = formatStatus(goal)
   assert.match(status, /Active goal: ship it/)
+  assert.match(status, /State: blocked/)
+  assert.match(status, /Completion audit: evidence gate only \(independent verifier off\)/)
   assert.match(status, /Auto-continues sent: 3\/10/)
   assert.match(status, /Context tokens:/)
   assert.match(status, /Elapsed:/)
@@ -3174,6 +3226,56 @@ test("formatStatus includes all key fields", () => {
   assert.match(status, /Recent checkpoint:/)
   assert.match(status, /Blocked reason: Need API key/)
   assert.match(status, /Suggested action: address the blocker, then run \/goal resume/)
+})
+
+test("goalDisplayState and formatStatus distinguish active, paused, and blocked goals", () => {
+  const base = {
+    condition: "ship it",
+    turnCount: 0,
+    options: normalizeOptions(),
+    totalTokens: 0,
+    startedAt: Date.now(),
+    lastProgressAt: Date.now(),
+    noProgressTurns: 0,
+    lastStatus: "Goal started.",
+    stopped: false,
+    stopReason: "",
+    blockedReason: "",
+  }
+  const paused = { ...base, stopped: true, stopReason: "paused by user" }
+  const blocked = {
+    ...base,
+    stopped: true,
+    stopReason: "blocked",
+    blockedReason: "Need approval",
+  }
+
+  assert.equal(goalDisplayState(base), "active")
+  assert.equal(goalDisplayState(paused), "paused")
+  assert.equal(goalDisplayState(blocked), "blocked")
+  assert.match(formatStatus(base), /State: active/)
+  assert.match(formatStatus(paused), /State: paused/)
+  assert.match(formatStatus(blocked), /State: blocked/)
+  assert.match(formatStatus(base, "goal", "built-in independent verifier"), /Completion audit: built-in independent verifier/)
+  assert.match(formatStatus(base, "goal", "custom completion auditor"), /Completion audit: custom completion auditor/)
+})
+
+test("/goal status reports the configured completion-audit mechanism", async () => {
+  const builtIn = await createHooks({ options: { completionAudit: true } })
+  await runGoal(builtIn.hooks, "status-audit-built-in", "ship it")
+  assert.match(
+    await runGoal(builtIn.hooks, "status-audit-built-in", "status"),
+    /Completion audit: built-in independent verifier/,
+  )
+
+  const custom = await createHooks({
+    options: { auditor: async () => ({ approved: true }) },
+  })
+  await runGoal(custom.hooks, "status-audit-custom", "ship it")
+  assert.match(
+    await runGoal(custom.hooks, "status-audit-custom", "status"),
+    /Completion audit: custom completion auditor/,
+  )
 })
 
 test("/goal history shows lifecycle events and the latest checkpoint", async () => {
@@ -3209,6 +3311,7 @@ test("/goal history shows lifecycle events and the latest checkpoint", async () 
 test("persisted running goals are recovered in paused state after restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
   const stateFilePath = join(dir, "state.json")
+  const lifecycle = []
 
   try {
     const client = {
@@ -3221,7 +3324,12 @@ test("persisted running goals are recovered in paused state after restart", asyn
 
     const hooks = await GoalPlugin(
       { client },
-      { persistState: true, stateFilePath, minDelayMs: 1 },
+      {
+        persistState: true,
+        stateFilePath,
+        minDelayMs: 1,
+        lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+      },
     )
     await hooks["command.execute.before"](
       { command: "goal", sessionID: "session-persist", arguments: "ship it" },
@@ -3236,10 +3344,16 @@ test("persisted running goals are recovered in paused state after restart", asyn
       true,
     )
     await hooks.dispose()
+    lifecycle.length = 0
 
     const recoveredHooks = await GoalPlugin(
       { client },
-      { persistState: true, stateFilePath, minDelayMs: 1 },
+      {
+        persistState: true,
+        stateFilePath,
+        minDelayMs: 1,
+        lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+      },
     )
     await recoveredHooks["command.execute.before"](
       { command: "goal", sessionID: "session-persist", arguments: "status" },
@@ -3255,6 +3369,8 @@ test("persisted running goals are recovered in paused state after restart", asyn
       statusOutput,
     )
     assert.match(statusOutput.parts[0].text, /Recovered persisted goal state/)
+    assert.equal(lifecycle.length, 1)
+    assert.match(lifecycle[0], /Goal recovered and paused/i)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -5134,8 +5250,8 @@ test("/goal list shows numbered live goals and archived results", async () => {
   await runGoal(hooks, sid, "add beta")
   const listText = await runGoal(hooks, sid, "list")
   assert.match(listText, /Goals \(2\):/)
-  assert.match(listText, /\[focused\] beta/)
-  assert.match(listText, /\[background\] alpha/)
+  assert.match(listText, /\[focused\] beta.*state: active/)
+  assert.match(listText, /\[background\] alpha.*state: paused.*backgrounded/)
 
   // The first idle belongs to the routed list response: it resumes the loop but
   // must not treat that control response as goal progress or completion.
@@ -5150,6 +5266,32 @@ test("/goal list shows numbered live goals and archived results", async () => {
   const afterList = await runGoal(hooks, sid, "list")
   assert.match(afterList, /Archived \(1, newest last\):/)
   assert.match(afterList, /\[achieved\] beta/)
+})
+
+test("/goal list shows the focused goal's paused or blocked state and reason", async () => {
+  const paused = await createHooks()
+  const pausedSessionID = "multi-focused-paused"
+  await runGoal(paused.hooks, pausedSessionID, "ship it")
+  await runGoal(paused.hooks, pausedSessionID, "pause")
+
+  const pausedList = await runGoal(paused.hooks, pausedSessionID, "list")
+  assert.match(pausedList, /\[focused\] ship it.*state: paused.*\(paused\)/)
+
+  const blocked = await createHooks({
+    messages: async () => ({ data: [message("Need approval.\n[goal:blocked]")] }),
+    options: { minDelayMs: 1 },
+  })
+  const blockedSessionID = "multi-focused-blocked"
+  await runGoal(blocked.hooks, blockedSessionID, "ship it")
+  await blocked.hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: blockedSessionID, status: { type: "idle" } },
+    },
+  })
+
+  const blockedList = await runGoal(blocked.hooks, blockedSessionID, "list")
+  assert.match(blockedList, /\[focused\] ship it.*state: blocked.*Need approval/)
 })
 
 test("/goal focus switches the active goal and backgrounds the prior one", async () => {
@@ -5418,7 +5560,281 @@ test("completed archives survive a persistence round-trip", async () => {
   }
 })
 
-// ── Visible audit messages ─────────────────────────────────────────────────
+// ── Visible lifecycle and audit messages ───────────────────────────────────
+
+test("slash-command lifecycle messages cover transitions without leaking goal text or spamming queries", async () => {
+  const lifecycle = []
+  const { hooks } = await createHooks({
+    options: {
+      minDelayMs: 1,
+      lifecycleMessenger: async (sessionID, text) => lifecycle.push({ sessionID, text }),
+    },
+  })
+  const sid = "lifecycle-slash-s1"
+  const privateObjective = "ship private customer ACME-SECRET"
+
+  await runGoal(hooks, sid, privateObjective)
+  assert.equal(lifecycle.length, 1)
+  assert.match(lifecycle[0].text, /Goal (?:active|started)/i)
+  assert.doesNotMatch(lifecycle[0].text, /ACME-SECRET/)
+
+  const afterStart = lifecycle.length
+  await runGoal(hooks, sid, "status")
+  await runGoal(hooks, sid, "list")
+  await runGoal(hooks, sid, "history")
+  assert.equal(lifecycle.length, afterStart)
+
+  await runGoal(hooks, sid, "pause")
+  assert.match(lifecycle.at(-1).text, /Goal paused/i)
+  await runGoal(hooks, sid, "resume")
+  assert.match(lifecycle.at(-1).text, /Goal resumed/i)
+  await runGoal(hooks, sid, "edit revised private objective")
+  assert.match(lifecycle.at(-1).text, /Goal updated/i)
+
+  const beforeIdle = lifecycle.length
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: sid, status: { type: "idle" } } },
+  })
+  assert.equal(lifecycle.length, beforeIdle)
+
+  await runGoal(hooks, sid, "clear")
+  assert.match(lifecycle.at(-1).text, /Goal cleared/i)
+  assert.ok(lifecycle.every(({ sessionID }) => sessionID === sid))
+  assert.ok(lifecycle.every(({ text }) => !text.includes("private")))
+})
+
+test("repeated pause without a state transition emits one lifecycle notice", async () => {
+  const lifecycle = []
+  const { hooks } = await createHooks({
+    options: {
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+  const sessionID = "lifecycle-repeat-pause"
+
+  await runGoal(hooks, sessionID, "ship it")
+  lifecycle.length = 0
+  assert.match(await runGoal(hooks, sessionID, "pause"), /Goal paused/)
+  assert.match(await runGoal(hooks, sessionID, "pause"), /already paused/)
+  assert.equal(lifecycle.filter((text) => /Goal paused/i.test(text)).length, 1)
+
+  await runGoal(hooks, sessionID, "resume")
+  lifecycle.length = 0
+  const first = JSON.parse(await hooks.tool.goal_pause.execute({}, { sessionID }))
+  const second = JSON.parse(await hooks.tool.goal_pause.execute({}, { sessionID }))
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.match(second.message, /already paused/)
+  assert.equal(lifecycle.filter((text) => /Goal paused/i.test(text)).length, 1)
+})
+
+test("consecutive objective edits each emit lifecycle feedback", async () => {
+  const lifecycle = []
+  const { hooks } = await createHooks({
+    options: {
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+  const sessionID = "lifecycle-consecutive-edits"
+
+  await runGoal(hooks, sessionID, "initial objective")
+  lifecycle.length = 0
+  await runGoal(hooks, sessionID, "edit first revision")
+  await runGoal(hooks, sessionID, "edit second revision")
+
+  assert.deepEqual(lifecycle, ["Goal updated and active.", "Goal updated and active."])
+  assert.equal(currentGoal(sessionID).condition, "second revision")
+})
+
+test("lifecycleMessages:false suppresses lifecycle messages", async () => {
+  const lifecycle = []
+  const { hooks } = await createHooks({
+    options: {
+      lifecycleMessages: false,
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+  const sid = "lifecycle-off-s1"
+
+  await runGoal(hooks, sid, "ship it")
+  await runGoal(hooks, sid, "pause")
+  await runGoal(hooks, sid, "resume")
+  await runGoal(hooks, sid, "clear")
+
+  assert.equal(lifecycle.length, 0)
+})
+
+test("lifecycle messenger failures never change committed goal state", async () => {
+  const { hooks } = await createHooks({
+    options: {
+      lifecycleMessenger: async () => {
+        throw new Error("advisory transport unavailable")
+      },
+    },
+  })
+  const sid = "lifecycle-failure-s1"
+
+  await runGoal(hooks, sid, "ship it")
+  assert.equal(currentGoal(sid).stopped, false)
+  await runGoal(hooks, sid, "pause")
+  assert.equal(currentGoal(sid).stopped, true)
+  await runGoal(hooks, sid, "resume")
+  assert.equal(currentGoal(sid).stopped, false)
+  await runGoal(hooks, sid, "clear")
+  assert.equal(currentGoal(sid), null)
+})
+
+test("terminal audit messages do not duplicate lifecycle notices, with a lifecycle fallback when disabled", async () => {
+  const audits = []
+  const lifecycle = []
+  const first = await createHooks({
+    messages: async () => ({
+      data: [message("Done.\n[goal:evidence] suite green\n[goal:complete]")],
+    }),
+    options: {
+      minDelayMs: 1,
+      auditMessenger: async (_sessionID, text) => audits.push(text),
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+  await runGoal(first.hooks, "lifecycle-terminal-audit", "ship it")
+  lifecycle.length = 0
+  await first.hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "lifecycle-terminal-audit", status: { type: "idle" } },
+    },
+  })
+  assert.equal(audits.length, 2)
+  assert.equal(lifecycle.length, 0)
+
+  const fallback = []
+  const second = await createHooks({
+    messages: async () => ({
+      data: [message("Done.\n[goal:evidence] suite green\n[goal:complete]")],
+    }),
+    options: {
+      minDelayMs: 1,
+      auditMessages: false,
+      lifecycleMessenger: async (_sessionID, text) => fallback.push(text),
+    },
+  })
+  await runGoal(second.hooks, "lifecycle-terminal-fallback", "ship it")
+  fallback.length = 0
+  await second.hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "lifecycle-terminal-fallback", status: { type: "idle" } },
+    },
+  })
+  assert.equal(fallback.length, 1)
+  assert.match(fallback[0], /Goal achieved/i)
+})
+
+test("plugin-wired canonical terminal tools use audit notices or one lifecycle fallback", async () => {
+  const audits = []
+  const lifecycle = []
+  const audited = await createHooks({
+    options: {
+      auditMessenger: async (_sessionID, text) => audits.push(text),
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+  const call = async (hooks, sessionID, name, args = {}) =>
+    JSON.parse(await hooks.tool[name].execute(args, { sessionID }))
+
+  assert.equal(
+    (await call(audited.hooks, "canonical-audit-complete", "goal_set", { objective: "ship it" })).ok,
+    true,
+  )
+  audits.length = 0
+  lifecycle.length = 0
+  assert.equal(
+    (await call(audited.hooks, "canonical-audit-complete", "goal_complete", { summary: "suite green" })).ok,
+    true,
+  )
+  assert.equal(audits.length, 2)
+  assert.match(audits[0], /Auditing goal completion/i)
+  assert.match(audits[1], /completion accepted/i)
+  assert.equal(lifecycle.length, 0)
+
+  assert.equal(
+    (await call(audited.hooks, "canonical-audit-block", "goal_set", { objective: "deploy it" })).ok,
+    true,
+  )
+  audits.length = 0
+  lifecycle.length = 0
+  assert.equal(
+    (await call(audited.hooks, "canonical-audit-block", "goal_block", { blocker: "approval required" })).ok,
+    true,
+  )
+  assert.equal(audits.length, 2)
+  assert.match(audits[0], /Auditing goal blocker/i)
+  assert.match(audits[1], /paused as blocked/i)
+  assert.equal(lifecycle.length, 0)
+  await audited.hooks.dispose()
+
+  const fallbackAudits = []
+  const fallbackLifecycle = []
+  const fallback = await createHooks({
+    options: {
+      auditMessages: false,
+      auditMessenger: async (_sessionID, text) => fallbackAudits.push(text),
+      lifecycleMessenger: async (_sessionID, text) => fallbackLifecycle.push(text),
+    },
+  })
+
+  assert.equal(
+    (await call(fallback.hooks, "canonical-fallback-complete", "goal_set", { objective: "ship it" })).ok,
+    true,
+  )
+  fallbackLifecycle.length = 0
+  assert.equal(
+    (await call(fallback.hooks, "canonical-fallback-complete", "goal_complete", { summary: "suite green" })).ok,
+    true,
+  )
+  assert.deepEqual(fallbackAudits, [])
+  assert.equal(fallbackLifecycle.length, 1)
+  assert.match(fallbackLifecycle[0], /Goal achieved/i)
+
+  assert.equal(
+    (await call(fallback.hooks, "canonical-fallback-block", "goal_set", { objective: "deploy it" })).ok,
+    true,
+  )
+  fallbackLifecycle.length = 0
+  assert.equal(
+    (await call(fallback.hooks, "canonical-fallback-block", "goal_block", { blocker: "approval required" })).ok,
+    true,
+  )
+  assert.deepEqual(fallbackAudits, [])
+  assert.equal(fallbackLifecycle.length, 1)
+  assert.match(fallbackLifecycle[0], /Goal blocked/i)
+  await fallback.hooks.dispose()
+})
+
+test("defaultLifecycleMessenger uses app.log and TUI toasts with state-aware variants", async () => {
+  const logs = []
+  const toasts = []
+  const client = {
+    app: { log: async (input) => logs.push(input) },
+    tui: { showToast: async (input) => toasts.push(input) },
+  }
+
+  await defaultLifecycleMessenger(client, "lifecycle-transport", "Goal active.")
+  await defaultLifecycleMessenger(client, "lifecycle-transport", "Goal paused: safety limit reached.")
+  await defaultLifecycleMessenger(client, "lifecycle-transport", "Goal achieved.")
+
+  assert.equal(logs.length, 3)
+  assert.ok(logs.every((entry) => entry.body.extra.kind === "goal-lifecycle"))
+  assert.ok(logs.every((entry) => entry.body.extra.sessionID === "lifecycle-transport"))
+  assert.deepEqual(toasts.map((toast) => toast.body.variant), ["info", "warning", "success"])
+  assert.deepEqual(toasts.map((toast) => toast.body.message), [
+    "Goal active.",
+    "Goal paused: safety limit reached.",
+    "Goal achieved.",
+  ])
+  await defaultLifecycleMessenger({}, "s", "Goal active.")
+})
 
 test("completion emits visible audit-start and audit-result messages", async () => {
   const audits = []
@@ -5847,6 +6263,28 @@ test("agent tool handlers set, read, update, and clear a goal", async () => {
   assert.ok(persistCalls.length > 0)
 })
 
+test("agent tool handlers emit the same lifecycle transitions as slash commands", async () => {
+  const lifecycle = []
+  const { handlers } = makeAgentHandlers({
+    announceLifecycle: async (sessionID, text) => lifecycle.push({ sessionID, text }),
+  })
+  const sid = "agent-lifecycle-s1"
+
+  await handlers.setGoal(sid, { objective: "private agent objective" })
+  await handlers.updateGoal(sid, { objective: "revised private agent objective" })
+  await handlers.updateGoal(sid, { status: "paused" })
+  await handlers.updateGoal(sid, { status: "resumed" })
+  await handlers.updateGoal(sid, { status: "blocked", blocker: "private deployment key missing" })
+  await handlers.clearGoal(sid)
+
+  assert.deepEqual(
+    lifecycle.map(({ text }) => text.match(/Goal (?:active|updated|paused|resumed|blocked|cleared)/i)?.[0]),
+    ["Goal active", "Goal updated", "Goal paused", "Goal resumed", "Goal blocked", "Goal cleared"],
+  )
+  assert.ok(lifecycle.every(({ sessionID }) => sessionID === sid))
+  assert.ok(lifecycle.every(({ text }) => !text.includes("private")))
+})
+
 test("agent set_goal honors limit overrides, schema fields, and rejects an empty objective", async () => {
   const { handlers } = makeAgentHandlers()
   assert.match(
@@ -6113,6 +6551,44 @@ test("canonical errors use state and stable codes instead of parsing legacy pros
   const rejected = JSON.parse(await tools.goal_complete.execute({ summary: "claimed done" }, context))
   assert.equal(rejected.error, "completion_rejected")
   assert.match(rejected.message, /custom provider verdict/)
+})
+
+test("canonical goal_block rejects when its goal changes during terminal persistence", async () => {
+  const schema = {
+    string: () => ({ optional: () => "str?" }),
+    number: () => ({ optional: () => "num?" }),
+    array: () => ({ optional: () => "array?" }),
+    object: () => "object",
+    enum: () => "enum",
+  }
+  const toolHelper = (definition) => definition
+  toolHelper.schema = schema
+  let signalPersist
+  let releasePersist
+  const persistStarted = new Promise((resolve) => { signalPersist = resolve })
+  const persistGate = new Promise((resolve) => { releasePersist = resolve })
+  const { handlers } = makeAgentHandlers({
+    persistTerminalState: async () => {
+      signalPersist()
+      await persistGate
+      return true
+    },
+  })
+  const tools = buildAgentTools(toolHelper, handlers)
+  const context = { sessionID: "canonical-block-race" }
+
+  await tools.goal_set.execute({ objective: "old objective" }, context)
+  const blocking = tools.goal_block.execute({ blocker: "need approval" }, context)
+  await persistStarted
+  await tools.goal_set.execute({ objective: "replacement objective" }, context)
+  releasePersist()
+  const result = JSON.parse(await blocking)
+
+  assert.equal(result.ok, false)
+  assert.equal(result.error, "goal_changed")
+  assert.match(result.message, /changed.*not (?:recorded|reported)/i)
+  assert.equal(currentGoal(context.sessionID).condition, "replacement objective")
+  assert.equal(currentGoal(context.sessionID).stopped, false)
 })
 
 test("/goal resume preserves registry identity and clears cleanly", async () => {
@@ -6550,6 +7026,134 @@ test("agent completion remains paused when neither state nor ledger records the 
   assert.equal(goal.stopReason, "terminal persistence failed")
 })
 
+test("terminal persistence failure cannot resurrect a concurrently replaced goal", async () => {
+  let signalPersist
+  let releasePersist
+  const persistStarted = new Promise((resolve) => { signalPersist = resolve })
+  const persistGate = new Promise((resolve) => { releasePersist = resolve })
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+    persistTerminalState: async () => {
+      signalPersist()
+      await persistGate
+      return false
+    },
+  })
+  const sessionID = "terminal-storage-replacement-race"
+
+  await handlers.setGoal(sessionID, { objective: "old objective" })
+  const completing = handlers.updateGoal(sessionID, {
+    status: "complete",
+    evidence: "suite green",
+  })
+  await persistStarted
+  await handlers.setGoal(sessionID, { objective: "replacement objective" })
+  releasePersist()
+  const result = await completing
+
+  assert.match(result, /could not be persisted.*goal changed|goal changed.*could not be persisted|before the goal changed/i)
+  assert.doesNotMatch(result, /Goal remains paused/i)
+  assert.equal(currentGoal(sessionID).condition, "replacement objective")
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.deepEqual(listSessionGoals(sessionID).map((goal) => goal.condition), ["replacement objective"])
+  assert.doesNotMatch(await handlers.getGoal(sessionID), /State: achieved/)
+  assert.doesNotMatch(formatGoalList(sessionID), /old objective/)
+})
+
+test("another session's result eviction cannot suppress terminal rollback", async () => {
+  let signalPersist
+  let releasePersist
+  const persistStarted = new Promise((resolve) => { signalPersist = resolve })
+  const persistGate = new Promise((resolve) => { releasePersist = resolve })
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions({ maxStoredResults: 1 }),
+    persist: async () => true,
+    persistTerminalState: async (sessionID) => {
+      if (sessionID !== "rollback-A") return true
+      signalPersist()
+      await persistGate
+      return false
+    },
+  })
+
+  await handlers.setGoal("rollback-A", { objective: "A objective" })
+  const completingA = handlers.updateGoal("rollback-A", {
+    status: "complete",
+    evidence: "verified",
+  })
+  await persistStarted
+
+  await handlers.setGoal("rollback-B", { objective: "B objective" })
+  assert.match(
+    await handlers.updateGoal("rollback-B", { status: "complete", evidence: "verified" }),
+    /archived/i,
+  )
+
+  releasePersist()
+  assert.match(await completingA, /remains paused/i)
+  assert.equal(currentGoal("rollback-A").condition, "A objective")
+  assert.equal(currentGoal("rollback-A").stopReason, "terminal persistence failed")
+  assert.doesNotMatch(formatGoalList("rollback-A"), /\[achieved\]/)
+  assert.match(formatGoalList("rollback-B"), /\[achieved\] B objective/)
+})
+
+test("terminal persistence failure cannot resurrect a concurrently cleared goal", async () => {
+  let signalPersist
+  let releasePersist
+  const persistStarted = new Promise((resolve) => { signalPersist = resolve })
+  const persistGate = new Promise((resolve) => { releasePersist = resolve })
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+    persistTerminalState: async (sessionID, label) => {
+      if (sessionID === "rollback-clear" && label === "completion") {
+        signalPersist()
+        await persistGate
+        return false
+      }
+      return true
+    },
+  })
+
+  await handlers.setGoal("rollback-clear", { objective: "clear this goal" })
+  const completing = handlers.updateGoal("rollback-clear", {
+    status: "complete",
+    evidence: "verified",
+  })
+  await persistStarted
+  assert.equal(await handlers.clearGoal("rollback-clear"), "Goal cleared.")
+
+  releasePersist()
+  assert.match(await completing, /goal changed/i)
+  assert.equal(currentGoal("rollback-clear"), null)
+  assert.doesNotMatch(formatGoalList("rollback-clear"), /clear this goal|\[achieved\]/)
+})
+
+test("agent blocked state fails closed when neither snapshot nor ledger is durable", async () => {
+  const audits = []
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => false,
+    persistTerminalState: async () => false,
+    auditMessagesEnabled: true,
+    announceAudit: async (_sessionID, text) => audits.push(text),
+  })
+  const sessionID = "blocked-dual-storage-failure"
+
+  await handlers.setGoal(sessionID, { objective: "ship it" })
+  const result = await handlers.updateGoal(sessionID, {
+    status: "blocked",
+    blocker: "need approval",
+  })
+
+  assert.match(result, /could not be persisted/)
+  assert.equal(currentGoal(sessionID).stopped, true)
+  assert.equal(currentGoal(sessionID).stopReason, "terminal persistence failed")
+  assert.ok(audits.some((text) => /storage failed/i.test(text)))
+  assert.ok(!audits.some((text) => /paused as blocked/i.test(text)))
+})
+
 test("ordered completion storage failure rolls back premature successor promotion", async () => {
   const client = {
     app: { log: async () => {} },
@@ -6627,6 +7231,124 @@ test("ledger cross-check removes completed goals still active in a stale state f
     )
     assert.equal(currentGoal("xcheck-s1"), null)
   } finally {
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("ledger cross-check restores a newer blocked state and reason from a stale active snapshot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-blocked-ledger-xcheck-"))
+  const stateFilePath = join(dir, "state.json")
+  const sessionID = "blocked-ledger-restart"
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, sessionID)
+  const lifecycle = []
+  let prompts = 0
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [message("still working")] }),
+      promptAsync: async () => {
+        prompts += 1
+        return {}
+      },
+    },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(first, sessionID, "ship it")
+    const staleGoal = currentGoal(sessionID)
+    const entries = await readLedgerEntries(ledgerFilePath)
+    const blockedAt = Math.max(...entries.map((entry) => Number(entry.ts) || 0), Date.now()) + 1
+    await first.dispose()
+    first = null
+
+    assert.equal(appendLedgerLine(ledgerFilePath, {
+      ts: blockedAt,
+      sessionID,
+      goalId: staleGoal.goalId,
+      condition: staleGoal.condition,
+      snapshot: {
+        options: staleGoal.options,
+        stopped: true,
+        stopReason: "blocked",
+        blockedReason: "need a production credential",
+      },
+      type: "blocked",
+      detail: "need a production credential",
+    }), true)
+
+    second = await GoalPlugin({ client }, {
+      stateFilePath,
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    })
+    const status = await runGoal(second, sessionID, "status")
+    const recovered = currentGoal(sessionID)
+    assert.match(status, /State: blocked/)
+    assert.match(status, /Blocked reason: need a production credential/)
+    assert.equal(recovered.stopReason, "blocked")
+    assert.equal(recovered.blockedReason, "need a production credential")
+    assert.ok(recovered.history.some((entry) => entry.type === "blocked" && /production credential/.test(entry.detail)))
+    assert.equal(lifecycle.filter((text) => /recovered as blocked/i.test(text)).length, 1)
+
+    await second.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+    assert.equal(prompts, 0)
+    const rewritten = JSON.parse(await readFile(sessionStatePath(stateFilePath, sessionID), "utf8"))
+    assert.equal(rewritten.goals[0].stopReason, "blocked")
+    assert.equal(rewritten.goals[0].blockedReason, "need a production credential")
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a persisted resume state wins over an older blocked ledger entry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-blocked-ledger-resume-"))
+  const stateFilePath = join(dir, "state.json")
+  const sessionID = "blocked-ledger-resumed"
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, sessionID)
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(first, sessionID, "ship it")
+    const goal = currentGoal(sessionID)
+    assert.equal(appendLedgerLine(ledgerFilePath, {
+      ts: Date.now(),
+      sessionID,
+      goalId: goal.goalId,
+      condition: goal.condition,
+      snapshot: {
+        options: goal.options,
+        stopped: true,
+        stopReason: "blocked",
+        blockedReason: "obsolete blocker",
+      },
+      type: "blocked",
+      detail: "obsolete blocker",
+    }), true)
+    await runGoal(first, sessionID, "pause")
+    await runGoal(first, sessionID, "resume")
+    await first.dispose()
+    first = null
+
+    second = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    const status = await runGoal(second, sessionID, "status")
+    assert.match(status, /State: paused/)
+    assert.doesNotMatch(status, /State: blocked|obsolete blocker/)
+    assert.equal(currentGoal(sessionID).stopReason, "recovered after restart")
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
     setLedgerSink(null)
     await rm(dir, { recursive: true, force: true })
   }
