@@ -325,6 +325,23 @@ export interface GoalPluginOptions {
   auditorOptions?: CompletionAuditorOptions
 
   /**
+   * Whether the plugin announces applied goal-state transitions such as
+   * creation, pause/resume, recovery, promotion, and clearing. Routine
+   * idle/checkpoint activity is not announced. Completion/block uses the
+   * audit-result channel when enabled and this lifecycle channel only as its
+   * disabled fallback.
+   * @default true
+   */
+  lifecycleMessages?: boolean
+
+  /**
+   * Custom sink for bounded lifecycle notices. Defaults to routing through
+   * OpenCode's structured log (`client.app.log`) and TUI toast when those host
+   * APIs are available. Delivery is advisory and does not make model calls.
+   */
+  lifecycleMessenger?: (sessionID: string, text: string) => Promise<void> | void
+
+  /**
    * Whether the plugin announces completion/blocked audits (an
    * audit-start and an audit-result message) instead of running silently.
    * @default true

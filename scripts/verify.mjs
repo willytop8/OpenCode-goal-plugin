@@ -146,7 +146,8 @@ await check("/goal set works", async () => {
   assert.match(text, /New active goal: verify the installation/)
   const statusText = await runGoalCommand("status")
   assert.match(statusText, /Active goal: verify the installation/)
-  assert.doesNotMatch(statusText, /State: Paused/)
+  assert.match(statusText, /State: active/)
+  assert.match(statusText, /Completion audit: evidence gate only \(independent verifier off\)/)
 })
 
 await check("no model calls were made during verification", () => {
@@ -155,6 +156,13 @@ await check("no model calls were made during verification", () => {
 
 // Clean up the goal created above so this script has no side effects.
 await runGoalCommand("clear")
+
+await check("lifecycle transitions are visible without leaking objective text", () => {
+  assert.deepEqual(logCalls.map((entry) => entry.body.extra.kind), ["goal-lifecycle", "goal-lifecycle"])
+  assert.match(logCalls[0].body.message, /Goal (?:active|started)/i)
+  assert.match(logCalls[1].body.message, /Goal cleared/i)
+  assert.ok(logCalls.every((entry) => !entry.body.message.includes("verify the installation")))
+})
 
 console.log()
 

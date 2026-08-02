@@ -18,6 +18,7 @@ Compatibility: this plugin relies on experimental OpenCode hooks. Re-test agains
 - Guarded auto-continuation with turn, duration, token, no-progress, and no-tool-call limits.
 - Project-local restart recovery backed by persisted state and a bounded lifecycle ledger.
 - Evidence-gated completion with an optional independent, fail-closed verifier.
+- Explicit `active`, `paused`, and `blocked` status plus transition-only lifecycle notices.
 - Canonical agent tools, collision-safe goal/verifier agents, multiple goals, and ordered goal sequences.
 
 This project is independently implemented for OpenCode. Product names used elsewhere identify their respective owners; no feature-parity or endorsement claim is implied.
@@ -100,6 +101,8 @@ Check status:
 /goal status
 ```
 
+`/goal status` keeps its existing `Active goal:` heading and adds an explicit `State:` line: `active` while the goal can continue, `blocked` when the assistant recorded a concrete blocker, and `paused` for other retained stops such as user intervention, a safety limit, or an audit rejection. A `Completion audit:` line distinguishes the always-on evidence gate from an optional built-in independent verifier or custom completion auditor.
+
 View lifecycle history and the latest checkpoint:
 
 ```
@@ -156,7 +159,7 @@ A session can hold more than one goal. `/goal <condition>` replaces the focused 
 /goal focus 1
 ```
 
-`/goal list` shows numbered live goals (focused and backgrounded) plus achieved goals retained in the per-session archive. `/goal clear` intentionally removes live goals and saved status from these views; its terminal ledger entries remain available for crash-safe recovery decisions. `/goal focus <number>` switches the active goal, backgrounding the previous one. Focus is tracked per session and survives a restart.
+`/goal list` shows numbered live goals (focused and backgrounded) plus achieved goals retained in the per-session archive. Each live entry includes its explicit `active`, `paused`, or `blocked` state; a stopped focused goal keeps its bounded stop or blocker reason visible. `/goal clear` intentionally removes live goals and saved status from these views; its terminal ledger entries remain available for crash-safe recovery decisions. `/goal focus <number>` switches the active goal, backgrounding the previous one. Focus is tracked per session and survives a restart.
 
 #### Ordered sequences
 
@@ -336,6 +339,8 @@ Additional plugin-level options:
 - `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
+- `lifecycleMessages` — announce applied goal-state transitions (default `true`). Set to `false` to disable lifecycle notices without disabling audit messages or persistence.
+- `lifecycleMessenger(sessionID, text)` — route lifecycle notices to a custom sink instead of the default structured-log/TUI-toast path.
 
 ## Agent tools
 
@@ -352,12 +357,23 @@ These operate on the same per-session multi-goal state as the command path: a to
 
 > Integration note: the tool execute-context shape (`ctx.sessionID`) and Zod argument definitions follow the OpenCode plugin docs. The tool **logic** is unit-tested independently, but live registration should still be confirmed against the exact OpenCode host used in production (see the smoke-test checklist).
 
+## Lifecycle messages
+
+The plugin announces meaningful, applied state transitions such as goal creation, focus changes, pause/resume, recovery, ordered-goal promotion, and clearing. It does not emit a notice for every idle event, checkpoint, or continuation attempt. Messages are bounded and avoid dumping the full objective, evidence, or filesystem paths.
+
+By default, lifecycle notices go to OpenCode's structured log and to a TUI toast when that host capability is available. Provide a `lifecycleMessenger(sessionID, text)` plugin option to route them elsewhere, or set `lifecycleMessages: false` to disable them. Delivery is advisory: notices do not start an assistant turn or make any extra model call, and a log, toast, or custom-messenger failure does not undo the recorded state transition.
+
+Lifecycle notices and audit messages are separate controls. Lifecycle notices describe applied goal state; audit messages describe completion/block validation. When `auditMessages` is `true`, its audit-result message is the sole completion/block announcement. When `auditMessages` is `false` and `lifecycleMessages` is `true`, the lifecycle channel emits one terminal fallback instead. Other transitions follow `lifecycleMessages`; disabling one control does not disable the other.
+
 ## Audit messages
 
-When the assistant marks a goal complete or blocked, the plugin announces the audit instead of doing it silently: an audit-start message ("Auditing goal completion…") and an audit-result message ("completion accepted — goal archived" / "paused as blocked — …"). By default these are written to OpenCode's structured log and shown as a TUI toast when that client capability is available. Provide an `auditMessenger(sessionID, text)` plugin option to route them elsewhere, or set `auditMessages: false` to disable them.
+When the assistant marks a goal complete or blocked, the plugin announces the audit instead of doing it silently: an audit-start message ("Auditing goal completion…") and an audit-result message ("completion accepted — goal archived" / "paused as blocked — …"). By default these are written to OpenCode's structured log and shown as a TUI toast when that client capability is available. Provide an `auditMessenger(sessionID, text)` plugin option to route them elsewhere, or set `auditMessages: false` to disable them. The audit-result message owns the terminal completion/block announcement while `auditMessages` is enabled, so the lifecycle channel does not duplicate it.
+
+Audit messages are visibility only; enabling them does not turn on the independent completion auditor. The evidence gate always applies. Independent verification is enabled only with `completionAudit: true` or a custom `auditor`.
+
 ## Completion auditor (optional)
 
-By default a `[goal:complete]` is accepted on the assistant's word. You can require an independent audit before a goal is archived:
+Every `[goal:complete]` claim must first pass the local evidence gate described above. By default, that evidence gate is the only verifier. You can additionally require an independent audit before a goal is archived:
 
 - `completionAudit: true` — the plugin spawns an independent OpenCode child session to verify the completion against the goal and workspace. The auditor replies with `[audit:approved]` or `[audit:rejected]` (with a reason).
 - `auditor: async ({ goal, sessionID, latestText }) => ({ approved, reason })` — supply your own auditor function (takes precedence over `completionAudit`).

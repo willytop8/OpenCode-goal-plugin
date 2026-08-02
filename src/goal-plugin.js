@@ -95,6 +95,7 @@ function createRuntimeState() {
     sessionArchive: new Map(),
     sessionOrdered: new Set(),
     lastGoalResults: new Map(),
+    sessionMutationVersions: new Map(),
     seenTokens: new Map(),
     seenUsage: new Map(),
     seenOutputTokens: new Map(),
@@ -165,6 +166,7 @@ const sessionArchive = runtimeCollection("sessionArchive")
 const sessionOrdered = runtimeCollection("sessionOrdered")
 const MAX_ARCHIVED_PER_SESSION = 10
 const lastGoalResults = runtimeCollection("lastGoalResults")
+const sessionMutationVersions = runtimeCollection("sessionMutationVersions")
 const seenTokens = runtimeCollection("seenTokens")
 const seenUsage = runtimeCollection("seenUsage")
 const seenOutputTokens = runtimeCollection("seenOutputTokens")
@@ -490,6 +492,7 @@ function emitLedgerEvent(goal, type, detail, timestamp) {
         options: goal.options,
         stopped: goal.stopped,
         stopReason: goal.stopReason,
+        blockedReason: goal.blockedReason,
         ordered: sessionOrdered.has(goal.sessionID),
       },
       type,
@@ -504,6 +507,7 @@ function emitLedgerEvent(goal, type, detail, timestamp) {
 function pushHistory(goal, type, detail, timestamp = Date.now()) {
   const entry = makeHistoryEntry(type, detail, timestamp)
   goal.history = [...(goal.history || []), entry].slice(-MAX_HISTORY_ENTRIES)
+  markSessionMutation(goal.sessionID)
   return emitLedgerEvent(goal, entry.type, entry.detail, entry.timestamp)
 }
 
@@ -638,6 +642,7 @@ function reconstructGoalsFromLedger(entries) {
     const condition = [...events].reverse().find((event) => typeof event.condition === "string" && event.condition.trim())?.condition?.trim()
     if (!condition) continue
     const snapshot = [...events].reverse().find((event) => isPlainObject(event.snapshot))?.snapshot || {}
+    const latestBlocked = [...events].reverse().find((event) => event.type === "blocked")
 
     const history = events
       .map((event) =>
@@ -659,6 +664,12 @@ function reconstructGoalsFromLedger(entries) {
       options: isPlainObject(snapshot.options) ? snapshot.options : {},
       stopped: snapshot.stopped === true,
       stopReason: typeof snapshot.stopReason === "string" ? snapshot.stopReason : "",
+      blockedReason:
+        typeof snapshot.blockedReason === "string"
+          ? snapshot.blockedReason
+          : snapshot.stopReason === "blocked" && typeof latestBlocked?.detail === "string"
+            ? latestBlocked.detail
+            : "",
       ordered: snapshot.ordered === true || events.some((event) => /ordered goal/i.test(String(event.detail || ""))),
       startedAt: normalizeTimestamp(events[0]?.ts),
       history,
@@ -675,9 +686,19 @@ function recordCheckpoint(goal, text, timestamp = Date.now()) {
   const checkpoint = { summary, timestamp }
   goal.lastCheckpoint = checkpoint
   goal.checkpoints = [...(goal.checkpoints || []), checkpoint].slice(-MAX_CHECKPOINTS)
+  markSessionMutation(goal.sessionID)
 }
 
-function formatStatus(goal, commandName = "goal") {
+function goalDisplayState(goal) {
+  if (!goal?.stopped) return "active"
+  return goal.stopReason === "blocked" ? "blocked" : "paused"
+}
+
+function formatStatus(
+  goal,
+  commandName = "goal",
+  completionAuditLabel = "evidence gate only (independent verifier off)",
+) {
   const elapsed = Math.round((Date.now() - goal.startedAt) / 1000)
   const lastProgress =
     goal.lastProgressAt > 0
@@ -688,6 +709,8 @@ function formatStatus(goal, commandName = "goal") {
     : "none yet"
   const lines = [
     `Active goal: ${goal.condition}`,
+    `State: ${goalDisplayState(goal)}`,
+    `Completion audit: ${completionAuditLabel}`,
   ]
   if (goal.successCriteria) lines.push(`Success criteria: ${goal.successCriteria}`)
   if (goal.constraints) lines.push(`Constraints: ${goal.constraints}`)
@@ -772,8 +795,16 @@ function sessionGoalMap(sessionID) {
   return map
 }
 
+function markSessionMutation(sessionID) {
+  if (!sessionID) return 0
+  const next = (sessionMutationVersions.get(sessionID) || 0) + 1
+  sessionMutationVersions.set(sessionID, next)
+  return next
+}
+
 function registerSessionGoal(goal) {
   sessionGoalMap(goal.sessionID).set(goal.goalId, goal)
+  markSessionMutation(goal.sessionID)
 }
 
 function listSessionGoals(sessionID) {
@@ -796,12 +827,13 @@ function setBoundedMessageValue(map, messageID, value) {
 function removeSessionGoal(sessionID, goalId) {
   const map = sessionGoals.get(sessionID)
   if (!map) return
-  map.delete(goalId)
+  if (map.delete(goalId)) markSessionMutation(sessionID)
   if (map.size === 0) sessionGoals.delete(sessionID)
 }
 
 function focusGoal(sessionID, goal) {
   goalStates.set(sessionID, goal)
+  markSessionMutation(sessionID)
 }
 
 function pauseGoalClock(goal, timestamp = Date.now()) {
@@ -858,6 +890,10 @@ function cleanupGoal(sessionID) {
   }
   goalStates.delete(sessionID)
   activeContinues.delete(sessionID)
+  // Increment even when no focused goal remains. A concurrent clear of a
+  // provisional completion is otherwise indistinguishable from unrelated
+  // global result-retention pruning while its terminal write is in flight.
+  markSessionMutation(sessionID)
 }
 
 function clearRuntimeState() {
@@ -868,6 +904,7 @@ function clearRuntimeState() {
   sessionArchive.clear()
   sessionOrdered.clear()
   lastGoalResults.clear()
+  sessionMutationVersions.clear()
   seenTokens.clear()
   seenUsage.clear()
   seenOutputTokens.clear()
@@ -908,6 +945,7 @@ function clearSessionRuntimeState(
   runtime.sessionStatuses.delete(sessionID)
   if (!preserveExecutionContext) runtime.sessionExecutionContexts.delete(sessionID)
   runtime.passiveSessions.delete(sessionID)
+  markSessionMutation(sessionID)
   if (!preserveCommandSecurity) {
     runtime.pendingCommandTurns.delete(sessionID)
     runtime.activeCommandTurns.delete(sessionID)
@@ -966,16 +1004,60 @@ function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") 
   lastGoalResults.delete(sessionID)
   lastGoalResults.set(sessionID, result)
   // Keep a per-session archive so completed goals stay readable via /goal list.
-  archiveSessionResult(sessionID, { ...result })
+  const archivedResult = { ...result }
+  archiveSessionResult(sessionID, archivedResult)
   pruneGoalResults(goal.options)
+  markSessionMutation(sessionID)
+  return { lastResult: result, archivedResult }
 }
 
-function restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered = false } = {}) {
-  lastGoalResults.delete(sessionID)
+function captureFocusedGoalSnapshot(sessionID) {
+  const goal = goalStates.get(sessionID) || null
+  return {
+    goal,
+    serialized: goal ? JSON.stringify(serializeGoal(goal)) : "",
+    mutationVersion: sessionMutationVersions.get(sessionID) || 0,
+  }
+}
+
+function focusedGoalSnapshotIsCurrent(sessionID, snapshot) {
+  const current = goalStates.get(sessionID) || null
+  if (current !== snapshot?.goal) return false
+  if ((sessionMutationVersions.get(sessionID) || 0) !== snapshot?.mutationVersion) return false
+  return !current || JSON.stringify(serializeGoal(current)) === snapshot.serialized
+}
+
+function restoreAfterTerminalPersistenceFailure(
+  sessionID,
+  goal,
+  { ordered = false, expectedCurrentSnapshot, expectedResult } = {},
+) {
+  // A terminal write can yield while another command replaces, edits, pauses,
+  // resumes, clears, or advances the session. Never roll the old goal back over
+  // that newer state. The per-session mutation version catches a concurrent
+  // clear even when both the expected and current focused goal are null, while
+  // remaining unaffected by result-retention pruning in a different session.
+  const expectedLastResult = expectedResult?.lastResult || expectedResult
+  const expectedArchivedResult = expectedResult?.archivedResult
+  const canRestore =
+    !expectedCurrentSnapshot ||
+    focusedGoalSnapshotIsCurrent(sessionID, expectedCurrentSnapshot)
+
+  // Remove only this failed provisional completion record. A newer concurrent
+  // result/archive entry belongs to the newer operation and must survive.
+  if (expectedLastResult && lastGoalResults.get(sessionID) === expectedLastResult) {
+    lastGoalResults.delete(sessionID)
+  }
   const archived = sessionArchive.get(sessionID) || []
-  if (archived.length) {
+  if (expectedArchivedResult) {
+    const retained = archived.filter((entry) => entry !== expectedArchivedResult)
+    if (retained.length) sessionArchive.set(sessionID, retained)
+    else sessionArchive.delete(sessionID)
+  } else if (archived.length) {
     sessionArchive.set(sessionID, archived.slice(0, -1))
   }
+
+  if (!canRestore) return false
   const prematurelyPromoted = goalStates.get(sessionID)
   if (prematurelyPromoted && prematurelyPromoted.goalId !== goal.goalId) {
     prematurelyPromoted.stopped = true
@@ -990,6 +1072,7 @@ function restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered = fal
   goal.lastStatus = "Terminal state could not be persisted. Goal kept paused; fix storage and retry."
   registerSessionGoal(goal)
   focusGoal(sessionID, goal)
+  return true
 }
 
 function resetGoalBudget(goal) {
@@ -1543,15 +1626,15 @@ async function applyParsedStateFile(raw, client, onlySessionID = null) {
 }
 
 // After applyParsedStateFile loads goals into goalStates, check the ledger for
-// terminal events. If a goal has a "completed" or "cleared" entry in the ledger
-// but still appears active in the state file (because the state write failed
-// after the terminal ledger write), remove it so it is not re-driven.
+// state transitions that landed after the snapshot. Completed/cleared goals are
+// removed so they cannot be re-driven, while a newer blocked event is overlaid
+// so its state and concrete reason survive a failed snapshot write.
 async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySessionID = null) {
   const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
     maxBytes: persistenceOptions.ledgerMaxBytes,
     retentionFiles: persistenceOptions.ledgerRetentionFiles,
   })
-  if (!entries.length) return
+  if (!entries.length) return { removed: 0, blocked: 0 }
 
   const terminalGoals = new Set()
   for (const entry of entries) {
@@ -1564,16 +1647,69 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySe
       terminalGoals.add(`${entry.sessionID}\0${entry.goalId}`)
     }
   }
-  if (!terminalGoals.size) return
-
   let removed = 0
+  let blocked = 0
   for (const [sessionID, goals] of sessionGoals.entries()) {
     if (onlySessionID && sessionID !== onlySessionID) continue
     for (const goal of [...goals.values()]) {
-      if (!terminalGoals.has(`${sessionID}\0${goal.goalId}`)) continue
-      removeSessionGoal(sessionID, goal.goalId)
-      if (goalStates.get(sessionID)?.goalId === goal.goalId) goalStates.delete(sessionID)
-      removed += 1
+      const key = `${sessionID}\0${goal.goalId}`
+      if (terminalGoals.has(key)) {
+        removeSessionGoal(sessionID, goal.goalId)
+        if (goalStates.get(sessionID)?.goalId === goal.goalId) goalStates.delete(sessionID)
+        removed += 1
+        continue
+      }
+
+      const persistedHistory = (goal.history || []).filter((event) => event.type !== "recovered")
+      const latestPersistedTimestamp = persistedHistory.reduce(
+        (latest, event) => Math.max(latest, normalizeTimestamp(event.timestamp, 0)),
+        0,
+      )
+      let latestLedgerState = null
+      let latestLedgerTimestamp = -1
+      for (const entry of entries) {
+        if (entry.sessionID !== sessionID || entry.goalId !== goal.goalId || entry.type === "recovered") continue
+        const timestamp = normalizeTimestamp(entry.ts, 0)
+        if (timestamp < latestPersistedTimestamp) continue
+        const detail = summarizeText(entry.detail, 400)
+        const alreadyApplied = persistedHistory.some(
+          (event) =>
+            event.type === entry.type &&
+            normalizeTimestamp(event.timestamp, 0) === timestamp &&
+            event.detail === detail,
+        )
+        if (timestamp >= latestLedgerTimestamp) {
+          latestLedgerState = { entry, alreadyApplied }
+          latestLedgerTimestamp = timestamp
+        }
+      }
+      if (
+        latestLedgerState?.alreadyApplied ||
+        latestLedgerState?.entry?.type !== "blocked" ||
+        latestLedgerState.entry.snapshot?.stopped !== true ||
+        latestLedgerState.entry.snapshot?.stopReason !== "blocked"
+      ) continue
+
+      const reason = summarizeText(
+        latestLedgerState.entry.snapshot?.blockedReason || latestLedgerState.entry.detail,
+        MAX_GOAL_BLOCKER_LENGTH,
+      )
+      if (!reason) continue
+      goal.stopped = true
+      goal.stopReason = "blocked"
+      goal.blockedReason = reason
+      goal.lastStatus = "Recovered blocked goal state from the lifecycle ledger after the saved snapshot lagged behind."
+      goal.continuationClaim = null
+      goal.history = [
+        ...(goal.history || []),
+        makeHistoryEntry(
+          "blocked",
+          reason,
+          normalizeTimestamp(latestLedgerState.entry.ts),
+        ),
+      ].slice(-MAX_HISTORY_ENTRIES)
+      pauseGoalClock(goal)
+      blocked += 1
     }
     if (!goalStates.has(sessionID) && sessionOrdered.has(sessionID) && goals.size > 0) {
       promoteNextOrderedGoal(sessionID)
@@ -1585,6 +1721,13 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySe
       `Ledger cross-check: removed ${removed} goal(s) whose terminal state was recorded in the ledger but not yet reflected in the state file (likely a failed terminal persist).`,
     )
   }
+  if (blocked > 0) {
+    await logPluginError(
+      client,
+      `Ledger cross-check: restored ${blocked} blocked goal(s) whose blocked state was recorded in the ledger but not yet reflected in the state file (likely a failed terminal persist).`,
+    )
+  }
+  return { removed, blocked }
 }
 
 async function pathExists(path) {
@@ -1810,8 +1953,8 @@ async function loadPersistedSessionState(persistence, client, sessionID) {
   const state = await readPersistedStateFile(persistence.stateFilePath, client)
   if (state.status === "loaded") {
     await applyParsedStateFile(state.raw, client, sessionID)
-    await reconcileLoadedStateWithLedger(persistence, client, sessionID)
-    return "loaded"
+    const reconciliation = await reconcileLoadedStateWithLedger(persistence, client, sessionID)
+    return reconciliation.blocked > 0 ? "reconciled-blocked" : "loaded"
   }
   const recovered = await reconstructFromLedger(persistence, client, sessionID)
   if (state.status === "invalid" && recovered === "reconstructed") {
@@ -2802,6 +2945,8 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
 }
 
 const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed"])
+const AGENT_COMPLETE_SUCCESS = "Goal marked complete and archived."
+const AGENT_BLOCK_SUCCESS = "Goal marked blocked."
 
 // Programmatic equivalents of the /goal command, exposed to the agent as tools
 // Each handler operates on a session id and mutates
@@ -2810,14 +2955,24 @@ const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed
 // result. Goal creation/replacement routes through the multi-goal registry
 // (buildGoalState + registerSessionGoal + focusGoal) exactly like the command
 // path, so tool-created goals persist and are driven by the idle handler.
-function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalState = null, completionAuditor = null, commandName = "goal" }) {
+function buildAgentToolHandlers({
+  defaultGoalOptions,
+  persist,
+  persistTerminalState = null,
+  completionAuditor = null,
+  completionAuditLabel = "evidence gate only (independent verifier off)",
+  announceAudit = async () => {},
+  auditMessagesEnabled = false,
+  announceLifecycle = () => {},
+  commandName = "goal",
+}) {
   // Use persistTerminalState (which logs on failure) for terminal operations when
   // available; fall back to plain persist for callers that don't wire it up (e.g.
   // tests using buildAgentToolHandlers directly).
   const persistFinal = persistTerminalState || persist
   async function getGoal(sessionID) {
     const goal = goalStates.get(sessionID)
-    if (goal) return formatStatus(goal)
+    if (goal) return formatStatus(goal, commandName, completionAuditLabel)
     const lastResult = lastGoalResults.get(sessionID)
     if (lastResult) return formatGoalResult(lastResult)
     return "No active goal."
@@ -2887,12 +3042,18 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     // Mirror the `/goal <condition>` replace path: discard the focused goal and
     // its saved result, drop any ordered sequence, then register + focus the new
     // goal so it persists and the idle handler drives it.
+    const replacedGoal = goalStates.get(sessionID)
     sessionOrdered.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
     registerSessionGoal(goal)
     focusGoal(sessionID, goal)
     await persist(sessionID)
+    announceLifecycle(sessionID, replacedGoal ? "Goal replaced and active." : "Goal active.", {
+      goal,
+      transition: replacedGoal ? "replaced-active" : "active",
+      expectedState: "active",
+    })
     // Escape in the tool result only: goal.condition is stored raw so callers
     // that build XML (buildGoalBlock, buildContinueMessage) can apply escaping
     // themselves. Escaping here prevents XML metacharacters in user-supplied
@@ -2920,6 +3081,7 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     }
 
     const messages = []
+    let lifecycleNotice = null
 
     if (typeof args.objective === "string" && args.objective.trim()) {
       if (args.objective.trim().length > MAX_GOAL_OBJECTIVE_LENGTH) {
@@ -2938,6 +3100,13 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
       goal.lastStatus = "Goal objective updated."
       pushHistory(goal, "edited", `Objective updated to: ${summarizeText(goal.condition, 400)}`)
       messages.push(`Objective updated: ${escapeGoalText(goal.condition)}`)
+      lifecycleNotice = {
+        text: `Goal updated; state remains ${goalDisplayState(goal)}.`,
+        transition: "updated",
+        reason: goalDisplayState(goal),
+        expectedState: goalDisplayState(goal),
+        expectedStopReason: goal.stopped ? goal.stopReason : "",
+      }
     }
 
     if (args.status !== undefined) {
@@ -2950,13 +3119,24 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
         if (!evidence) return "Completion evidence is required before a goal can be archived."
         if (evidence.length > MAX_LEGACY_EVIDENCE_LENGTH)
           return `Completion evidence must be ${MAX_LEGACY_EVIDENCE_LENGTH} characters or fewer.`
+        const auditedGoalID = goal.goalId
+        const auditedRunID = goal.runId
+        if (auditMessagesEnabled) {
+          await announceAudit(
+            sessionID,
+            "Auditing goal completion: checking submitted evidence before archiving.",
+          )
+          const goalAfterAnnouncement = activeGoal(sessionID, auditedGoalID, auditedRunID)
+          if (!goalAfterAnnouncement) {
+            return "Completion audit finished after the goal changed; completion was not recorded."
+          }
+          goal = goalAfterAnnouncement
+        }
         // If a completion auditor is configured, run it before archiving so the
         // agent tool path has the same integrity gate as the [goal:complete] marker
         // path. Without this, an autonomous agent could bypass the auditor by
         // calling update_goal({status:"complete"}) instead of using the marker.
         if (completionAuditor) {
-          const auditedGoalID = goal.goalId
-          const auditedRunID = goal.runId
           let verdict
           try {
             verdict = await completionAuditor({ goal, sessionID, latestText: evidence })
@@ -2975,6 +3155,25 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
             goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
             pushHistory(goal, "audit-rejected", `Agent tool completion audit rejected: ${summarizeText(reason, 300)}`)
             await persist(sessionID)
+            const rejectedGoalAfterPersist = currentGoal(sessionID, auditedGoalID, auditedRunID)
+            if (
+              rejectedGoalAfterPersist !== goal ||
+              !goal.stopped ||
+              goal.stopReason !== "audit rejected"
+            ) {
+              return "Completion audit was rejected, but the goal changed while that state was persisted; current state was left untouched."
+            }
+            if (auditMessagesEnabled) {
+              await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
+            } else {
+              announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
+                goal,
+                transition: "audit-rejected",
+                reason,
+                expectedState: "paused",
+                expectedStopReason: "audit rejected",
+              })
+            }
             return `Completion audit rejected: ${summarizeText(reason, 200)}. Goal paused; use /${commandName} resume after addressing the issue.`
           }
         }
@@ -2985,16 +3184,72 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
           evidence ? `Marked complete via tool: ${summarizeText(evidence, 400)}` : "Marked complete via agent tool.",
         )
         const ordered = sessionOrdered.has(sessionID)
-        rememberGoalResult(sessionID, goal, "achieved", "", evidence)
+        const completedResult = rememberGoalResult(sessionID, goal, "achieved", "", evidence)
         cleanupGoal(sessionID)
         // Advance an ordered sequence just like the marker path does.
-        if (ordered) promoteNextOrderedGoal(sessionID)
+        const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null
+        const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID)
         const durable = await persistFinal(sessionID, "completion", ledgerDurable)
         if (durable === false) {
-          restoreAfterTerminalPersistenceFailure(sessionID, goal, { ordered })
-          return "Completion verified, but terminal state could not be persisted. Goal remains paused."
+          const restored = restoreAfterTerminalPersistenceFailure(sessionID, goal, {
+            ordered,
+            expectedCurrentSnapshot: postCompletionSnapshot,
+            expectedResult: completedResult,
+          })
+          if (auditMessagesEnabled) {
+            await announceAudit(
+              sessionID,
+              restored
+                ? "Audit result: completion verified, but storage failed; goal remains paused and was not archived."
+                : "Audit result: completion verified, but its terminal write failed after goal state changed; current state was left untouched.",
+            )
+          } else {
+            announceLifecycle(
+              sessionID,
+              restored
+                ? "Goal paused — completion could not be recorded durably."
+                : "Previous goal completion could not be confirmed durably after goal state changed.",
+              restored
+                ? {
+                    goal,
+                    transition: "terminal-persistence-failed",
+                    reason: goal.stopReason,
+                    expectedState: "paused",
+                    expectedStopReason: "terminal persistence failed",
+                  }
+                : {
+                    transition: "terminal-persistence-raced",
+                    requireCurrent: false,
+                  },
+            )
+          }
+          return restored
+            ? "Completion verified, but terminal state could not be persisted. Goal remains paused."
+            : "Completion verified, but its terminal state could not be persisted before the goal changed. Current state was left untouched."
         }
-        return "Goal marked complete and archived."
+        const activePromoted = promoted
+          ? activeGoal(sessionID, promoted.goalId, promoted.runId)
+          : null
+        if (auditMessagesEnabled) {
+          await announceAudit(
+            sessionID,
+            activePromoted
+              ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active."
+              : "Audit result: completion accepted — goal archived as achieved.",
+          )
+        } else {
+          announceLifecycle(
+            sessionID,
+            activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.",
+            {
+              goal: activePromoted || goal,
+              transition: activePromoted ? "achieved-promoted" : "achieved",
+              requireCurrent: Boolean(activePromoted),
+              expectedState: activePromoted ? "active" : "",
+            },
+          )
+        }
+        return AGENT_COMPLETE_SUCCESS
       }
       if (status === "blocked") {
         const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : ""
@@ -3002,18 +3257,80 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
           return "status 'blocked' requires a non-empty 'blocker' argument describing what is needed."
         if (blockerText.length > MAX_GOAL_BLOCKER_LENGTH)
           return `Blocker must be ${MAX_GOAL_BLOCKER_LENGTH} characters or fewer.`
+        const blockedGoalID = goal.goalId
+        const blockedRunID = goal.runId
+        if (auditMessagesEnabled) {
+          await announceAudit(
+            sessionID,
+            "Auditing goal blocker: checking the submitted blocker before pausing.",
+          )
+          const goalAfterAnnouncement = activeGoal(sessionID, blockedGoalID, blockedRunID)
+          if (!goalAfterAnnouncement) {
+            return "Blocker audit finished after the goal changed; blocked state was not recorded."
+          }
+          goal = goalAfterAnnouncement
+        }
         goal.blockedReason = blockerText
         goal.stopped = true
         goal.stopReason = "blocked"
         goal.lastStatus = "Assistant reported blocked."
-        pushHistory(goal, "blocked", goal.blockedReason)
-        messages.push("Goal marked blocked.")
+        const ledgerDurable = pushHistory(goal, "blocked", goal.blockedReason)
+        messages.push(AGENT_BLOCK_SUCCESS)
+        const durable = await persistFinal(sessionID, "blocked", ledgerDurable)
+        const blockedGoalAfterPersist = currentGoal(sessionID, blockedGoalID, blockedRunID)
+        if (blockedGoalAfterPersist !== goal || goal.stopReason !== "blocked") {
+          return "Blocked state changed while persistence completed; blocked state was not reported."
+        }
+        if (durable === false) {
+          goal.stopReason = "terminal persistence failed"
+          goal.lastStatus = "Blocked state could not be persisted; goal remains paused."
+          if (auditMessagesEnabled) {
+            await announceAudit(
+              sessionID,
+              "Audit result: blocker recognized, but storage failed; goal remains paused.",
+            )
+          } else {
+            announceLifecycle(sessionID, "Goal paused — blocked state could not be recorded durably.", {
+              goal,
+              transition: "terminal-persistence-failed",
+              expectedState: "paused",
+              expectedStopReason: "terminal persistence failed",
+            })
+          }
+          return "Blocker recognized, but terminal state could not be persisted. Goal remains paused."
+        }
+        if (auditMessagesEnabled) {
+          await announceAudit(
+            sessionID,
+            `Audit result: goal paused as blocked — ${summarizeText(blockerText, 160)}. Run /${commandName} resume after addressing it.`,
+          )
+        } else {
+          announceLifecycle(sessionID, `Goal blocked. Run /${commandName} status for the reason.`, {
+            goal,
+            transition: "blocked",
+            expectedState: "blocked",
+            expectedStopReason: "blocked",
+          })
+        }
+        return messages.join(" ")
       } else if (status === "paused") {
-        goal.stopped = true
-        goal.stopReason = "paused"
-        goal.lastStatus = "Goal paused."
-        pushHistory(goal, "paused", "Paused via agent tool.")
-        messages.push("Goal paused.")
+        if (goal.stopped && goal.stopReason === "paused") {
+          if (!messages.length) return "Goal is already paused."
+          messages.push("Goal is already paused.")
+        } else {
+          goal.stopped = true
+          goal.stopReason = "paused"
+          goal.lastStatus = "Goal paused."
+          pushHistory(goal, "paused", "Paused via agent tool.")
+          messages.push("Goal paused.")
+          lifecycleNotice = {
+            text: "Goal paused.",
+            transition: "paused",
+            reason: goal.stopReason,
+            expectedState: "paused",
+            expectedStopReason: "paused",
+          }
+        }
       } else if (status === "resumed") {
         if (!goal.stopped)
           return "Goal is already running. Pause or stop it first if you want to reset the budget window."
@@ -3027,6 +3344,11 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
         goal.lastStatus = "Goal resumed with a fresh local budget."
         pushHistory(goal, "resumed", "Resumed via agent tool with a fresh local budget window.")
         messages.push("Goal resumed with fresh limits.")
+        lifecycleNotice = {
+          text: "Goal resumed with fresh limits.",
+          transition: "resumed",
+          expectedState: "active",
+        }
       }
     }
 
@@ -3034,6 +3356,15 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
       return "Nothing to update. Provide `objective` and/or `status`."
     }
     await persist(sessionID)
+    if (lifecycleNotice) {
+      announceLifecycle(sessionID, lifecycleNotice.text, {
+        goal,
+        transition: lifecycleNotice.transition,
+        reason: lifecycleNotice.reason,
+        expectedState: lifecycleNotice.expectedState,
+        expectedStopReason: lifecycleNotice.expectedStopReason,
+      })
+    }
     return messages.join(" ")
   }
 
@@ -3042,15 +3373,33 @@ function buildAgentToolHandlers({ defaultGoalOptions, persist, persistTerminalSt
     // focused goal + result. Without sessionGoals.delete, background goals added via
     // `/goal add` survive clear and resurrect as the focused goal on restart.
     // Record the clear in the ledger before cleanupGoal removes the goal object.
-    for (const goal of listSessionGoals(sessionID)) {
-      pushHistory(goal, "cleared", "Cleared via agent tool.")
-    }
+    const goals = listSessionGoals(sessionID)
+    const clearedGoal = goalStates.get(sessionID) || goals[0] || null
+    const hadState = goals.length > 0 || lastGoalResults.has(sessionID)
+    const ledgerDurable =
+      goals.length > 0 &&
+      goals.map((goal) => pushHistory(goal, "cleared", "Cleared via agent tool.")).every(Boolean)
     sessionOrdered.delete(sessionID)
     sessionGoals.delete(sessionID)
     cleanupGoal(sessionID)
     lastGoalResults.delete(sessionID)
-    await persistFinal(sessionID, "clear")
-    return "Goal cleared."
+    const durable = await persistFinal(sessionID, "clear", ledgerDurable)
+    const clearStillCurrent = !goalStates.has(sessionID) && listSessionGoals(sessionID).length === 0
+    if (hadState && clearStillCurrent) {
+      announceLifecycle(sessionID, durable === false
+        ? "Goal cleared in memory, but storage failed; it may reappear after restart."
+        : "Goal cleared.", {
+        goal: clearedGoal,
+        transition: durable === false ? "clear-persistence-failed" : "cleared",
+        requireCurrent: false,
+      })
+    }
+    if (!clearStillCurrent) {
+      return "Clear persistence finished after goal state changed; current state was left untouched."
+    }
+    return durable === false
+      ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
+      : "Goal cleared."
   }
 
   return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal }
@@ -3175,8 +3524,22 @@ function buildAgentTools(
         return goalToolFailure("already_running", "Goal is already running.")
       }
       const message = await handlers.updateGoal(sessionID, args)
-      if (args.status === "complete" && currentGoal(sessionID)) {
-        return goalToolFailure("completion_rejected", message)
+      if (args.status === "complete") {
+        if (
+          message !== AGENT_COMPLETE_SUCCESS ||
+          currentGoal(sessionID, before.goalId, before.runId)
+        ) {
+          return goalToolFailure("completion_rejected", message)
+        }
+      }
+      if (args.status === "blocked") {
+        const after = currentGoal(sessionID, before.goalId, before.runId)
+        if (after !== before) {
+          return goalToolFailure("goal_changed", message)
+        }
+        if (message !== AGENT_BLOCK_SUCCESS || !after.stopped || after.stopReason !== "blocked") {
+          return goalToolFailure("block_rejected", message)
+        }
       }
       return goalToolSuccess(message)
     },
@@ -3296,8 +3659,14 @@ function formatGoalList(sessionID, commandName = "goal") {
     lines.push(`Goals (${goals.length})${sessionOrdered.has(sessionID) ? " — ordered sequence" : ""}:`)
     goals.forEach((goal, index) => {
       const marker = goal.goalId === focusedId ? "focused" : goal.stopped ? "background" : "idle"
-      const state = goal.stopped && goal.goalId !== focusedId ? ` — ${goal.stopReason || "stopped"}` : ""
-      lines.push(`${index + 1}. [${marker}] ${goal.condition}${state}`)
+      const state = goalDisplayState(goal)
+      const reason = state === "blocked"
+        ? goal.blockedReason || goal.stopReason
+        : goal.stopped
+          ? goal.stopReason
+          : ""
+      const reasonText = reason ? ` (${summarizeText(reason, 160)})` : ""
+      lines.push(`${index + 1}. [${marker}] ${goal.condition} — state: ${state}${reasonText}`)
     })
     lines.push(`Switch with \`/${commandName} focus <number>\`.`)
   } else {
@@ -3337,6 +3706,37 @@ async function defaultAuditMessenger(client, sessionID, text) {
         title: "Goal workflow",
         message: summarizeText(text, 500),
         variant: /rejected|failed|blocked/i.test(text) ? "warning" : "info",
+        duration: 6000,
+      },
+    }))
+  }
+}
+
+// High-signal lifecycle feedback uses the same non-blocking host surfaces as
+// audit notices, but remains a separate channel so callers can configure each
+// independently. Messages are normalized and bounded before they reach either
+// host API; goal objectives, evidence, and workspace paths are deliberately
+// excluded by transition call sites.
+async function defaultLifecycleMessenger(client, sessionID, text) {
+  const message = summarizeText(text, 500)
+  const warning = /\b(?:paused|blocked|recovered|failed|passive)\b/i.test(message)
+  const success = /\b(?:achieved|completed)\b/i.test(message)
+  if (client?.app?.log) {
+    dispatchAdvisoryHostCall(() => client.app.log({
+      body: {
+        service: "opencode-goal-plugin",
+        level: warning ? "warn" : "info",
+        message,
+        extra: { sessionID, kind: "goal-lifecycle" },
+      },
+    }))
+  }
+  if (client?.tui?.showToast) {
+    dispatchAdvisoryHostCall(() => client.tui.showToast({
+      body: {
+        title: "Goal workflow",
+        message,
+        variant: warning ? "warning" : success ? "success" : "info",
         duration: 6000,
       },
     }))
@@ -3499,6 +3899,41 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return persistence.persistChain
   }
 
+  const lifecycleMessagesEnabled = pluginOptions.lifecycleMessages !== false
+  const lifecycleMessenger =
+    typeof pluginOptions.lifecycleMessenger === "function"
+      ? pluginOptions.lifecycleMessenger
+      : (sessionID, text) => defaultLifecycleMessenger(client, sessionID, text)
+  const announceLifecycle = (
+    sessionID,
+    text,
+    {
+      goal,
+      transition = "state",
+      reason = "",
+      requireCurrent = true,
+      expectedState = "",
+      expectedStopReason = "",
+    } = {},
+  ) => {
+    if (!lifecycleMessagesEnabled || !sessionID) return false
+    if (requireCurrent && goal) {
+      const current = goalStates.get(sessionID)
+      if (current !== goal) return false
+      if (expectedState && goalDisplayState(current) !== expectedState) return false
+      if (expectedStopReason && current.stopReason !== expectedStopReason) return false
+    }
+    const message = summarizeText(text, 500)
+    if (!message) return false
+    dispatchAdvisoryHostCall(
+      () => lifecycleMessenger(sessionID, message),
+      (error) => {
+        void logPluginError(client, "Failed to deliver goal lifecycle message", error).catch(() => {})
+      },
+    )
+    return true
+  }
+
   const passiveLoadResult = (entry) => ({
     kind: "passive",
     code: SESSION_OWNED_ELSEWHERE,
@@ -3596,7 +4031,40 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const status = await loadPersistedSessionState(persistence, client, sessionID)
         if (runtime.disposed) return releaseDisposedSession()
         pruneGoalResults(defaultGoalOptions)
-        if (status === "loaded" || status === "missing" || status === "reconstructed") await persist(sessionID)
+        if (
+          status === "loaded" ||
+          status === "missing" ||
+          status === "reconstructed" ||
+          status === "reconciled-blocked"
+        ) await persist(sessionID)
+        const recoveredGoal = goalStates.get(sessionID)
+        if (recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
+          announceLifecycle(sessionID, `Goal recovered and paused. Run /${commandName} status, then /${commandName} resume when ready.`, {
+            goal: recoveredGoal,
+            transition: "recovered-paused",
+            reason: recoveredGoal.stopReason,
+            expectedState: "paused",
+            expectedStopReason: "recovered after restart",
+          })
+        } else if (
+          status === "reconciled-blocked" &&
+          recoveredGoal?.stopped &&
+          recoveredGoal.stopReason === "blocked"
+        ) {
+          announceLifecycle(sessionID, `Goal recovered as blocked. Run /${commandName} status for the reason.`, {
+            goal: recoveredGoal,
+            transition: "recovered-blocked",
+            reason: recoveredGoal.blockedReason,
+            expectedState: "blocked",
+            expectedStopReason: "blocked",
+          })
+        } else if (recoveredGoal?.lastStatus === "Promoted as the next ordered goal.") {
+          announceLifecycle(sessionID, "Goal state recovered; the next ordered goal is active.", {
+            goal: recoveredGoal,
+            transition: "recovered-promoted",
+            expectedState: "active",
+          })
+        }
         if (runtime.disposed) return releaseDisposedSession()
         return ACTIVE_PERSISTENCE_OWNED
       } catch (error) {
@@ -3681,6 +4149,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                   reason: "owned verifier agent registration was not confirmed",
                 })
         : null
+  const completionAuditLabel =
+    typeof pluginOptions.auditor === "function"
+      ? "custom completion auditor"
+      : pluginOptions.completionAudit
+        ? "built-in independent verifier"
+        : "evidence gate only (independent verifier off)"
 
   clearRuntimeState()
 
@@ -3689,6 +4163,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     persist,
     persistTerminalState,
     completionAuditor,
+    completionAuditLabel,
+    announceAudit,
+    auditMessagesEnabled,
+    announceLifecycle,
     commandName,
   })
 
@@ -3714,6 +4192,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   ) => {
     const goal = goalStates.get(sessionID)
     if (!goal) return false
+    if (goal.stopped && goal.stopReason === reason) return false
     currentRuntime().continuationControllers.get(sessionID)?.abort()
     goal.stopped = true
     goal.stopReason = reason
@@ -3722,6 +4201,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     pushHistory(goal, "paused", history)
     activeContinues.delete(sessionID)
     await persist(sessionID)
+    announceLifecycle(sessionID, `Goal paused — ${summarizeText(reason, 160)}.`, {
+      goal,
+      transition: "paused",
+      reason,
+      expectedState: "paused",
+      expectedStopReason: reason,
+    })
     if (abortAccepted) await abortAcceptedContinuation(sessionID)
     return true
   }
@@ -3798,6 +4284,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       goal.stopReason = "continuation claim persistence failed"
       goal.lastStatus = `Auto-continue paused because its source-turn claim could not be persisted. Run /${commandName} resume after fixing storage.`
       pushHistory(goal, "paused", "Paused because the durable continuation source claim could not be persisted.")
+      announceLifecycle(sessionID, "Goal paused — continuation state could not be persisted.", {
+        goal,
+        transition: "continuation-persistence-failed",
+        reason: goal.stopReason,
+        expectedState: "paused",
+        expectedStopReason: "continuation claim persistence failed",
+      })
       return null
     }
     return goal
@@ -3992,7 +4485,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         replaceCommandOutputText(
           output,
           goal
-            ? formatStatus(goal, commandName)
+            ? formatStatus(goal, commandName, completionAuditLabel)
             : lastResult
               ? formatGoalResult(lastResult)
               : `No active goal. Set one with \`/${commandName} <condition>\`.`,
@@ -4033,15 +4526,35 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // sessionGoals.delete clears ALL backgrounded goals so they do not
         // resurrect as the focused goal on restart (cleanupGoal only removes the
         // focused one; background goals from `/goal add` would survive otherwise).
-        for (const goal of listSessionGoals(sessionID)) {
-          pushHistory(goal, "cleared", "User cleared the goal.")
-        }
+        const goals = listSessionGoals(sessionID)
+        const clearedGoal = goalStates.get(sessionID) || goals[0] || null
+        const hadState = goals.length > 0 || lastGoalResults.has(sessionID)
+        const ledgerDurable =
+          goals.length > 0 &&
+          goals.map((goal) => pushHistory(goal, "cleared", "User cleared the goal.")).every(Boolean)
         sessionOrdered.delete(sessionID)
         sessionGoals.delete(sessionID)
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
-        await persist(sessionID)
-        replaceCommandOutputText(output, "Goal cleared.")
+        const durable = await persistTerminalState(sessionID, "clear", ledgerDurable)
+        const clearStillCurrent = !goalStates.has(sessionID) && listSessionGoals(sessionID).length === 0
+        if (hadState && clearStillCurrent) {
+          announceLifecycle(sessionID, durable === false
+            ? "Goal cleared in memory, but storage failed; it may reappear after restart."
+            : "Goal cleared.", {
+            goal: clearedGoal,
+            transition: durable === false ? "clear-persistence-failed" : "cleared",
+            requireCurrent: false,
+          })
+        }
+        replaceCommandOutputText(
+          output,
+          !clearStillCurrent
+            ? "Clear persistence finished after goal state changed; current state was left untouched."
+            : durable === false
+              ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
+              : "Goal cleared.",
+        )
         return
       }
 
@@ -4049,6 +4562,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const goal = goalStates.get(sessionID)
         if (!goal) {
           replaceCommandOutputText(output, `No active goal. Set one with \`/${commandName} <condition>\`.`)
+          return
+        }
+        if (goal.stopped && goal.stopReason === "paused") {
+          replaceCommandOutputText(output, "Goal is already paused.")
           return
         }
         currentRuntime().continuationControllers.get(sessionID)?.abort()
@@ -4059,6 +4576,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         activeContinues.delete(sessionID)
         pushHistory(goal, "paused", "User paused the active goal.")
         await persist(sessionID)
+        announceLifecycle(sessionID, "Goal paused.", {
+          goal,
+          transition: "paused",
+          reason: goal.stopReason,
+          expectedState: "paused",
+          expectedStopReason: "paused",
+        })
         await abortAcceptedContinuation(sessionID)
         replaceCommandOutputText(output, `Goal paused: ${goal.condition}`)
         return
@@ -4085,6 +4609,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.lastStatus = "Goal resumed with a fresh local budget."
         pushHistory(goal, "resumed", "User resumed the goal with a fresh local budget window.")
         await persist(sessionID)
+        announceLifecycle(sessionID, "Goal resumed with fresh limits.", {
+          goal,
+          transition: "resumed",
+          expectedState: "active",
+        })
         replaceCommandOutputText(output, `Goal resumed with fresh limits: ${goal.condition}`, {
           startsWork: true,
         })
@@ -4132,6 +4661,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         goal.lastStatus = "Goal objective updated."
         pushHistory(goal, "edited", `Objective updated to: ${summarizeText(newObjective, 400)}`)
         await persist(sessionID)
+        announceLifecycle(sessionID, "Goal updated and active.", {
+          goal,
+          transition: "updated-active",
+          expectedState: "active",
+        })
         replaceCommandOutputText(
           output,
           [
@@ -4212,6 +4746,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         focusGoal(sessionID, firstGoal)
         sessionOrdered.add(sessionID)
         await persist(sessionID)
+        announceLifecycle(sessionID, `Ordered goal sequence active (${objectives.length} goals).`, {
+          goal: firstGoal,
+          transition: "sequence-active",
+          reason: String(objectives.length),
+          expectedState: "active",
+        })
         replaceCommandOutputText(
           output,
           [
@@ -4277,6 +4817,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         pushHistory(target, "focused", "Brought into focus as the session's active goal.")
         focusGoal(sessionID, target)
         await persist(sessionID)
+        announceLifecycle(sessionID, "Goal focus changed; selected goal active.", {
+          goal: target,
+          transition: "focused-active",
+          expectedState: "active",
+        })
         replaceCommandOutputText(
           output,
           [
@@ -4335,6 +4880,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         registerSessionGoal(added)
         focusGoal(sessionID, added)
         await persist(sessionID)
+        announceLifecycle(sessionID, current
+          ? "Goal added and active; previous goal backgrounded."
+          : "Goal added and active.", {
+          goal: added,
+          transition: current ? "added-active-backgrounded" : "added-active",
+          expectedState: "active",
+        })
         const total = listSessionGoals(sessionID).length
         replaceCommandOutputText(
           output,
@@ -4373,6 +4925,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       registerSessionGoal(goal)
       focusGoal(sessionID, goal)
       await persist(sessionID)
+      announceLifecycle(sessionID, replacedGoal ? "Goal replaced and active." : "Goal active.", {
+        goal,
+        transition: replacedGoal ? "replaced-active" : "active",
+        expectedState: "active",
+      })
       replaceCommandOutputText(
         output,
         [
@@ -4740,7 +5297,23 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
                 pushHistory(auditedGoal, "audit-rejected", `Completion audit rejected: ${summarizeText(reason, 300)}`)
                 await persist(sessionID)
-                await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
+                const rejectedGoalAfterPersist = currentGoal(sessionID, goalID, runID)
+                if (
+                  rejectedGoalAfterPersist !== auditedGoal ||
+                  !auditedGoal.stopped ||
+                  auditedGoal.stopReason !== "audit rejected"
+                ) return
+                if (auditMessagesEnabled) {
+                  await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
+                } else {
+                  announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
+                    goal: auditedGoal,
+                    transition: "audit-rejected",
+                    reason,
+                    expectedState: "paused",
+                    expectedStopReason: "audit rejected",
+                  })
+                }
                 return
               }
               pushHistory(
@@ -4760,23 +5333,80 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               `Assistant marked the goal complete with evidence: ${summarizeText(evidence, 400)}`,
             )
             const ordered = sessionOrdered.has(sessionID)
-            rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved", "", evidence)
+            const completedResult = rememberGoalResult(
+              sessionID,
+              activeGoalAfterMessages,
+              "achieved",
+              "",
+              evidence,
+            )
             cleanupGoal(sessionID)
             // Ordered sequence: auto-promote the next goal so the
             // session keeps working through the sequence without manual /goal focus.
-            if (ordered) {
-              promoteNextOrderedGoal(sessionID)
-            }
+            const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null
+            const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID)
             const durable = await persistTerminalState(sessionID, "completion", ledgerDurable)
             if (durable === false) {
-              restoreAfterTerminalPersistenceFailure(sessionID, activeGoalAfterMessages, { ordered })
-              await announceAudit(
+              const restored = restoreAfterTerminalPersistenceFailure(
                 sessionID,
-                "Audit result: completion verified, but storage failed; goal remains paused and was not archived.",
+                activeGoalAfterMessages,
+                {
+                  ordered,
+                  expectedCurrentSnapshot: postCompletionSnapshot,
+                  expectedResult: completedResult,
+                },
               )
+              if (auditMessagesEnabled) {
+                await announceAudit(
+                  sessionID,
+                  restored
+                    ? "Audit result: completion verified, but storage failed; goal remains paused and was not archived."
+                    : "Audit result: completion verified, but its terminal write failed after goal state changed; current state was left untouched.",
+                )
+              } else {
+                announceLifecycle(
+                  sessionID,
+                  restored
+                    ? "Goal paused — completion could not be recorded durably."
+                    : "Previous goal completion could not be confirmed durably after goal state changed.",
+                  restored
+                    ? {
+                        goal: activeGoalAfterMessages,
+                        transition: "terminal-persistence-failed",
+                        reason: activeGoalAfterMessages.stopReason,
+                        expectedState: "paused",
+                        expectedStopReason: "terminal persistence failed",
+                      }
+                    : {
+                        transition: "terminal-persistence-raced",
+                        requireCurrent: false,
+                      },
+                )
+              }
               return
             }
-            await announceAudit(sessionID, "Audit result: completion accepted — goal archived as achieved.")
+            const activePromoted = promoted
+              ? activeGoal(sessionID, promoted.goalId, promoted.runId)
+              : null
+            if (auditMessagesEnabled) {
+              await announceAudit(
+                sessionID,
+                activePromoted
+                  ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active."
+                  : "Audit result: completion accepted — goal archived as achieved.",
+              )
+            } else {
+              announceLifecycle(
+                sessionID,
+                activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.",
+                {
+                  goal: activePromoted || activeGoalAfterMessages,
+                  transition: activePromoted ? "achieved-promoted" : "achieved",
+                  requireCurrent: Boolean(activePromoted),
+                  expectedState: activePromoted ? "active" : "",
+                },
+              )
+            }
             return
           }
           completionUnverified = true
@@ -4802,16 +5432,41 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             blockedGoal.stopReason = "blocked"
             const ledgerDurable = pushHistory(blockedGoal, "blocked", reason)
             const durable = await persistTerminalState(sessionID, "blocked", ledgerDurable)
+            const blockedGoalAfterPersist = currentGoal(sessionID, goalID, runID)
+            if (
+              blockedGoalAfterPersist !== blockedGoal ||
+              !blockedGoal.stopped ||
+              blockedGoal.stopReason !== "blocked"
+            ) return
             if (durable === false) {
               blockedGoal.stopReason = "terminal persistence failed"
               blockedGoal.lastStatus = "Blocked state could not be persisted; goal remains paused."
-              await announceAudit(sessionID, "Audit result: blocker recognized, but storage failed; goal remains paused.")
+              if (auditMessagesEnabled) {
+                await announceAudit(sessionID, "Audit result: blocker recognized, but storage failed; goal remains paused.")
+              } else {
+                announceLifecycle(sessionID, "Goal paused — blocked state could not be recorded durably.", {
+                  goal: blockedGoal,
+                  transition: "terminal-persistence-failed",
+                  reason: blockedGoal.stopReason,
+                  expectedState: "paused",
+                  expectedStopReason: "terminal persistence failed",
+                })
+              }
               return
             }
-            await announceAudit(
-              sessionID,
-              `Audit result: goal paused as blocked — ${summarizeText(reason, 160)}. Run /${commandName} resume after addressing it.`,
-            )
+            if (auditMessagesEnabled) {
+              await announceAudit(
+                sessionID,
+                `Audit result: goal paused as blocked — ${summarizeText(reason, 160)}. Run /${commandName} resume after addressing it.`,
+              )
+            } else {
+              announceLifecycle(sessionID, `Goal blocked. Run /${commandName} status for the reason.`, {
+                goal: blockedGoal,
+                transition: "blocked",
+                expectedState: "blocked",
+                expectedStopReason: "blocked",
+              })
+            }
             return
           }
           blockerUnstated = true
@@ -4826,6 +5481,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
         const limitReason = stopReason(activeGoalAfterMessages)
         if (limitReason) {
+          let lifecycleAnnounced = false
           if (!activeGoalAfterMessages.budgetWrapupSent) {
             const claimedGoal = await claimContinuationSource(
               sessionID,
@@ -4842,6 +5498,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             claimedGoal.lastStatus = `${limitReason}; requested final handoff.`
             pushHistory(claimedGoal, "limit", `${limitReason}; requested a final handoff.`)
             await persist(sessionID)
+            lifecycleAnnounced = announceLifecycle(
+              sessionID,
+              `Goal paused — ${summarizeText(limitReason, 160)}; final handoff requested.`,
+              {
+                goal: claimedGoal,
+                transition: "limit-paused",
+                reason: limitReason,
+                expectedState: "paused",
+                expectedStopReason: limitReason,
+              },
+            )
             currentRuntime().promptInFlightSessions.add(sessionID)
             let response
             try {
@@ -4868,6 +5535,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             pushHistory(activeGoalAfterMessages, "limit", limitReason)
           }
           await persist(sessionID)
+          if (!lifecycleAnnounced) {
+            announceLifecycle(sessionID, `Goal paused — ${summarizeText(limitReason, 160)}; final handoff requested.`, {
+              goal: activeGoalAfterMessages,
+              transition: "limit-paused",
+              reason: limitReason,
+              expectedState: "paused",
+              expectedStopReason: limitReason,
+            })
+          }
           return
         }
 
@@ -4923,6 +5599,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               `Paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens.`,
             )
             await persist(sessionID)
+            announceLifecycle(sessionID, "Goal paused — no progress threshold reached.", {
+              goal: activeGoalAfterMessages,
+              transition: "no-progress-paused",
+              reason: activeGoalAfterMessages.stopReason,
+              expectedState: "paused",
+              expectedStopReason: "no progress",
+            })
             return
           }
 
@@ -4968,6 +5651,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               `Paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) that produced no tool calls.`,
             )
             await persist(sessionID)
+            announceLifecycle(sessionID, "Goal paused — no-tool-call threshold reached.", {
+              goal: activeGoalAfterMessages,
+              transition: "no-tool-calls-paused",
+              reason: activeGoalAfterMessages.stopReason,
+              expectedState: "paused",
+              expectedStopReason: "no tool calls",
+            })
             return
           }
 
@@ -5017,6 +5707,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // the hard-limit path which also persists before its promptAsync call.
           pushHistory(activeGoalBeforePrompt, "budget-wrapup", "Budget threshold reached; sending final handoff prompt.")
           await persist(sessionID)
+          announceLifecycle(sessionID, "Goal paused — budget threshold reached; final handoff requested.", {
+            goal: activeGoalBeforePrompt,
+            transition: "budget-wrapup-paused",
+            reason: activeGoalBeforePrompt.stopReason,
+            expectedState: "paused",
+            expectedStopReason: "budget wrap-up requested",
+          })
         }
 
         activeGoalBeforePrompt.turnCount += 1
@@ -5057,6 +5754,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s).`,
             )
             await persist(sessionID)
+            announceLifecycle(sessionID, "Goal paused — repeated completion/blocker format failures.", {
+              goal: activeGoalBeforePrompt,
+              transition: "format-failures-paused",
+              reason: activeGoalBeforePrompt.stopReason,
+              expectedState: "paused",
+              expectedStopReason: "format validation failures",
+            })
             return
           }
         }
@@ -5081,6 +5785,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           currentRuntime().promptInFlightSessions.delete(sessionID)
         }
 
+        let promptFailurePausedGoal = null
         if (response.error) {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
@@ -5096,6 +5801,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               activeGoalAfterPrompt.stopped = true
               activeGoalAfterPrompt.stopReason = "auto-continue failures"
               activeGoalAfterPrompt.lastStatus = `${message}; paused after ${activeGoalAfterPrompt.promptFailures} failure(s). Run /${commandName} resume to retry.`
+              promptFailurePausedGoal = activeGoalAfterPrompt
             }
           }
           await logPluginError(client, message, response.error)
@@ -5119,6 +5825,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
         }
         await persist(sessionID)
+        if (promptFailurePausedGoal) {
+          announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
+            goal: promptFailurePausedGoal,
+            transition: "prompt-failures-paused",
+            reason: promptFailurePausedGoal.stopReason,
+            expectedState: "paused",
+            expectedStopReason: "auto-continue failures",
+          })
+        }
       } catch (error) {
         const activeGoalAfterError = currentGoal(sessionID, goalID, runID)
         if (activeGoalAfterError) {
@@ -5139,6 +5854,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterError.lastStatus = `${message}; paused after ${activeGoalAfterError.promptFailures} failure(s). Run /${commandName} resume to retry.`
           }
           await persist(sessionID)
+          if (activeGoalAfterError.stopped && activeGoalAfterError.stopReason === "auto-continue failures") {
+            announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
+              goal: activeGoalAfterError,
+              transition: "prompt-failures-paused",
+              reason: activeGoalAfterError.stopReason,
+              expectedState: "paused",
+              expectedStopReason: "auto-continue failures",
+            })
+          }
         }
         await logPluginError(client, "Auto-continue failed", error)
       } finally {
@@ -5357,6 +6081,7 @@ export const testInternals = {
   ledgerPathFor,
   setLedgerSink,
   defaultAuditMessenger,
+  defaultLifecycleMessenger,
   buildAuditPrompt,
   parseAuditVerdict,
   createChildSessionAuditor,
@@ -5375,6 +6100,7 @@ export const testInternals = {
   extractCompletionEvidence,
   findLatestAssistantMessage,
   formatArgumentErrors,
+  goalDisplayState,
   formatStatus,
   getSessionID,
   goalIsBlocked,
