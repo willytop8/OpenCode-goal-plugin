@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-02
+
 - Make `/goal status` add explicit `State:` and `Completion audit:` lines without changing its existing `Active goal:` header; make `/goal list` report `active`, `paused`, or `blocked` and preserve the reason for stopped focused goals. Completion audit reporting distinguishes the evidence gate, built-in independent verifier, and custom completion auditor.
 - Add bounded, transition-only lifecycle notices through OpenCode's structured log and TUI toast, with independent `lifecycleMessages` and `lifecycleMessenger` controls. Delivery is advisory, does not create model turns, and does not announce routine idle/checkpoint activity. Completion/block uses the audit-result message when `auditMessages` is enabled and one lifecycle fallback only when it is disabled.
 - Harden lifecycle persistence around the new feedback path: failed completion writes cannot resurrect an older goal over newer session state, blocked ledger events repair a lagging snapshot with their concrete reason, and clear operations disclose when neither snapshot nor ledger recorded the deletion durably.
