@@ -50,6 +50,7 @@ const {
   readLedgerEntries,
   reconstructGoalsFromLedger,
   resolveStateFilePath,
+  runtimeSessionDiagnostics,
   sessionPathsFor,
   setLedgerSink,
   stopReason,
@@ -4000,27 +4001,33 @@ test("overlapping hooks for one session await its in-flight lazy load", async ()
     hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
     loading = hooks["chat.params"]({ sessionID, agent: "build" })
 
-    const shardLockPath = `${sessionStatePath(stateFilePath, sessionID)}.lock`
-    let shardLeaseObserved = false
+    let loadingStateObserved = false
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      try {
-        await stat(shardLockPath)
-        shardLeaseObserved = true
+      const diagnostics = runtimeSessionDiagnostics(sessionID)
+      if (diagnostics.persistenceOwned && diagnostics.loadInFlight) {
+        loadingStateObserved = true
         break
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error
-        await new Promise((resolve) => setTimeout(resolve, 5))
       }
+      await new Promise((resolve) => setTimeout(resolve, 5))
     }
-    assert.equal(shardLeaseObserved, true)
+    assert.equal(
+      loadingStateObserved,
+      true,
+      "the lease must be installed while the same session load remains in flight",
+    )
 
     let creationFinished = false
     creating = runGoal(hooks, sessionID, "new goal created during load").then((text) => {
       creationFinished = true
       return text
     })
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve()
     assert.equal(creationFinished, false, "the second hook must wait for the session load")
+    assert.equal(
+      currentGoal(sessionID),
+      null,
+      "the second hook must not mutate goal state while the session load is in flight",
+    )
 
     await migrationBlocker.release()
     await loading
@@ -4031,6 +4038,93 @@ test("overlapping hooks for one session await its in-flight lazy load", async ()
   } finally {
     await migrationBlocker.release().catch(() => false)
     await Promise.allSettled([loading, creating].filter(Boolean))
+    await hooks?.dispose()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("dispose during a blocked lazy load releases ownership without running goal controls", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "goal-plugin-dispose-load-race-"))
+  const stateFilePath = join(directory, "state.json")
+  const sessionID = "dispose-load-race"
+  const shardStatePath = sessionStatePath(stateFilePath, sessionID)
+  const migrationMarkerPath = join(`${stateFilePath}.sessions`, ".migration-v1-complete")
+  await writeFile(
+    stateFilePath,
+    JSON.stringify({ version: 1, goals: [], results: [] }),
+  )
+
+  const migrationBlocker = await acquirePersistenceLease(stateFilePath)
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+    },
+  }
+  const originalParts = [{ type: "text", text: "host-owned sentinel" }]
+  const output = { parts: originalParts }
+  let hooks
+  let command
+  let toolCall
+  let disposing
+  let replacement
+  try {
+    hooks = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    command = hooks["command.execute.before"](
+      { command: "goal", sessionID, arguments: "must never be created" },
+      output,
+    )
+    toolCall = hooks.tool.goal_set.execute(
+      { objective: "must never be set by a tool" },
+      { sessionID },
+    )
+
+    const shardLockPath = `${shardStatePath}.lock`
+    let blockedMigrationObserved = false
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const diagnostics = runtimeSessionDiagnostics(sessionID)
+      if (diagnostics.persistenceOwned && diagnostics.loadInFlight) {
+        blockedMigrationObserved = true
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(
+      blockedMigrationObserved,
+      true,
+      "the session must own its shard while blocked on the legacy migration lease",
+    )
+    await stat(shardLockPath)
+
+    disposing = hooks.dispose()
+    await migrationBlocker.release()
+    await disposing
+    await command
+    const toolResult = JSON.parse(await toolCall)
+
+    assert.strictEqual(output.parts, originalParts)
+    assert.deepEqual(output.parts, [{ type: "text", text: "host-owned sentinel" }])
+    assert.equal(toolResult.ok, false)
+    assert.equal(toolResult.error, "plugin_disposed")
+    assert.equal(currentGoal(sessionID), null)
+    await assert.rejects(readFile(shardStatePath, "utf8"), { code: "ENOENT" })
+    const legacyGuard = JSON.parse(await readFile(shardLockPath, "utf8"))
+    assert.equal(legacyGuard.sentinel, true)
+    assert.deepEqual(
+      (await readdir(`${shardLockPath}.claims-v2`)).filter((name) => name.startsWith("claim-")),
+      [],
+    )
+    await assert.rejects(stat(migrationMarkerPath), { code: "ENOENT" })
+    assert.match(await readFile(stateFilePath, "utf8"), /"version":1/)
+
+    replacement = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    const replacementText = await runGoal(replacement, sessionID, "replacement owns the session")
+    assert.match(replacementText, /New active goal: replacement owns the session/)
+  } finally {
+    await migrationBlocker.release().catch(() => false)
+    await Promise.allSettled([command, toolCall, disposing].filter(Boolean))
+    await replacement?.dispose()
     await hooks?.dispose()
     await rm(directory, { recursive: true, force: true })
   }
