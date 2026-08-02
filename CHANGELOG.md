@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Keep a second OpenCode process usable when it opens a session whose goal-state shard is already leased: ordinary chat and unrelated tools remain available, while goal commands and tools fail safely without reading, changing, or prompting from that session's goal state. After the owner exits, the next explicit goal command or tool retries ownership and reloads any active goal paused. Lease contention is now typed and owner metadata is sanitized; unrelated filesystem failures still fail closed.
+- Harden the single-writer lease with immutable per-owner claims so delayed publication, simultaneous stale reclaim, and concurrent release cannot remove a replacement owner's lease. A complete compatibility guard is published atomically with no replacement, preventing old/current startup races; legacy, incomplete, tampered, or unsupported lease layouts fail closed for explicit manual recovery. Owner reads remain bounded and symlink-safe, slow passive command guards keep blocking tools until an authenticated new boundary, delayed control errors cannot pause a newer goal run, takeover retains Plan/model execution context, and advisory host logging cannot stall loading or disposal.
+
 ## 0.6.7 — 2026-08-01
 
 - Fix `/goal` routing on OpenCode 1.17.15 and 1.18.10 by replacing the host-retained prompt parts in place, authenticating each resolved command turn (including host-expanded file attachments), framing control results with direct reporting instructions, blocking tools during those reporting turns, and excluding control responses from goal completion and progress analysis. Unreadable command attachments now become read-only error reports and pause safely without losing command provenance.

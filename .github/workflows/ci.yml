@@ -89,7 +89,7 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
       - name: Run portable lifecycle and filesystem tests
-        run: node --test test/host-lifecycle.test.js test/persistence-lease.test.js test/public-hook-cancellation.test.js
+        run: node --test test/host-lifecycle.test.js test/persistence-lease.test.js test/public-hook-cancellation.test.js test/session-concurrency.test.js
       - name: Compile installed-package type contracts on Windows
         if: runner.os == 'Windows'
         run: npm run type:check

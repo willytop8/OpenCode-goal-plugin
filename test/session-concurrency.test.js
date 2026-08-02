@@ -1,43 +1,18 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawn } from "node:child_process"
 import test from "node:test"
+import { GoalPlugin } from "../src/goal-plugin.js"
 
 function sessionStatePath(stateFilePath, sessionID) {
   const key = createHash("sha256").update(sessionID).digest("hex")
   return join(`${stateFilePath}.sessions`, key, "state.json")
 }
 
-function spawnGoalProcess(moduleURL, stateFilePath, sessionID, objective, { expectLeaseError = false } = {}) {
-  const action = expectLeaseError
-    ? `
-      try {
-        await hooks["command.execute.before"](
-          { command: "goal", sessionID: ${JSON.stringify(sessionID)}, arguments: ${JSON.stringify(objective)} },
-          { parts: [] },
-        )
-        process.stdout.write("UNEXPECTED\\n")
-        await hooks.dispose()
-        process.exit(1)
-      } catch (error) {
-        process.stdout.write("ERROR:" + (error?.message || error) + "\\n")
-        process.exit(0)
-      }
-    `
-    : `
-      await hooks["command.execute.before"](
-        { command: "goal", sessionID: ${JSON.stringify(sessionID)}, arguments: ${JSON.stringify(objective)} },
-        { parts: [] },
-      )
-      process.stdout.write("READY\\n")
-      process.stdin.once("data", async () => {
-        await hooks.dispose()
-        process.exit(0)
-      })
-    `
+function spawnGoalProcess(moduleURL, stateFilePath, sessionID, objective) {
   const source = `
     import { GoalPlugin } from ${JSON.stringify(moduleURL)}
     const client = {
@@ -48,7 +23,15 @@ function spawnGoalProcess(moduleURL, stateFilePath, sessionID, objective, { expe
       { client, directory: ${JSON.stringify(tmpdir())} },
       { stateFilePath: ${JSON.stringify(stateFilePath)}, registerTools: false, minDelayMs: 1 },
     )
-    ${action}
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: ${JSON.stringify(sessionID)}, arguments: ${JSON.stringify(objective)} },
+      { parts: [] },
+    )
+    process.stdout.write("READY\\n")
+    process.stdin.once("data", async () => {
+      await hooks.dispose()
+      process.exit(0)
+    })
   `
   const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -64,7 +47,7 @@ function spawnGoalProcess(moduleURL, stateFilePath, sessionID, objective, { expe
     }
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString()
-      if (stdout.includes(expectLeaseError ? "ERROR:" : "READY")) {
+      if (stdout.includes("READY")) {
         settled = true
         resolve({ stdout, stderr })
       }
@@ -115,29 +98,129 @@ test("independent sessions in one project persist concurrently in separate shard
   }
 })
 
-test("the same session remains single-writer across processes", async () => {
+test("a same-session process contender stays passive and takes over only after an explicit retry", async () => {
   const directory = await mkdtemp(join(tmpdir(), "goal-plugin-single-session-"))
   const stateFilePath = join(directory, "state.json")
   const moduleURL = new URL("../src/goal-plugin.js", import.meta.url).href
   const first = spawnGoalProcess(moduleURL, stateFilePath, "session-single-writer", "hold the session")
-  let second
+  const promptCalls = []
+  const messageCalls = []
+  const logs = []
+  let hostMessages = []
+  let contender
   try {
     await first.ready
-    second = spawnGoalProcess(
-      moduleURL,
-      stateFilePath,
-      "session-single-writer",
-      "take the session",
-      { expectLeaseError: true },
+    const persistedBefore = await readFile(
+      sessionStatePath(stateFilePath, "session-single-writer"),
+      "utf8",
     )
-    const result = await second.ready
-    assert.match(result.stdout, /goal persistence is already owned by pid/)
-    assert.equal(await waitForExit(second.child), 0)
+
+    contender = await GoalPlugin(
+      {
+        client: {
+          app: { log: async (input) => logs.push(input) },
+          session: {
+            messages: async (input) => {
+              messageCalls.push(input)
+              return { data: hostMessages }
+            },
+            promptAsync: async (input) => {
+              promptCalls.push(input)
+              return {}
+            },
+          },
+        },
+        directory,
+      },
+      { stateFilePath, registerTools: false, minDelayMs: 1 },
+    )
+
+    await assert.doesNotReject(() =>
+      contender["chat.params"]({ sessionID: "session-single-writer", agent: "build" }),
+    )
+    const denial = {
+      message: { id: "passive-command", role: "user", sessionID: "session-single-writer" },
+      parts: [],
+    }
+    await contender["command.execute.before"](
+      { command: "goal", sessionID: "session-single-writer", arguments: "status" },
+      denial,
+    )
+    assert.match(denial.parts[0].text, /Goal controls are unavailable/)
+    Object.assign(denial.parts[0], {
+      id: "passive-command-part",
+      messageID: "passive-command",
+      sessionID: "session-single-writer",
+    })
+    await contender["chat.message"](
+      { sessionID: "session-single-writer", messageID: "passive-command", agent: "build" },
+      denial,
+    )
+    hostMessages = [{
+      info: {
+        id: "passive-command-assistant",
+        parentID: "passive-command",
+        role: "assistant",
+        sessionID: "session-single-writer",
+      },
+      parts: [{ type: "text", text: "Ownership denial reported." }],
+    }]
+    await contender.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "session-single-writer", status: { type: "idle" } },
+      },
+    })
+    assert.equal(
+      await readFile(sessionStatePath(stateFilePath, "session-single-writer"), "utf8"),
+      persistedBefore,
+    )
+    assert.equal(promptCalls.length, 0)
+    assert.equal(messageCalls.length, 1)
+    assert.equal(logs.length, 1)
+
+    first.child.stdin.write("stop\n")
+    assert.equal(await waitForExit(first.child), 0)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    const ordinaryParts = [{ type: "text", text: "ordinary chat after owner exit" }]
+    await contender["chat.message"](
+      { sessionID: "session-single-writer", messageID: "ordinary-after-exit", agent: "build" },
+      {
+        message: { id: "ordinary-after-exit", role: "user", sessionID: "session-single-writer" },
+        parts: ordinaryParts,
+      },
+    )
+    assert.equal(ordinaryParts[0].text, "ordinary chat after owner exit")
+    const releasedLockPath = `${sessionStatePath(stateFilePath, "session-single-writer")}.lock`
+    const sentinel = JSON.parse(await readFile(releasedLockPath, "utf8"))
+    assert.equal(sentinel.protocol, 2)
+    assert.equal(sentinel.sentinel, true)
+    assert.deepEqual(
+      (await readdir(`${releasedLockPath}.claims-v2`))
+        .filter((name) => name.startsWith("claim-")),
+      [],
+    )
+
+    const takeover = { parts: [] }
+    await contender["command.execute.before"](
+      { command: "goal", sessionID: "session-single-writer", arguments: "status" },
+      takeover,
+    )
+    assert.match(takeover.parts[0].text, /hold the session/)
+    assert.match(takeover.parts[0].text, /recovered after restart|paused|stopped/i)
+    await contender.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "session-single-writer", status: { type: "idle" } },
+      },
+    })
+    assert.equal(promptCalls.length, 0)
   } finally {
     if (first.child.exitCode === null) first.child.stdin.write("stop\n")
-    await Promise.all([waitForExit(first.child), second ? waitForExit(second.child) : Promise.resolve()])
+    await waitForExit(first.child)
+    await contender?.dispose()
     first.child.kill()
-    second?.child.kill()
     await rm(directory, { recursive: true, force: true })
   }
 })

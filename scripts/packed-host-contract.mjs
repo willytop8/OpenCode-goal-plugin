@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -208,6 +209,116 @@ try {
 
   await hooks.dispose()
   await hooks.dispose()
+
+  // Prove the installed artifact keeps same-session contention graceful while
+  // retaining one durable writer and requiring an explicit takeover.
+  const persistentSessionID = "packed-host-passive-session"
+  const stateFilePath = join(projectDirectory, "packed-state.json")
+  const sessionKey = createHash("sha256").update(persistentSessionID).digest("hex")
+  const shardStatePath = join(`${stateFilePath}.sessions`, sessionKey, "state.json")
+  const shardLedgerPath = `${shardStatePath}.ledger.jsonl`
+  const passivePromptCalls = []
+  let persistentMessages = []
+  const persistentClient = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: persistentMessages }),
+      promptAsync: async (input) => {
+        passivePromptCalls.push(input)
+        return {}
+      },
+    },
+  }
+  const owner = await installed.GoalPlugin(
+    { client: persistentClient, directory: projectDirectory },
+    { stateFilePath, minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+  )
+  const contender = await installed.GoalPlugin(
+    { client: persistentClient, directory: projectDirectory },
+    { stateFilePath, minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+  )
+  try {
+    await owner["command.execute.before"](
+      {
+        command: "goal",
+        sessionID: persistentSessionID,
+        arguments: "persisted installed-artifact objective",
+      },
+      { parts: [] },
+    )
+    const stateBefore = await readFile(shardStatePath, "utf8")
+    const ledgerBefore = await readFile(shardLedgerPath, "utf8")
+
+    await contender["chat.params"]({ sessionID: persistentSessionID, agent: "build" })
+    const passiveMessageID = "packed-passive-command"
+    const passiveOutput = {
+      message: { id: passiveMessageID, role: "user", sessionID: persistentSessionID },
+      parts: [],
+    }
+    await contender["command.execute.before"](
+      { command: "goal", sessionID: persistentSessionID, arguments: "status" },
+      passiveOutput,
+    )
+    assert.match(passiveOutput.parts[0].text, /Goal controls are unavailable/)
+    Object.assign(passiveOutput.parts[0], {
+      id: "packed-passive-command-part",
+      messageID: passiveMessageID,
+      sessionID: persistentSessionID,
+    })
+    await contender["chat.message"](
+      { sessionID: persistentSessionID, messageID: passiveMessageID, agent: "build" },
+      passiveOutput,
+    )
+    const passiveAssistant = {
+      info: {
+        id: "packed-passive-command-assistant",
+        parentID: passiveMessageID,
+        role: "assistant",
+        sessionID: persistentSessionID,
+      },
+      parts: [{ type: "text", text: "Ownership denial reported." }],
+    }
+    persistentMessages = [passiveAssistant]
+    await contender.event({
+      event: {
+        type: "message.updated",
+        properties: { info: passiveAssistant.info },
+      },
+    })
+    await contender.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: persistentSessionID, status: { type: "idle" } },
+      },
+    })
+    const passiveStatus = JSON.parse(
+      await contender.tool.goal_status.execute({}, { sessionID: persistentSessionID }),
+    )
+    assert.equal(passiveStatus.ok, false)
+    assert.equal(passiveStatus.error, "session_owned_elsewhere")
+    assert.equal(await readFile(shardStatePath, "utf8"), stateBefore)
+    assert.equal(await readFile(shardLedgerPath, "utf8"), ledgerBefore)
+    assert.equal(passivePromptCalls.length, 0)
+
+    await owner.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const takeover = JSON.parse(
+      await contender.tool.goal_status.execute({}, { sessionID: persistentSessionID }),
+    )
+    assert.equal(takeover.ok, true)
+    assert.match(takeover.message, /persisted installed-artifact objective/)
+    assert.match(takeover.message, /recovered after restart|paused|stopped/i)
+    await contender.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: persistentSessionID, status: { type: "idle" } },
+      },
+    })
+    assert.equal(passivePromptCalls.length, 0)
+  } finally {
+    await owner.dispose()
+    await contender.dispose()
+  }
 
   console.log(
     `packed host contract passed (${installedManifest.name}@${installedManifest.version}; ${packResult[0].size} byte tarball)`,

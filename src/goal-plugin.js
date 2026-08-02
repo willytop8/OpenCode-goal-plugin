@@ -19,7 +19,10 @@ import { createOpenCodeSessionApi } from "./opencode-session-api.js"
 import { applyNativeGoalConfig } from "./native-agent-config.js"
 import { serializeCompletionClaim } from "./completion-claim.js"
 import { goalToolFailure, goalToolSuccess, serializeGoalToolResult } from "./goal-tool-result.js"
-import { acquirePersistenceLease } from "./persistence-lease.js"
+import {
+  acquirePersistenceLease,
+  isPersistenceLeaseContendedError,
+} from "./persistence-lease.js"
 
 const STATE_FILE_VERSION = 1
 // Default state now follows the project: <cwd>/.opencode/goals/state.json.
@@ -56,6 +59,11 @@ const DEFAULT_LEDGER_RETENTION_FILES = 3
 const MAX_LEDGER_LINE_BYTES = 16 * 1024
 const MIGRATION_LEASE_RETRIES = 200
 const MIGRATION_LEASE_DELAY_MS = 25
+const PASSIVE_SESSION_RETRY_MS = 250
+const SESSION_OWNED_ELSEWHERE = "session_owned_elsewhere"
+const ACTIVE_PERSISTENCE_DISABLED = Object.freeze({ kind: "active", persistence: "disabled" })
+const ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "owned" })
+const PLUGIN_DISPOSED = Object.freeze({ kind: "disposed" })
 
 const DEFAULT_OPTIONS = {
   maxTurns: 10,
@@ -104,6 +112,7 @@ function createRuntimeState() {
     ledgerSink: null,
     sessionPersistence: new Map(),
     sessionLoadPromises: new Map(),
+    passiveSessions: new Map(),
     disposed: false,
   }
 }
@@ -113,6 +122,19 @@ let lastRuntime = createRuntimeState()
 
 function currentRuntime() {
   return runtimeStorage.getStore() || lastRuntime
+}
+
+function runtimeSessionDiagnostics(sessionID) {
+  const runtime = currentRuntime()
+  return Object.freeze({
+    disposed: runtime.disposed,
+    loadInFlight: runtime.sessionLoadPromises.has(sessionID),
+    persistenceOwned: runtime.sessionPersistence.has(sessionID),
+    passive: runtime.passiveSessions.has(sessionID),
+    suppressedAssistantCount: [...runtime.suppressedCommandAssistants.values()]
+      .filter((ownerSessionID) => ownerSessionID === sessionID)
+      .length,
+  })
 }
 
 // Route the existing domain helpers to the plugin instance associated with the
@@ -341,6 +363,24 @@ function normalizeExecutionContext(value) {
     ...(providerID && modelID ? { model: { providerID, modelID } } : {}),
     ...(variant ? { variant } : {}),
   }
+}
+
+function rememberSessionExecutionContext(sessionID, value, { replace = false } = {}) {
+  if (!sessionID) return null
+  const observed = normalizeExecutionContext(value)
+  if (!observed) return null
+  const runtime = currentRuntime()
+  if (replace) {
+    runtime.sessionExecutionContexts.set(sessionID, observed)
+    return observed
+  }
+  const previous = normalizeExecutionContext(runtime.sessionExecutionContexts.get(sessionID)) || {}
+  const merged = {
+    ...previous,
+    ...observed,
+  }
+  runtime.sessionExecutionContexts.set(sessionID, merged)
+  return merged
 }
 
 function continuationContextInput(goal) {
@@ -841,9 +881,13 @@ function clearRuntimeState() {
   runtime.activeCommandTurns.clear()
   runtime.ownedPluginMessages.clear()
   runtime.suppressedCommandAssistants.clear()
+  runtime.passiveSessions.clear()
 }
 
-function clearSessionRuntimeState(sessionID) {
+function clearSessionRuntimeState(
+  sessionID,
+  { preserveCommandSecurity = false, preserveExecutionContext = false } = {},
+) {
   const runtime = currentRuntime()
   for (const goal of sessionGoals.get(sessionID)?.values() || []) {
     for (const messageID of goal.messageIDs || []) {
@@ -862,14 +906,17 @@ function clearSessionRuntimeState(sessionID) {
   runtime.continuationControllers.delete(sessionID)
   runtime.promptInFlightSessions.delete(sessionID)
   runtime.sessionStatuses.delete(sessionID)
-  runtime.sessionExecutionContexts.delete(sessionID)
-  runtime.pendingCommandTurns.delete(sessionID)
-  runtime.activeCommandTurns.delete(sessionID)
-  for (const [messageID, owner] of runtime.ownedPluginMessages) {
-    if (owner?.sessionID === sessionID) runtime.ownedPluginMessages.delete(messageID)
-  }
-  for (const [messageID, ownerSessionID] of runtime.suppressedCommandAssistants) {
-    if (ownerSessionID === sessionID) runtime.suppressedCommandAssistants.delete(messageID)
+  if (!preserveExecutionContext) runtime.sessionExecutionContexts.delete(sessionID)
+  runtime.passiveSessions.delete(sessionID)
+  if (!preserveCommandSecurity) {
+    runtime.pendingCommandTurns.delete(sessionID)
+    runtime.activeCommandTurns.delete(sessionID)
+    for (const [messageID, owner] of runtime.ownedPluginMessages) {
+      if (owner?.sessionID === sessionID) runtime.ownedPluginMessages.delete(messageID)
+    }
+    for (const [messageID, ownerSessionID] of runtime.suppressedCommandAssistants) {
+      if (ownerSessionID === sessionID) runtime.suppressedCommandAssistants.delete(messageID)
+    }
   }
 }
 
@@ -1441,7 +1488,12 @@ async function applyParsedStateFile(raw, client, onlySessionID = null) {
     )
   }
 
-  if (onlySessionID) clearSessionRuntimeState(onlySessionID)
+  if (onlySessionID) {
+    clearSessionRuntimeState(onlySessionID, {
+      preserveCommandSecurity: true,
+      preserveExecutionContext: true,
+    })
+  }
   else clearRuntimeState()
 
   const focusBySession = new Map()
@@ -1552,7 +1604,7 @@ async function acquireMigrationLease(stateFilePath, migrationMarkerPath) {
     try {
       return await acquirePersistenceLease(stateFilePath)
     } catch (error) {
-      if (!String(error?.message || error).includes("goal persistence is already owned")) throw error
+      if (!isPersistenceLeaseContendedError(error)) throw error
       lastError = error
       await new Promise((resolve) => setTimeout(resolve, MIGRATION_LEASE_DELAY_MS))
     }
@@ -1682,6 +1734,7 @@ async function migrateLegacyState(persistenceOptions, client) {
     )
     if (!migrationLease) return
     try {
+      if (currentRuntime().disposed) return
       if (await pathExists(persistenceOptions.migrationMarkerPath)) return
 
       const state = await readPersistedStateFile(candidate.stateFilePath, client)
@@ -1736,6 +1789,7 @@ async function migrateLegacyState(persistenceOptions, client) {
 
   // A fresh project has no aggregate or legacy state. Mark the namespace so a
   // later session does not repeatedly probe global fallback paths.
+  if (currentRuntime().disposed) return
   await writeMigrationMarker(persistenceOptions.migrationMarkerPath)
 }
 
@@ -1777,7 +1831,12 @@ async function reconstructFromLedger(persistenceOptions, client, onlySessionID =
   )
   if (!reconstructed.length) return "missing"
 
-  if (onlySessionID) clearSessionRuntimeState(onlySessionID)
+  if (onlySessionID) {
+    clearSessionRuntimeState(onlySessionID, {
+      preserveCommandSecurity: true,
+      preserveExecutionContext: true,
+    })
+  }
   else clearRuntimeState()
   const focusCandidates = new Map()
   for (const stub of reconstructed) {
@@ -1847,24 +1906,46 @@ async function persistState(persistence, client, sessionID) {
   }
 }
 
-async function logPluginError(client, message, error) {
+function dispatchAdvisoryHostCall(call, onFailure = () => {}) {
+  try {
+    // Host notices are diagnostic only. Start the SDK request immediately,
+    // contain both synchronous and asynchronous failures, and never let a
+    // stalled host promise retain a persistence lease or block goal controls.
+    void Promise.resolve(call()).catch(onFailure)
+  } catch (error) {
+    onFailure(error)
+  }
+}
+
+async function logPluginMessage(client, level, message, error) {
+  const fallback = () => {
+    const logger = level === "warn" ? console.warn : console.error
+    logger("[goal-plugin]", message, error || "")
+  }
   if (client?.app?.log) {
-    try {
-      await client.app.log({
+    return dispatchAdvisoryHostCall(
+      () => client.app.log({
         body: {
           service: "opencode-goal-plugin",
-          level: "error",
+          level,
           message,
-          extra: { error: error?.message || error?.name || String(error) },
+          ...(error === undefined
+            ? {}
+            : { extra: { error: error?.message || error?.name || String(error) } }),
         },
-      })
-      return
-    } catch {
-      // Logging must never poison persistence or leak an acquired lease.
-    }
+      }),
+      fallback,
+    )
   }
+  fallback()
+}
 
-  console.error("[goal-plugin]", message, error || "")
+async function logPluginError(client, message, error) {
+  return logPluginMessage(client, "error", message, error)
+}
+
+async function logPluginWarning(client, message) {
+  return logPluginMessage(client, "warn", message)
 }
 
 function parseGoalArguments(args, defaults) {
@@ -2459,7 +2540,14 @@ function pluginMessageMatches(message, kind, correlationID) {
   return Boolean(correlationID) && pluginMessageCorrelationID(message, kind) === correlationID
 }
 
-function rememberOwnedPluginMessage(message, sessionID, kind, correlationID, policy = "") {
+function rememberOwnedPluginMessage(
+  message,
+  sessionID,
+  kind,
+  correlationID,
+  policy = "",
+  passive = false,
+) {
   const id = messageID(message)
   if (!id) return
   setBoundedMessageValue(currentRuntime().ownedPluginMessages, id, {
@@ -2467,7 +2555,32 @@ function rememberOwnedPluginMessage(message, sessionID, kind, correlationID, pol
     kind,
     correlationID,
     ...(policy ? { policy } : {}),
+    ...(passive ? { passive: true } : {}),
   })
+}
+
+function suppressControlCommandAssistant(message) {
+  const currentMessageID = messageID(message)
+  const currentSessionID = messageSessionID(message)
+  if (!currentMessageID || !currentSessionID) return false
+  const runtime = currentRuntime()
+  const parentOwner = runtime.ownedPluginMessages.get(messageParentID(message))
+  const isControlCommandAssistant =
+    messageRole(message) === "assistant" &&
+    parentOwner?.kind === "command" &&
+    parentOwner?.policy === "control" &&
+    parentOwner?.sessionID === currentSessionID
+  if (!isControlCommandAssistant) return false
+  // A control command may produce several assistant messages (for example, a
+  // blocked tool-call step followed by a final report). Authenticate each
+  // response through its owned parent user message and suppress it immediately
+  // so later idle processing cannot treat it as goal progress or completion.
+  setBoundedMessageValue(
+    runtime.suppressedCommandAssistants,
+    currentMessageID,
+    currentSessionID,
+  )
+  return parentOwner?.passive === true ? "passive" : "control"
 }
 
 function isOwnedPluginMessage(message, kind, ownedMessages = currentRuntime().ownedPluginMessages) {
@@ -2522,16 +2635,26 @@ function isPluginGeneratedMessage(message, ownedMessages = currentRuntime().owne
   )
 }
 
+function pruneExpiredPendingCommandTurns(sessionID, now = Date.now()) {
+  const runtime = currentRuntime()
+  const pending = runtime.pendingCommandTurns.get(sessionID)
+  if (pending) {
+    for (const [id, turn] of pending) {
+      if (now - turn.createdAt > COMMAND_TURN_TTL_MS) pending.delete(id)
+    }
+    if (pending.size === 0) runtime.pendingCommandTurns.delete(sessionID)
+  }
+
+}
+
 function registerPendingCommandTurn(sessionID, output) {
   const runtime = currentRuntime()
   const now = Date.now()
+  pruneExpiredPendingCommandTurns(sessionID, now)
   let pending = runtime.pendingCommandTurns.get(sessionID)
   if (!pending) {
     pending = new Map()
     runtime.pendingCommandTurns.set(sessionID, pending)
-  }
-  for (const [id, turn] of pending) {
-    if (now - turn.createdAt > COMMAND_TURN_TTL_MS) pending.delete(id)
   }
   while (pending.size >= MAX_PENDING_COMMAND_TURNS_PER_SESSION) {
     pending.delete(pending.keys().next().value)
@@ -2930,12 +3053,70 @@ function agentToolSessionID(ctx) {
 // helper's unrelated SDK/effect dependency graph in every consumer project.
 const bundledToolHelper = Object.assign((definition) => definition, { schema: z })
 
-function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () => true) {
+function sessionOwnedElsewhereMessage(
+  commandName = "goal",
+  commandRegistered = true,
+  reason = "owned_elsewhere",
+) {
+  const retryTarget = commandRegistered
+    ? `\`/${commandName} status\``
+    : "the `goal_status` tool"
+  if (reason === "legacy_lock") {
+    return (
+      "Goal controls are unavailable because this session has an older or incomplete persistence lease. " +
+      "No goal state was read or changed here. Ordinary chat remains available. " +
+      "Close every OpenCode process using this session and upgrade them first. If the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or open a fork with `opencode --continue --fork`, " +
+      `then retry ${retryTarget}.`
+    )
+  }
+  return (
+    "Goal controls are unavailable in this OpenCode instance because another process owns this session's goal workflow. " +
+    "No goal state was read or changed here. Ordinary chat remains available. " +
+    `Close the owning process or open a fork with \`opencode --continue --fork\`, then retry ${retryTarget}.`
+  )
+}
+
+function inactiveGoalToolResult(
+  loadResult,
+  commandName = "goal",
+  disposed = false,
+  commandRegistered = true,
+) {
+  if (disposed || loadResult?.kind === "disposed") {
+    return goalToolFailure("plugin_disposed", "The goal plugin is no longer active in this process.")
+  }
+  if (loadResult?.kind === "passive") {
+    return goalToolFailure(
+      SESSION_OWNED_ELSEWHERE,
+      sessionOwnedElsewhereMessage(commandName, commandRegistered, loadResult.reason),
+    )
+  }
+  return null
+}
+
+function buildAgentTools(
+  toolHelper,
+  handlers,
+  ensureSessionLoaded = async () => ACTIVE_PERSISTENCE_DISABLED,
+  commandName = "goal",
+  isDisposed = () => false,
+  commandRegistered = true,
+) {
   const schema = toolHelper.schema
   const run = (handler) => async (args, ctx) => {
     const sessionID = agentToolSessionID(ctx)
     if (!sessionID) return "No session id available for the goal tool."
-    await ensureSessionLoaded(sessionID)
+    const loadResult = await ensureSessionLoaded(sessionID, {
+      retryPassive: true,
+      executionContext: ctx,
+    })
+    const unavailable = inactiveGoalToolResult(
+      loadResult,
+      commandName,
+      isDisposed(),
+      commandRegistered,
+    )
+    if (unavailable) return unavailable.message
     return handler(sessionID, args || {})
   }
   // Canonical tools use a small, versioned machine-readable envelope. Keep the
@@ -2949,7 +3130,17 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
         goalToolFailure("missing_session", "No session id available for the goal tool."),
       )
     }
-    await ensureSessionLoaded(sessionID)
+    const loadResult = await ensureSessionLoaded(sessionID, {
+      retryPassive: true,
+      executionContext: ctx,
+    })
+    const unavailable = inactiveGoalToolResult(
+      loadResult,
+      commandName,
+      isDisposed(),
+      commandRegistered,
+    )
+    if (unavailable) return serializeGoalToolResult(operation, unavailable)
     return serializeGoalToolResult(operation, await handler(sessionID, args || {}))
   }
 
@@ -3118,24 +3309,24 @@ function formatGoalList(sessionID, commandName = "goal") {
 // once a non-prompting message API is available.
 async function defaultAuditMessenger(client, sessionID, text) {
   if (client?.app?.log) {
-    await client.app.log({
+    dispatchAdvisoryHostCall(() => client.app.log({
       body: {
         service: "opencode-goal-plugin",
         level: "info",
         message: text,
         extra: { sessionID, kind: "goal-audit" },
       },
-    })
+    }))
   }
   if (client?.tui?.showToast) {
-    await client.tui.showToast({
+    dispatchAdvisoryHostCall(() => client.tui.showToast({
       body: {
         title: "Goal workflow",
         message: summarizeText(text, 500),
         variant: /rejected|failed|blocked/i.test(text) ? "warning" : "info",
         duration: 6000,
       },
-    })
+    }))
   }
 }
 
@@ -3295,11 +3486,69 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return persistence.persistChain
   }
 
-  const ensureSessionLoaded = async (sessionID) => {
-    if (!persistenceOptions.persistState || !sessionID) return true
+  const passiveLoadResult = (entry) => ({
+    kind: "passive",
+    code: SESSION_OWNED_ELSEWHERE,
+    reason: entry.reason,
+    owner: entry.owner,
+    retryAt: entry.retryAt,
+  })
+
+  const enterPassiveSession = async (sessionID, error) => {
+    const previous = runtime.passiveSessions.get(sessionID)
+    clearSessionRuntimeState(sessionID, {
+      preserveCommandSecurity: Boolean(previous),
+      preserveExecutionContext: true,
+    })
+    const entry = {
+      code: SESSION_OWNED_ELSEWHERE,
+      reason: error.reason,
+      owner: error.owner,
+      firstObservedAt: previous?.firstObservedAt || Date.now(),
+      retryAt: Date.now() + PASSIVE_SESSION_RETRY_MS,
+      warned: true,
+    }
+    runtime.passiveSessions.set(sessionID, entry)
+    if (!previous?.warned) {
+      const owner = entry.owner?.pid && entry.owner?.hostname
+        ? `pid ${entry.owner.pid} on ${entry.owner.hostname}`
+        : "another process"
+      const warning = entry.reason === "legacy_lock"
+        ? "Goal controls are passive for this session because its persistence lease is from an older release or is incomplete. Ordinary chat remains available. Close every OpenCode process using this session and upgrade them; if the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or fork the session before retrying goal controls."
+        : `Goal controls are passive for this session because ${owner} owns its persistence lease. Ordinary chat remains available; close the owner or fork the session before retrying goal controls.`
+      // Host logging is advisory. A broken or backpressured logger must not
+      // turn passive mode back into the session-wide hang it is meant to
+      // prevent, and the contained rejection avoids an unhandled promise.
+      void logPluginWarning(
+        client,
+        warning,
+      ).catch(() => {})
+    }
+    return passiveLoadResult(entry)
+  }
+
+  const ensureSessionLoaded = async (
+    sessionID,
+    { retryPassive = false, executionContext, freshCommandBoundary = false } = {},
+  ) => {
+    if (runtime.disposed) return PLUGIN_DISPOSED
+    rememberSessionExecutionContext(sessionID, executionContext)
+    if (!persistenceOptions.persistState || !sessionID) return ACTIVE_PERSISTENCE_DISABLED
     const existingLoad = runtime.sessionLoadPromises.get(sessionID)
     if (existingLoad) return existingLoad
-    if (runtime.sessionPersistence.has(sessionID)) return true
+    if (runtime.sessionPersistence.has(sessionID)) return ACTIVE_PERSISTENCE_OWNED
+
+    const passive = runtime.passiveSessions.get(sessionID)
+    pruneExpiredPendingCommandTurns(sessionID)
+    const commandTurnInFlight =
+      runtime.pendingCommandTurns.has(sessionID) ||
+      (!freshCommandBoundary && runtime.activeCommandTurns.has(sessionID))
+    if (
+      passive &&
+      (!retryPassive || commandTurnInFlight || Date.now() < passive.retryAt)
+    ) {
+      return passiveLoadResult(passive)
+    }
 
     const load = (async () => {
       const paths = sessionPathsFor(persistenceOptions, sessionID)
@@ -3307,20 +3556,36 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         ...persistenceOptions,
         stateFilePath: paths.stateFilePath,
       })
-      const lease = await acquirePersistenceLease(paths.stateFilePath)
+      let lease
+      try {
+        lease = await acquirePersistenceLease(paths.stateFilePath)
+      } catch (error) {
+        if (!isPersistenceLeaseContendedError(error)) throw error
+        return enterPassiveSession(sessionID, error)
+      }
+      const releaseDisposedSession = async () => {
+        runtime.sessionPersistence.delete(sessionID)
+        await lease.release().catch(() => false)
+        return PLUGIN_DISPOSED
+      }
+      if (runtime.disposed) return releaseDisposedSession()
       const persistence = {
         ...persistenceOptions,
         ...paths,
         persistChain: Promise.resolve(true),
         lease,
       }
+      runtime.passiveSessions.delete(sessionID)
       runtime.sessionPersistence.set(sessionID, persistence)
       try {
         await migrateLegacyState(persistenceOptions, client)
+        if (runtime.disposed) return releaseDisposedSession()
         const status = await loadPersistedSessionState(persistence, client, sessionID)
+        if (runtime.disposed) return releaseDisposedSession()
         pruneGoalResults(defaultGoalOptions)
         if (status === "loaded" || status === "missing" || status === "reconstructed") await persist(sessionID)
-        return true
+        if (runtime.disposed) return releaseDisposedSession()
+        return ACTIVE_PERSISTENCE_OWNED
       } catch (error) {
         runtime.sessionPersistence.delete(sessionID)
         await lease.release().catch(() => false)
@@ -3525,6 +3790,42 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return goal
   }
 
+  const retireCompletedCommandTurnOnIdle = async (sessionID, messageLimit) => {
+    const runtime = currentRuntime()
+    const activeCommandTurn = runtime.activeCommandTurns.get(sessionID)
+    if (!activeCommandTurn) return { ready: true, messages: null }
+
+    const commandHostMessages = await sessionApi.messages(sessionID, {
+      limit: messageLimit,
+    })
+    if (runtime.disposed) return { ready: false, messages: null }
+    const commandMessages = Array.isArray(commandHostMessages)
+      ? commandHostMessages.slice(-messageLimit)
+      : []
+    if (runtime.activeCommandTurns.get(sessionID) !== activeCommandTurn) {
+      return { ready: false, messages: commandMessages }
+    }
+    const commandAssistant = findLatestAssistantMessage(commandMessages)
+    if (
+      !commandAssistant ||
+      messageParentID(commandAssistant) !== activeCommandTurn.messageID
+    ) {
+      return { ready: false, messages: commandMessages }
+    }
+    if (activeCommandTurn.policy === "control") {
+      const commandAssistantID = messageID(commandAssistant)
+      if (commandAssistantID) {
+        setBoundedMessageValue(
+          runtime.suppressedCommandAssistants,
+          commandAssistantID,
+          sessionID,
+        )
+      }
+    }
+    runtime.activeCommandTurns.delete(sessionID)
+    return { ready: true, messages: commandMessages }
+  }
+
   const hooks = {
     config: async (config) => {
       applyNativeGoalConfig(config, {
@@ -3535,20 +3836,29 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "chat.params": async (input) => {
       if (!input?.sessionID) return
-      await ensureSessionLoaded(input.sessionID)
-      const context = normalizeExecutionContext({
-        agent: input.agent,
-        model: input.model,
-        variant: input?.message?.model?.variant,
+      const loadResult = await ensureSessionLoaded(input.sessionID, {
+        executionContext: input,
       })
-      if (context) currentRuntime().sessionExecutionContexts.set(input.sessionID, context)
+      if (currentRuntime().disposed || loadResult.kind === "disposed") return
+      rememberSessionExecutionContext(
+        input.sessionID,
+        {
+          agent: input.agent,
+          model: input.model,
+          variant:
+            input.variant ?? input?.model?.variant ?? input?.message?.model?.variant,
+        },
+        { replace: true },
+      )
     },
     "chat.message": async (input, output) => {
       const sessionID = input?.sessionID
       if (!sessionID) return
-      await ensureSessionLoaded(sessionID)
-      const context = normalizeExecutionContext(input)
-      if (context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+      const loadResult = await ensureSessionLoaded(sessionID, {
+        executionContext: input,
+      })
+      if (currentRuntime().disposed) return
+      rememberSessionExecutionContext(sessionID, input, { replace: true })
 
       const message = {
         info: isPlainObject(output?.message)
@@ -3581,6 +3891,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           "command",
           commandTurn.id,
           commandTurn.policy,
+          commandTurn.passive === true,
         )
         return
       }
@@ -3590,6 +3901,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // in flight; public synthetic/metadata fields alone are never trusted.
       runtime.pendingCommandTurns.delete(sessionID)
       runtime.activeCommandTurns.delete(sessionID)
+      if (loadResult.kind !== "active") return
       const continuationID = activeContinues.get(sessionID)
       if (
         currentMessageID &&
@@ -3615,6 +3927,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       const sessionID = input?.sessionID
       if (!sessionID) return
       await ensureSessionLoaded(sessionID)
+      if (currentRuntime().disposed) return
       if (currentRuntime().activeCommandTurns.get(sessionID)?.policy !== "control") return
       throw new Error(
         `This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`,
@@ -3625,8 +3938,26 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const sessionID = input.sessionID
       if (!sessionID) return
-      await ensureSessionLoaded(sessionID)
-      registerPendingCommandTurn(sessionID, output)
+      // A fresh slash command is an authenticated boundary that may retry a
+      // passive lease without waiting forever for an orphaned older reply.
+      // Keep the old active guard installed during the asynchronous load so
+      // tools from that older turn remain blocked; accepting this new command
+      // in chat.message atomically replaces the guard.
+      const loadResult = await ensureSessionLoaded(sessionID, {
+        retryPassive: true,
+        freshCommandBoundary: true,
+      })
+      if (currentRuntime().disposed || loadResult.kind === "disposed") return
+      const commandTurn = registerPendingCommandTurn(sessionID, output)
+
+      if (loadResult.kind === "passive") {
+        commandTurn.passive = true
+        replaceCommandOutputText(
+          output,
+          sessionOwnedElsewhereMessage(commandName, true, loadResult.reason),
+        )
+        return
+      }
 
       if (typeof input.arguments !== "string") {
         replaceCommandOutputText(output, "Goal command arguments must be text.")
@@ -4061,9 +4392,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     event: async ({ event }) => {
       const eventSessionID = getSessionID(event) || messageSessionID(messageInfoFromEvent(event))
-      if (eventSessionID) await ensureSessionLoaded(eventSessionID)
+      const loadResult = eventSessionID
+        ? await ensureSessionLoaded(eventSessionID)
+        : ACTIVE_PERSISTENCE_DISABLED
+      if (currentRuntime().disposed || loadResult.kind === "disposed") return
+      const passive = loadResult.kind === "passive"
 
-      if (event?.type === "session.status") {
+      if (!passive && event?.type === "session.status") {
         const sessionID = getSessionID(event)
         const status = event?.properties?.status?.type || event?.data?.status?.type
         if (sessionID && status) currentRuntime().sessionStatuses.set(sessionID, status)
@@ -4071,22 +4406,42 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       if (event?.type === "session.updated") {
         const sessionID = getSessionID(event)
-        const context = normalizeExecutionContext(event?.properties?.info || event?.data?.info)
-        if (sessionID && context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+        rememberSessionExecutionContext(
+          sessionID,
+          event?.properties?.info || event?.data?.info,
+        )
       }
 
-      if (event?.type === "message.updated") {
+      if (!passive && event?.type === "message.updated") {
         const message = messageInfoFromEvent(event)
         if (messageRole(message) === "user") {
-          const context = normalizeExecutionContext(message)
           const sessionID = messageSessionID(message) || getSessionID(event)
-          if (sessionID && context) currentRuntime().sessionExecutionContexts.set(sessionID, context)
+          rememberSessionExecutionContext(sessionID, message)
         }
       }
+
+      const updatedMessage = event?.type === "message.updated"
+        ? messageInfoFromEvent(event)
+        : null
+      const controlCommandAssistant = updatedMessage
+        ? suppressControlCommandAssistant(updatedMessage)
+        : false
 
       const terminal = terminalEvent(event)
       if (terminal?.sessionID) {
         const runtime = currentRuntime()
+        if (controlCommandAssistant) {
+          // A provider error on a plugin-owned control reply belongs to that
+          // read-only command turn, not to whichever goal may be active now.
+          // This is especially important after passive takeover: a delayed
+          // denial reply from the old lease epoch must not pause a newly
+          // resumed goal. Retire only the exact active guard it answers.
+          const activeCommandTurn = runtime.activeCommandTurns.get(terminal.sessionID)
+          if (activeCommandTurn?.messageID === messageParentID(updatedMessage)) {
+            runtime.activeCommandTurns.delete(terminal.sessionID)
+          }
+          return
+        }
         const pendingTurns = runtime.pendingCommandTurns.get(terminal.sessionID)
         const resolvingCommandTurn = [...(pendingTurns?.values() || [])].reverse().find(
           (turn) => turn.preservedFileCount > 0,
@@ -4110,6 +4465,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         if (!resolvingCommandAttachments) runtime.pendingCommandTurns.delete(terminal.sessionID)
         runtime.activeCommandTurns.delete(terminal.sessionID)
+        if (passive) return
         await pauseActiveGoal(terminal.sessionID, {
           ...(resolvingCommandAttachments
             ? {
@@ -4123,6 +4479,24 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             : terminal),
           abortAccepted: true,
         })
+        return
+      }
+
+      if (event?.type === "message.updated") {
+        if (passive || controlCommandAssistant === "passive") return
+      }
+
+      if (passive) {
+        if (isIdleEvent(event) && eventSessionID) {
+          // A session-scoped idle can be stale or unrelated. Keep the passive
+          // command guard until the latest assistant is proven to answer the
+          // plugin-owned denial turn, matching the active-mode correlation
+          // contract below.
+          await retireCompletedCommandTurnOnIdle(
+            eventSessionID,
+            defaultGoalOptions.maxRecentMessages,
+          )
+        }
         return
       }
 
@@ -4144,25 +4518,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!currentMessageID) return
         const currentSessionID = messageSessionID(message)
         const runtime = currentRuntime()
-        const parentOwner = runtime.ownedPluginMessages.get(messageParentID(message))
-        const isControlCommandAssistant =
-          messageRole(message) === "assistant" &&
-          parentOwner?.kind === "command" &&
-          parentOwner?.policy === "control" &&
-          parentOwner?.sessionID === currentSessionID
-        if (isControlCommandAssistant) {
-          // A control command may produce several assistant messages (for
-          // example, a blocked tool-call step followed by a final report), and
-          // another plugin turn may overlap before all message.updated events
-          // arrive. Authenticate each response through its owned parent user
-          // message instead of relying on the session's single latest-command
-          // slot, then suppress it immediately for later idle processing.
-          setBoundedMessageValue(
-            runtime.suppressedCommandAssistants,
-            currentMessageID,
-            currentSessionID,
-          )
-        }
 
         const goal = goalStates.get(currentSessionID)
         if (!goal) return
@@ -4247,37 +4602,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // remain suppressed in a bounded map so a later duplicate idle cannot
       // reinterpret the same report as goal progress or completion.
       const runtime = currentRuntime()
-      const activeCommandTurn = runtime.activeCommandTurns.get(sessionID)
-      let commandMessages = null
-      if (activeCommandTurn) {
-        const commandMessageLimit =
-          goalStates.get(sessionID)?.options.maxRecentMessages ||
-          defaultGoalOptions.maxRecentMessages
-        const commandHostMessages = await sessionApi.messages(sessionID, {
-          limit: commandMessageLimit,
-        })
-        commandMessages = Array.isArray(commandHostMessages)
-          ? commandHostMessages.slice(-commandMessageLimit)
-          : []
-        const commandAssistant = findLatestAssistantMessage(commandMessages)
-        if (
-          !commandAssistant ||
-          messageParentID(commandAssistant) !== activeCommandTurn.messageID
-        ) {
-          return
-        }
-        if (activeCommandTurn.policy === "control") {
-          const commandAssistantID = messageID(commandAssistant)
-          if (commandAssistantID) {
-            setBoundedMessageValue(
-              runtime.suppressedCommandAssistants,
-              commandAssistantID,
-              sessionID,
-            )
-          }
-        }
-        runtime.activeCommandTurns.delete(sessionID)
-      }
+      const commandMessageLimit =
+        goalStates.get(sessionID)?.options.maxRecentMessages ||
+        defaultGoalOptions.maxRecentMessages
+      const commandTurnState = await retireCompletedCommandTurnOnIdle(
+        sessionID,
+        commandMessageLimit,
+      )
+      if (!commandTurnState.ready) return
+      const commandMessages = commandTurnState.messages
 
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped || activeContinues.has(sessionID)) return
@@ -4809,11 +5142,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
-      await ensureSessionLoaded(input.sessionID)
+      const loadResult = await ensureSessionLoaded(input.sessionID)
+      if (currentRuntime().disposed || loadResult.kind === "disposed") return
 
       const activeCommandTurn = currentRuntime().activeCommandTurns.get(input.sessionID)
       const commandGuarded = activeCommandTurn?.policy === "control"
-      const goal = goalStates.get(input.sessionID)
+      const goal = loadResult.kind === "active" ? goalStates.get(input.sessionID) : null
       if (!goal && !commandGuarded) return
       const blockID = goal?.goalId || `command-${activeCommandTurn.id}`
       const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
@@ -4870,7 +5204,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     "experimental.session.compacting": async (input, output) => {
       if (!input?.sessionID || !output) return
-      await ensureSessionLoaded(input.sessionID)
+      const loadResult = await ensureSessionLoaded(input.sessionID)
+      if (currentRuntime().disposed || loadResult.kind !== "active") return
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
       const context = buildCompactionContext(goal)
@@ -4890,7 +5225,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // auto-continue to avoid two continuations racing after a compaction.
       // Paused/stopped goals leave the native behavior untouched.
       if (!input?.sessionID || !output) return
-      await ensureSessionLoaded(input.sessionID)
+      const loadResult = await ensureSessionLoaded(input.sessionID)
+      if (currentRuntime().disposed || loadResult.kind !== "active") return
       const goal = goalStates.get(input.sessionID)
       if (!goal || goal.stopped) return
       output.enabled = false
@@ -4907,7 +5243,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   // makes this deterministic for normal npm installs; `registerTools: false`
   // remains the explicit opt-out.
   if (pluginOptions.registerTools !== false) {
-    hooks.tool = buildAgentTools(bundledToolHelper, agentToolHandlers, ensureSessionLoaded)
+    hooks.tool = buildAgentTools(
+      bundledToolHelper,
+      agentToolHandlers,
+      ensureSessionLoaded,
+      commandName,
+      () => runtime.disposed,
+      registerCommand,
+    )
   }
 
   return hooks
@@ -4987,6 +5330,7 @@ export default {
 }
 
 export const testInternals = {
+  commandTurnTtlMs: COMMAND_TURN_TTL_MS,
   activeGoal,
   agentToolSessionID,
   buildAgentToolHandlers,
@@ -5042,6 +5386,7 @@ export const testInternals = {
   parseTokenBudget,
   pruneGoalResults,
   resolveStateFilePath,
+  runtimeSessionDiagnostics,
   stopReason,
   xdgStateFilePath,
 }
