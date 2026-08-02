@@ -1,11 +1,13 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { promises as sharedFs } from "node:fs"
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawn } from "node:child_process"
 import test from "node:test"
 import { GoalPlugin } from "../src/goal-plugin.js"
+import { acquirePersistenceLease } from "../src/persistence-lease.js"
 
 function sessionStatePath(stateFilePath, sessionID) {
   const key = createHash("sha256").update(sessionID).digest("hex")
@@ -67,6 +69,75 @@ function waitForExit(child) {
   if (child.exitCode !== null) return Promise.resolve(child.exitCode)
   return new Promise((resolve) => child.once("exit", resolve))
 }
+
+test("fresh namespaces serialize migration-marker publication", { timeout: 5_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "goal-plugin-fresh-migration-"))
+  const stateFilePath = join(directory, "state.json")
+  const migrationMarkerPath = join(`${stateFilePath}.sessions`, ".migration-v1-complete")
+  const migrationLockPath = `${stateFilePath}.lock`
+  const originalLstat = sharedFs.lstat
+  let observedMigrationLock
+  const migrationLockObserved = new Promise((resolve) => {
+    observedMigrationLock = resolve
+  })
+  let migrationBlocker = await acquirePersistenceLease(stateFilePath)
+  let releasedLease
+  let hooks
+  let loading
+  sharedFs.lstat = async (...args) => {
+    if (args[0] === migrationLockPath) observedMigrationLock()
+    return originalLstat(...args)
+  }
+
+  try {
+    hooks = await GoalPlugin(
+      {
+        client: {
+          app: { log: async () => {} },
+          session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+        },
+        directory,
+      },
+      { stateFilePath, registerTools: false, minDelayMs: 1 },
+    )
+    let loadSettled = false
+    loading = hooks["chat.params"]({ sessionID: "fresh-migration-session", agent: "build" })
+      .then((value) => {
+        loadSettled = true
+        return value
+      })
+
+    const firstBoundary = await Promise.race([
+      migrationLockObserved.then(() => "lock"),
+      loading.then(() => "loaded"),
+    ])
+    assert.equal(
+      firstBoundary,
+      "lock",
+      "fresh migration must consult the aggregate lease before publishing its marker",
+    )
+    assert.equal(loadSettled, false, "fresh session loading must wait for migration ownership")
+    await assert.rejects(stat(migrationMarkerPath), { code: "ENOENT" })
+
+    await migrationBlocker.release()
+    migrationBlocker = null
+    await loading
+    const marker = JSON.parse(await readFile(migrationMarkerPath, "utf8"))
+    assert.equal(marker.version, 1)
+    assert.equal(Number.isFinite(marker.migratedAt), true)
+    releasedLease = await acquirePersistenceLease(stateFilePath)
+    assert.ok(releasedLease, "fresh migration must release the aggregate lease after publishing")
+    await releasedLease.release()
+    releasedLease = null
+  } finally {
+    sharedFs.lstat = originalLstat
+    await migrationBlocker?.release().catch(() => false)
+    await releasedLease?.release().catch(() => false)
+    await Promise.allSettled([loading].filter(Boolean))
+    await hooks?.dispose()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 test("independent sessions in one project persist concurrently in separate shards", async () => {
   const directory = await mkdtemp(join(tmpdir(), "goal-plugin-concurrent-sessions-"))
