@@ -184,6 +184,16 @@ export interface GoalPluginOptions {
   noInterruptOnUserMessage?: boolean
 
   /**
+   * When `true`, auto-continue is deferred while the session has active child
+   * sessions (subagents or background tasks), so the goal loop does not prompt
+   * the orchestrator over work a child is already doing. The goal stays
+   * running and the next idle event continues once the children are done.
+   * Hosts that cannot report children/status fail open (continuation proceeds).
+   * @default false
+   */
+  noContinueWhileChildrenActive?: boolean
+
+  /**
    * Fraction (between 0 and 1, exclusive) of any budget (turns, duration,
    * or tokens) at which the plugin sends a one-time "wrap up" prompt
    * nudging the model to finish before the hard limit is hit.

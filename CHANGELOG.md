@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add `noInterruptOnUserMessage` plugin option. When `true`, a new human message steers an active goal — the loop keeps running and the message is included in the next continuation — instead of pausing it with `stopReason: "user intervention"`. The pause-on-intervention default is unchanged.
+- Add `noContinueWhileChildrenActive` plugin option. When `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks), so the goal loop does not prompt the orchestrator over work a child is already doing; the goal stays running and continues on a later idle once the children finish. Hosts that cannot report children/status fail open.
 
 ## 0.7.0 — 2026-08-02
 

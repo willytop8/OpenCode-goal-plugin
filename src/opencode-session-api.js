@@ -8,7 +8,7 @@ const SHAPE_ERROR_PATTERNS = [
 // Only read-only operations may be retried with another argument shape. A
 // TypeError can be raised after a mutating SDK call has already reached the
 // host, so replaying create/prompt/update/delete/abort could duplicate side effects.
-const REPLAY_SAFE_OPERATIONS = new Set(["messages", "get"])
+const REPLAY_SAFE_OPERATIONS = new Set(["messages", "get", "children", "status"])
 
 function isArgumentShapeError(error) {
   if (!(error instanceof TypeError)) return false
@@ -69,6 +69,12 @@ export function createOpenCodeSessionApi(client, options = {}) {
         { sessionID, ...options },
         { path: { id: sessionID }, query: options },
       )
+    },
+    children(sessionID) {
+      return invoke("children", { sessionID }, { path: { id: sessionID } })
+    },
+    status() {
+      return invoke("status", {}, { path: {} })
     },
     promptAsync(sessionID, input = {}) {
       return invoke(

@@ -75,6 +75,7 @@ const DEFAULT_OPTIONS = {
   noProgressTurnsBeforePause: 2,
   noToolCallTurnsBeforePause: 2,
   noInterruptOnUserMessage: false,
+  noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
   warnDurationMsRemaining: 60 * 1000,
@@ -1178,6 +1179,7 @@ function normalizeOptions(options = {}) {
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
     noInterruptOnUserMessage: options.noInterruptOnUserMessage === true,
+    noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
         ? Number(options.budgetWrapupRatio)
@@ -4214,6 +4216,34 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return true
   }
 
+  // With noContinueWhileChildrenActive, auto-continue is deferred while any
+  // child session (subagent, background task) is still active, so the goal
+  // loop does not prompt the orchestrator over work a child is already doing.
+  // Fail open: if the host cannot report children/status, continue as before.
+  const sessionHasActiveChildren = async (sessionID) => {
+    try {
+      const [children, status] = await Promise.all([
+        sessionApi.children(sessionID),
+        sessionApi.status(),
+      ])
+      const statusMap = isPlainObject(status) ? status : {}
+      const childrenList = Array.isArray(children) ? children : []
+      return childrenList.some(
+        (child) =>
+          isPlainObject(child) &&
+          typeof child.id === "string" &&
+          Object.hasOwn(statusMap, child.id),
+      )
+    } catch (error) {
+      await logPluginError(
+        client,
+        "Failed to check child session activity; continuing without the active-children gate",
+        error,
+      )
+      return false
+    }
+  }
+
   const claimContinuationSource = async (
     sessionID,
     goalID,
@@ -4246,6 +4276,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         history: "Paused before auto-continue because the active session agent switched to Plan.",
       })
       return null
+    }
+
+    if (goal.options.noContinueWhileChildrenActive) {
+      if (await sessionHasActiveChildren(sessionID)) return null
     }
 
     const newHumanMessage =
