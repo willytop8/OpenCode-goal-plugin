@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `noInterruptOnUserMessage` plugin option. When `true`, a new human message steers an active goal — the loop keeps running and the message is included in the next continuation — instead of pausing it with `stopReason: "user intervention"`. The pause-on-intervention default is unchanged.
+
 ## 0.7.0 — 2026-08-02
 
 - Make `/goal status` add explicit `State:` and `Completion audit:` lines without changing its existing `Active goal:` header; make `/goal list` report `active`, `paused`, or `blocked` and preserve the reason for stopped focused goals. Completion audit reporting distinguishes the evidence gate, built-in independent verifier, and custom completion auditor.

@@ -74,6 +74,7 @@ const DEFAULT_OPTIONS = {
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
   noToolCallTurnsBeforePause: 2,
+  noInterruptOnUserMessage: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
   warnDurationMsRemaining: 60 * 1000,
@@ -1176,6 +1177,7 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
+    noInterruptOnUserMessage: options.noInterruptOnUserMessage === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
         ? Number(options.budgetWrapupRatio)
@@ -4249,7 +4251,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const newHumanMessage =
       refreshed.latestRealUserMessageID &&
       refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID
-    if (newHumanMessage || userInterventionDetected(messages, goal)) {
+    if (
+      !goal.options.noInterruptOnUserMessage &&
+      (newHumanMessage || userInterventionDetected(messages, goal))
+    ) {
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -4422,6 +4427,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped) return
+      // With noInterruptOnUserMessage, a human message steers the running loop
+      // instead of pausing the goal for /goal resume.
+      if (goal.options.noInterruptOnUserMessage) return
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -5229,7 +5237,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // Latest instruction wins: if a real (non-plugin) user message arrived
         // since the last auto-continue, stop driving the loop and defer to the
         // human. They can /goal resume to hand control back to the plugin.
-        if (userInterventionDetected(messages, activeGoalAfterMessages)) {
+        if (
+          !activeGoalAfterMessages.options.noInterruptOnUserMessage &&
+          userInterventionDetected(messages, activeGoalAfterMessages)
+        ) {
           await pauseActiveGoal(sessionID, {
             stopReason: "user intervention",
             status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",

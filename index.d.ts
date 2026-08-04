@@ -175,6 +175,15 @@ export interface GoalPluginOptions {
   noToolCallTurnsBeforePause?: number
 
   /**
+   * When `true`, a new human message does not pause an active goal: the goal
+   * loop keeps running and the message steers the next continuation instead of
+   * stopping with `stopReason: "user intervention"`. Plugin-owned command and
+   * continuation messages are never treated as interventions either way.
+   * @default false
+   */
+  noInterruptOnUserMessage?: boolean
+
+  /**
    * Fraction (between 0 and 1, exclusive) of any budget (turns, duration,
    * or tokens) at which the plugin sends a one-time "wrap up" prompt
    * nudging the model to finish before the hard limit is hit.
