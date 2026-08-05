@@ -1498,6 +1498,1183 @@ test("noContinueWhileChildrenActive:true defers continuation while a child is ac
   assert.equal(currentGoal("session-1").stopped, false)
 })
 
+test("an idle child reported in the status map does not stall the goal", async () => {
+  // OpenCode currently deletes idle sessions from /session/status, but the SDK
+  // response type allows an explicit {type:"idle"} entry. Bare key presence
+  // would gate every continuation forever and hang the goal silently.
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: { "child-1": { type: "idle" } } }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("a retrying child still defers auto-continue", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({
+        data: { "child-1": { type: "retry", attempt: 1, message: "rate limited", next: 0 } },
+      }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+})
+
+test("deferring for active children is visible in goal status and history", async () => {
+  const calls = []
+  let statusData = { "child-1": { type: "busy" } }
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: statusData }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  const idle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+
+  await idle()
+  await idle()
+  const deferred = currentGoal("session-1")
+  assert.equal(calls.length, 0)
+  assert.equal(deferred.stopped, false)
+  assert.match(deferred.lastStatus, /deferred while a child session/i)
+  // The notice is recorded once for the deferral episode, not once per idle.
+  const deferrals = deferred.history.filter((entry) => entry.type === "deferred")
+  assert.equal(deferrals.length, 1)
+
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await idle()
+  const resumed = currentGoal("session-1")
+  assert.equal(calls.length, 1)
+  // History is a bounded ring, so the episode is recorded once on entry. On
+  // exit the continuation immediately writes its own status line, which is the
+  // signal that the goal is moving again.
+  assert.equal(resumed.history.filter((entry) => entry.type === "deferred").length, 1)
+  assert.doesNotMatch(resumed.lastStatus, /deferred while a child session/i)
+})
+
+test("a real user message pauses immediately even while children are active", async () => {
+  // The chat.message hook is the first line of defence and must not be gated by
+  // the children check: a human "stop" cannot wait for subagents to finish.
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: { "child-1": { type: "busy" } } }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks["chat.message"](
+    { sessionID: "session-1", messageID: "msg-stop-now", agent: "build" },
+    {
+      message: { id: "msg-stop-now", role: "user", sessionID: "session-1" },
+      parts: [textPart("stop, do Y instead")],
+    },
+  )
+
+  assert.equal(currentGoal("session-1").stopped, true)
+  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+})
+
+test("a deferred goal is re-driven by the child's own idle event", async () => {
+  // Verified against a live opencode server: while a child runs and finishes,
+  // the parent session emits no events at all. The child's idle event is the
+  // only wake-up available, so without this the goal strands permanently.
+  const calls = []
+  let statusData = { "child-1": { type: "busy" } }
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: statusData }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0, "deferred while the child is busy")
+
+  // The child finishes. Only the child's session emits anything.
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({
+    event: { type: "session.idle", properties: { sessionID: "child-1" } },
+  })
+  assert.equal(calls.length, 1, "the child's idle event must re-drive the parent")
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("a goal stopped while deferred is not re-driven by its child's idle", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: { "child-1": { type: "busy" } } }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "stop" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.idle", properties: { sessionID: "child-1" } },
+  })
+  assert.equal(calls.length, 0, "a stopped goal must not be revived by a watched child")
+})
+
+for (const command of ["stop", "pause", "clear"]) {
+  test(`/goal ${command} still halts the loop with noInterruptOnUserMessage:true`, async () => {
+    // This is the only escape hatch once human messages stop pausing the goal,
+    // so it is the option's safety valve and must not regress.
+    const calls = []
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({
+          data: [pluginContinuationMessage(), message("did a step")],
+        }),
+        promptAsync: async (input) => {
+          calls.push(input)
+          return {}
+        },
+      },
+    }
+    const hooks = await GoalPlugin(
+      { client },
+      { persistState: false, minDelayMs: 1, noInterruptOnUserMessage: true },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-1", arguments: "ship it" },
+      { parts: [] },
+    )
+    const goal = currentGoal("session-1")
+    goal.turnCount = 1
+    goal.lastContinueAt = Date.now() - 10
+
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-1", arguments: command },
+      { parts: [] },
+    )
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+    assert.equal(calls.length, 0)
+  })
+}
+
+function toolCallMessage(text) {
+  const assistant = message(text)
+  assistant.parts.push({ type: "tool", tool: "bash", state: { status: "completed" } })
+  return assistant
+}
+
+function childGateClient(calls, { statusFor = () => ({ "child-1": { type: "busy" } }), toolCall = false } = {}) {
+  let statusReads = 0
+  const assistant = toolCall ? toolCallMessage("did a step") : message("did a step")
+  return {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [pluginContinuationMessage(), assistant] }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: statusFor((statusReads += 1)) }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+}
+
+async function startDeferrableGoal(client, options = {}) {
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true, ...options },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+  return { hooks, goal }
+}
+
+const parentIdle = (hooks) =>
+  hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+test("a deferral does not charge the stall gates twice for one assistant turn", async () => {
+  // The stall gates run before the children gate, so the deferring idle and the
+  // child's wake both see the same assistant message. Charging it twice paused
+  // a healthy goal after a single talk-only turn plus one deferral.
+  const calls = []
+  let active = true
+  const client = childGateClient(calls, { statusFor: () => (active ? { "child-1": { type: "busy" } } : {}) })
+  const { hooks } = await startDeferrableGoal(client)
+
+  await parentIdle(hooks)
+  const deferred = currentGoal("session-1")
+  assert.equal(calls.length, 0)
+  assert.equal(deferred.noToolCallTurns, 1)
+
+  active = false
+  deferred.lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+
+  const woken = currentGoal("session-1")
+  assert.equal(woken.noToolCallTurns, 1, "the wake pass must not re-charge the same turn")
+  assert.equal(woken.stopped, false)
+  assert.equal(calls.length, 1)
+})
+
+test("an alternating defer/wake cycle cannot disarm the no-progress gate", async () => {
+  // The wake pass must leave stall accounting exactly as it found it.
+  // Suppressing the increment but not the reset zeroed the counter on every
+  // wake, so a stalled loop alternating defer/wake never reached the pause.
+  const calls = []
+  let sourceTurn = 0
+  let childActive = false
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [
+          pluginContinuationMessage(`msg-plugin-${sourceTurn}`),
+          message("ok", { input: 1, output: 5, reasoning: 0 }, `msg-low-${sourceTurn}`),
+        ],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: childActive ? { "child-1": { type: "busy" } } : {} }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        sourceTurn += 1
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noProgressTurnsBeforePause: 2,
+      noToolCallTurnsBeforePause: 0,
+      maxTurns: 500,
+      maxTokens: 10_000_000,
+      maxDurationMs: 3_600_000,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  for (let cycle = 0; cycle < 50; cycle += 1) {
+    childActive = true
+    currentGoal("session-1").lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+    childActive = false
+    currentGoal("session-1").lastContinueAt = Date.now() - 10
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+    if (currentGoal("session-1").stopped) break
+  }
+
+  const finished = currentGoal("session-1")
+  assert.equal(finished.stopped, true, "a stalled loop must still reach the no-progress pause")
+  assert.equal(finished.stopReason, "no progress")
+})
+
+function perSessionChildClient(calls, childrenFor, statusRef) {
+  const sessionIDOf = (input) => input?.path?.id ?? input?.sessionID
+  return {
+    app: { log: async () => {} },
+    session: {
+      messages: async (input) => {
+        const id = sessionIDOf(input)
+        const assistant = toolCallMessage("did a step")
+        assistant.info = { ...assistant.info, id: `msg-a-${id}`, sessionID: id }
+        return { data: [pluginContinuationMessage(`msg-plugin-${id}`), assistant] }
+      },
+      children: async (input) => ({ data: childrenFor(sessionIDOf(input)) }),
+      status: async () => ({ data: statusRef() }),
+      promptAsync: async (input) => {
+        calls.push(sessionIDOf(input))
+        return {}
+      },
+    },
+  }
+}
+
+test("the gate fails open for a child that already runs a goal of its own", async () => {
+  // Such a child answers its own idle events, so it can never deliver the wake
+  // this gate depends on. Deferring behind it would strand the parent.
+  const calls = []
+  let statusData = { "child-1": { type: "busy" } }
+  const client = perSessionChildClient(
+    calls,
+    (id) => (id === "session-1" ? [{ id: "child-1" }] : []),
+    () => statusData,
+  )
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "child-1", arguments: "child work" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.ok(calls.includes("session-1"), "the parent continues rather than deferring untrackably")
+})
+
+test("a child that acquires its own goal after being watched still wakes its parent", async () => {
+  // Being a goal session and being a watched child are independent facts. The
+  // child needs its idle for its own loop, and the parent has no other source
+  // of events, so both are served.
+  const calls = []
+  let statusData = { "child-1": { type: "busy" } }
+  const client = perSessionChildClient(
+    calls,
+    (id) => (id === "session-1" ? [{ id: "child-1" }] : []),
+    () => statusData,
+  )
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.deepEqual(calls, [], "deferred while the child is busy")
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "child-1", arguments: "child work" },
+    { parts: [] },
+  )
+  const childGoal = currentGoal("child-1")
+  childGoal.turnCount = 1
+  childGoal.lastContinueAt = Date.now() - 10
+
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+  assert.ok(calls.includes("session-1"), `the parent must be re-driven; got ${JSON.stringify(calls)}`)
+})
+
+test("concurrent wakes from two children of one parent continue it exactly once", async () => {
+  const calls = []
+  let statusData = { "c1": { type: "busy" }, "c2": { type: "busy" } }
+  const client = perSessionChildClient(
+    calls,
+    (id) => (id === "session-1" ? [{ id: "c1" }, { id: "c2" }] : []),
+    () => statusData,
+  )
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.deepEqual(calls, [], "deferred on both children")
+
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await Promise.all([
+    hooks.event({ event: { type: "session.idle", properties: { sessionID: "c1" } } }),
+    hooks.event({ event: { type: "session.idle", properties: { sessionID: "c2" } } }),
+  ])
+  assert.equal(
+    calls.filter((sessionID) => sessionID === "session-1").length,
+    1,
+    "two wakes for one deferral must not double-prompt",
+  )
+})
+
+test("a goal stays deferred until every child is idle, then wakes once", async () => {
+  const calls = []
+  let statusData = { "c1": { type: "busy" }, "c2": { type: "busy" } }
+  const client = perSessionChildClient(
+    calls,
+    (id) => (id === "session-1" ? [{ id: "c1" }, { id: "c2" }] : []),
+    () => statusData,
+  )
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  statusData = { "c2": { type: "busy" } }
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "c1" } } })
+  assert.deepEqual(calls, [], "one child finishing is not enough")
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "c2" } } })
+  assert.deepEqual(calls, ["session-1"], "woken exactly once once all children are idle")
+})
+
+test("concurrent child wakes do not drop one another", async () => {
+  // The re-entrancy guard is held across the awaited wake. A single shared
+  // counter would silently drop every other parent's wake in that window,
+  // stranding an unrelated goal that still reports itself as waiting.
+  const calls = []
+  let statusData = { "child-a": { type: "busy" }, "child-b": { type: "busy" } }
+  const childrenFor = (id) =>
+    id === "session-1" ? [{ id: "child-a" }] : id === "session-2" ? [{ id: "child-b" }] : []
+  const client = perSessionChildClient(calls, childrenFor, () => statusData)
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  for (const sessionID of ["session-1", "session-2"]) {
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID, arguments: "ship it" },
+      { parts: [] },
+    )
+    const goal = currentGoal(sessionID)
+    goal.turnCount = 1
+    goal.lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+  }
+  assert.deepEqual(calls, [], "both parents deferred")
+
+  // Both children acquire goals of their own after being watched.
+  for (const childID of ["child-a", "child-b"]) {
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: childID, arguments: "child work" },
+      { parts: [] },
+    )
+    const childGoal = currentGoal(childID)
+    childGoal.turnCount = 1
+    childGoal.lastContinueAt = Date.now() - 10
+  }
+
+  statusData = {}
+  for (const sessionID of ["session-1", "session-2"]) {
+    currentGoal(sessionID).lastContinueAt = Date.now() - 10
+  }
+  await Promise.all([
+    hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-a" } } }),
+    hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-b" } } }),
+  ])
+
+  assert.ok(calls.includes("session-1"), `session-1 stranded; prompts: ${JSON.stringify(calls)}`)
+  assert.ok(calls.includes("session-2"), `session-2 stranded; prompts: ${JSON.stringify(calls)}`)
+})
+
+test("a synthesized parent wake does not charge the stall gates", async () => {
+  // The wake arrives through the recursive dispatch rather than the remap, but
+  // it is still a wake pass: it re-examines an assistant turn already scored.
+  const calls = []
+  let statusData = { "child-1": { type: "busy" } }
+  const client = perSessionChildClient(
+    calls,
+    (id) => (id === "session-1" ? [{ id: "child-1" }] : []),
+    () => statusData,
+  )
+  // A talk-only parent turn, so the no-tool-call gate is live at its default.
+  client.session.messages = async (input) => {
+    const id = input?.path?.id ?? input?.sessionID
+    return { data: [pluginContinuationMessage(`msg-plugin-${id}`), message("talked", undefined, `msg-a-${id}`)] }
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  const deferredCount = currentGoal("session-1").noToolCallTurns
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "child-1", arguments: "child work" },
+    { parts: [] },
+  )
+  const childGoal = currentGoal("child-1")
+  childGoal.turnCount = 1
+  childGoal.lastContinueAt = Date.now() - 10
+
+  statusData = {}
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+
+  const woken = currentGoal("session-1")
+  assert.equal(woken.noToolCallTurns, deferredCount, "the wake must not re-charge the gate")
+  assert.equal(woken.stopped, false, "a healthy goal must not be paused by a deferral plus a wake")
+})
+
+test("re-arming on an unchanged child set does not exhaust watch capacity", async () => {
+  // The capacity check must not count entries already armed for this session,
+  // or a second deferral on the same children flips the gate to fail-open.
+  const calls = []
+  const manyChildren = Array.from({ length: 200 }, (_, index) => ({ id: `kid-${index}` }))
+  const statusData = {}
+  for (const child of manyChildren) statusData[child.id] = { type: "busy" }
+  const client = perSessionChildClient(calls, () => manyChildren, () => statusData)
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    currentGoal("session-1").lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  }
+  assert.deepEqual(calls, [], "the children are still busy on both passes")
+})
+
+test("probe and payload failures are each reported once, independently", async () => {
+  // A single shared latch let one failure class silence the diagnostics of the
+  // other for the lifetime of the plugin instance.
+  const logs = []
+  const calls = []
+  let mode = "payload"
+  let sourceTurn = 0
+  const client = {
+    app: {
+      log: async (input) => {
+        logs.push(JSON.stringify(input))
+      },
+    },
+    session: {
+      messages: async () => {
+        const assistant = toolCallMessage("did a step")
+        assistant.info = { ...assistant.info, id: `msg-a-${sourceTurn}` }
+        return { data: [pluginContinuationMessage(`msg-plugin-${sourceTurn}`), assistant] }
+      },
+      children: async () => {
+        if (mode === "throw") throw new TypeError("children unavailable")
+        return { error: { name: "UnknownError" }, request: {}, response: {} }
+      },
+      status: async () => ({ data: {} }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        sourceTurn += 1
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  mode = "throw"
+  goal.lastContinueAt = Date.now() - 10
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(logs.filter((entry) => entry.includes("unusable payload")).length, 1)
+  assert.equal(
+    logs.filter((entry) => entry.includes("Failed to check child session activity")).length,
+    1,
+    "a payload failure must not silence the probe diagnostic",
+  )
+})
+
+test("evicting watch entries never strands a live goal", async () => {
+  // The watch is global and capped. Dropping a live entry to make room would
+  // strand its goal permanently, so dead entries must be reclaimed first.
+  const calls = []
+  const childrenFor = (sessionID) =>
+    sessionID === "session-1"
+      ? [{ id: "child-1" }]
+      : Array.from({ length: 300 }, (_, index) => ({ id: `noise-${index}` }))
+  let statusData = { "child-1": { type: "busy" } }
+  for (let index = 0; index < 300; index += 1) statusData[`noise-${index}`] = { type: "busy" }
+  const sessionIDOf = (input) => input?.path?.id ?? input?.sessionID
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), toolCallMessage("did a step")],
+      }),
+      children: async (input) => ({ data: childrenFor(sessionIDOf(input)) }),
+      status: async () => ({ data: statusData }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  for (const sessionID of ["session-1", "session-2"]) {
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID, arguments: "ship it" },
+      { parts: [] },
+    )
+    const goal = currentGoal(sessionID)
+    goal.turnCount = 1
+    goal.lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+  }
+  // session-2 has more concurrent children than the watch can hold, so its gate
+  // fails open and it continues immediately rather than deferring behind a
+  // watch it cannot rely on.
+  assert.equal(calls.length, 1, "session-2 fails open rather than deferring untrackably")
+
+  statusData = {}
+  currentGoal("session-1").lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+  assert.equal(calls.length, 2, "session-1's watch must survive session-2's churn")
+})
+
+test("a goal replaced while deferred is not driven by the old goal's child", async () => {
+  const calls = []
+  let active = true
+  const client = childGateClient(calls, {
+    toolCall: true,
+    statusFor: () => (active ? { "child-1": { type: "busy" } } : {}),
+  })
+  const { hooks } = await startDeferrableGoal(client)
+
+  await parentIdle(hooks)
+  assert.equal(calls.length, 0)
+  const deferredGoalId = currentGoal("session-1").goalId
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "do something else instead" },
+    { parts: [] },
+  )
+  const replacement = currentGoal("session-1")
+  assert.notEqual(replacement.goalId, deferredGoalId)
+  replacement.turnCount = 1
+  replacement.lastContinueAt = Date.now() - 10
+  // The orphaned child finishes. The parent itself never went idle.
+  active = false
+
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+  assert.equal(calls.length, 0, "the orphaned watch must not drive the replacement goal")
+})
+
+test("a child going idle does not mark its parent idle", async () => {
+  // Recording the parent as idle on the strength of a child's event would
+  // defeat the idle guard and prompt into an actively working session.
+  const calls = []
+  let active = true
+  const client = childGateClient(calls, {
+    toolCall: true,
+    statusFor: () => (active ? { "child-1": { type: "busy" } } : {}),
+  })
+  const { hooks } = await startDeferrableGoal(client)
+
+  await parentIdle(hooks)
+  assert.equal(calls.length, 0)
+
+  // The parent picks up work of its own, then the child finishes.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "busy" } } },
+  })
+  active = false
+  currentGoal("session-1").lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+
+  assert.equal(calls.length, 0, "the parent is busy; no continuation may be sent")
+})
+
+test("a child idle delivered while the probe is in flight still continues", async () => {
+  // The wake event can arrive before the watch is armed. The gate notices the
+  // child idled during the probe and continues rather than waiting for an event
+  // that has already been delivered.
+  const calls = []
+  let hooks
+  let raced = false
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [pluginContinuationMessage(), message("spawned a background task")] }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => {
+        const payload = { data: { "child-1": { type: "busy" } } }
+        if (!raced) {
+          raced = true
+          await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
+        }
+        return payload
+      },
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await parentIdle(hooks)
+  assert.equal(calls.length, 1, "a wake delivered during the probe must not strand the goal")
+})
+
+test("two sessions each deferred on their own child both wake exactly once", async () => {
+  const calls = []
+  let statusData = { "child-a": { type: "busy" }, "child-b": { type: "busy" } }
+  const sessionIDOf = (input) => input?.path?.id ?? input?.sessionID
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), toolCallMessage("did a step")],
+      }),
+      children: async (input) => ({
+        data: sessionIDOf(input) === "session-1" ? [{ id: "child-a" }] : [{ id: "child-b" }],
+      }),
+      status: async () => ({ data: statusData }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noContinueWhileChildrenActive: true },
+  )
+  for (const sessionID of ["session-1", "session-2"]) {
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID, arguments: "ship it" },
+      { parts: [] },
+    )
+    const goal = currentGoal(sessionID)
+    goal.turnCount = 1
+    goal.lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+  }
+  assert.equal(calls.length, 0, "both sessions deferred")
+
+  statusData = {}
+  currentGoal("session-1").lastContinueAt = Date.now() - 10
+  currentGoal("session-2").lastContinueAt = Date.now() - 10
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-a" } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-b" } } })
+  assert.equal(calls.length, 2, "each session is re-driven exactly once")
+})
+
+test("a child that goes idle while the first probe is in flight still continues", async () => {
+  // The watch is armed and then the probe repeated. Without the second probe a
+  // child that finished during the first one would have already emitted its
+  // event, found nothing armed, and left the goal waiting forever.
+  const calls = []
+  const client = childGateClient(calls, {
+    toolCall: true,
+    statusFor: (read) => (read === 1 ? { "child-1": { type: "busy" } } : {}),
+  })
+  const { hooks } = await startDeferrableGoal(client)
+
+  await parentIdle(hooks)
+  assert.equal(calls.length, 1, "the re-probe must observe the child finishing and continue")
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("an unwatched child's idle event never drives a continuation", async () => {
+  // The completion auditor runs in its own child session. Its idle must not be
+  // mistaken for a deferred subagent finishing.
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [] }),
+      status: async () => ({ data: {} }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.idle", properties: { sessionID: "auditor-session" } },
+  })
+  assert.equal(calls.length, 0)
+})
+
+test("an errored children payload fails open with a diagnostic, not a silent no-op", async () => {
+  // A live opencode SDK resolves argument-shape mismatches as
+  // {error, request, response} instead of throwing, so the gate must not read
+  // that as "no active children" without saying anything.
+  const logs = []
+  const calls = []
+  const client = {
+    app: {
+      log: async (input) => {
+        logs.push(JSON.stringify(input))
+      },
+    },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ error: { name: "UnknownError" }, request: {}, response: {} }),
+      status: async () => ({ data: {} }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 1, "an unusable payload must fail open")
+  assert.equal(logs.filter((entry) => entry.includes("unusable payload")).length, 1)
+})
+
+test("a host that cannot report children/status logs the probe failure once", async () => {
+  const logs = []
+  const calls = []
+  const client = {
+    app: {
+      log: async (input) => {
+        logs.push(JSON.stringify(input))
+      },
+    },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      // No children()/status(): an older or non-OpenCode host.
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+
+  for (let i = 0; i < 4; i += 1) {
+    goal.lastContinueAt = Date.now() - 10
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  }
+
+  // Fail open: the gate never blocks a host that cannot answer.
+  assert.ok(calls.length > 0)
+  const probeFailures = logs.filter((entry) => entry.includes("child session activity"))
+  assert.equal(probeFailures.length, 1)
+})
+
 test("active children do not block auto-continue by default", async () => {
   const calls = []
   const client = {
