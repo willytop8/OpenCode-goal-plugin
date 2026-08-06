@@ -24,8 +24,8 @@ const mutants = [
   {
     name: "mutating SDK calls are never replayed",
     file: "src/opencode-session-api.js",
-    from: 'new Set([\"messages\", \"get\"])',
-    to: 'new Set([\"messages\", \"get\", \"prompt\"])',
+    from: 'new Set([\"messages\", \"get\", \"children\", \"status\"])',
+    to: 'new Set([\"messages\", \"get\", \"children\", \"status\", \"prompt\"])',
     test: "test/opencode-session-api.test.js",
   },
   {

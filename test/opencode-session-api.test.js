@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { createOpenCodeSessionApi } from "../src/opencode-session-api.js"
 
-const operations = ["messages", "promptAsync", "prompt", "update", "get", "create", "delete", "abort"]
+const operations = ["messages", "promptAsync", "prompt", "update", "get", "create", "delete", "abort", "children", "status"]
 
 function recordingClient(handler) {
   const calls = []
@@ -139,4 +139,28 @@ test("supports an explicit legacy preference without probing", async () => {
   const api = createOpenCodeSessionApi(host.client, { preferredShape: "legacy" })
   await api.get("known")
   assert.deepEqual(host.calls[0].input, { path: { id: "known" } })
+})
+
+test("children and status use the shape adapter and are replay-safe", async () => {
+  const host = recordingClient((_operation, input) => ({ data: input }))
+  const api = createOpenCodeSessionApi(host.client)
+  assert.deepEqual(await api.children("s1"), { sessionID: "s1" })
+  assert.deepEqual(await api.status(), {})
+
+  const legacy = recordingClient((_operation, input) => {
+    if (!("path" in input)) throw new TypeError("validation failed: required path")
+    return { data: input }
+  })
+  const apiLegacy = createOpenCodeSessionApi(legacy.client)
+  await apiLegacy.children("s2")
+  await apiLegacy.status()
+  assert.deepEqual(
+    legacy.calls.map(({ input }) => input),
+    [
+      { sessionID: "s2" },
+      { path: { id: "s2" } },
+      {},
+      { path: {} },
+    ],
+  )
 })

@@ -1398,6 +1398,137 @@ test("a real user message during the loop pauses auto-continue (latest instructi
   assert.equal(currentGoal("session-1").stopReason, "user intervention")
 })
 
+test("noInterruptOnUserMessage:true keeps the goal running and steers the loop", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [
+          pluginContinuationMessage(),
+          message("did a step"),
+          userMessage("stop, do Y instead"),
+          message("sure"),
+        ],
+      }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noInterruptOnUserMessage: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  // Simulate that the loop is already running.
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks["chat.message"](
+    { sessionID: "session-1", messageID: "msg-steer", agent: "build" },
+    {
+      message: { id: "msg-steer", role: "user", sessionID: "session-1" },
+      parts: [textPart("stop, do Y instead")],
+    },
+  )
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(calls.length, 1)
+})
+
+test("noContinueWhileChildrenActive:true defers continuation while a child is active", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: { "child-1": { type: "busy" } } }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    {
+      persistState: false,
+      minDelayMs: 1,
+      noContinueWhileChildrenActive: true,
+      // Keep the test focused on the children gate: a repeated tool-less
+      // assistant message would otherwise trip the no-tool-call pause.
+      noToolCallTurnsBeforePause: 0,
+    },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  // Simulate that the loop is already running.
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  // Once no child is active, the next idle continues normally.
+  client.session.status = async () => ({ data: {} })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("active children do not block auto-continue by default", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      children: async () => ({ data: [{ id: "child-1", agent: "fixer" }] }),
+      status: async () => ({ data: { "child-1": { type: "busy" } } }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+})
+
 test("the plugin's own continuation messages do not count as user intervention", async () => {
   const calls = []
   const client = {
@@ -4953,6 +5084,24 @@ test("normalizeOptions falls back to defaults for zero, negative, and non-numeri
   assert.equal(result.maxPromptFailures, defaults.maxPromptFailures)
   assert.equal(result.noProgressTurnsBeforePause, defaults.noProgressTurnsBeforePause)
   assert.equal(result.maxRecentMessages, defaults.maxRecentMessages)
+})
+
+test("normalizeOptions defaults noInterruptOnUserMessage to false and keeps it boolean", () => {
+  assert.equal(normalizeOptions().noInterruptOnUserMessage, false)
+  assert.equal(normalizeOptions({ noInterruptOnUserMessage: true }).noInterruptOnUserMessage, true)
+  assert.equal(normalizeOptions({ noInterruptOnUserMessage: "yes" }).noInterruptOnUserMessage, false)
+})
+
+test("normalizeOptions defaults noContinueWhileChildrenActive to false and keeps it boolean", () => {
+  assert.equal(normalizeOptions().noContinueWhileChildrenActive, false)
+  assert.equal(
+    normalizeOptions({ noContinueWhileChildrenActive: true }).noContinueWhileChildrenActive,
+    true,
+  )
+  assert.equal(
+    normalizeOptions({ noContinueWhileChildrenActive: "yes" }).noContinueWhileChildrenActive,
+    false,
+  )
 })
 
 test("normalizeOptions rejects budgetWrapupRatio at boundary values 0 and 1", () => {

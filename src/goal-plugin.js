@@ -74,6 +74,8 @@ const DEFAULT_OPTIONS = {
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
   noToolCallTurnsBeforePause: 2,
+  noInterruptOnUserMessage: false,
+  noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
   warnDurationMsRemaining: 60 * 1000,
@@ -1176,6 +1178,8 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
+    noInterruptOnUserMessage: options.noInterruptOnUserMessage === true,
+    noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
         ? Number(options.budgetWrapupRatio)
@@ -4212,6 +4216,34 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return true
   }
 
+  // With noContinueWhileChildrenActive, auto-continue is deferred while any
+  // child session (subagent, background task) is still active, so the goal
+  // loop does not prompt the orchestrator over work a child is already doing.
+  // Fail open: if the host cannot report children/status, continue as before.
+  const sessionHasActiveChildren = async (sessionID) => {
+    try {
+      const [children, status] = await Promise.all([
+        sessionApi.children(sessionID),
+        sessionApi.status(),
+      ])
+      const statusMap = isPlainObject(status) ? status : {}
+      const childrenList = Array.isArray(children) ? children : []
+      return childrenList.some(
+        (child) =>
+          isPlainObject(child) &&
+          typeof child.id === "string" &&
+          Object.hasOwn(statusMap, child.id),
+      )
+    } catch (error) {
+      await logPluginError(
+        client,
+        "Failed to check child session activity; continuing without the active-children gate",
+        error,
+      )
+      return false
+    }
+  }
+
   const claimContinuationSource = async (
     sessionID,
     goalID,
@@ -4246,10 +4278,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       return null
     }
 
+    if (goal.options.noContinueWhileChildrenActive) {
+      if (await sessionHasActiveChildren(sessionID)) return null
+    }
+
     const newHumanMessage =
       refreshed.latestRealUserMessageID &&
       refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID
-    if (newHumanMessage || userInterventionDetected(messages, goal)) {
+    if (
+      !goal.options.noInterruptOnUserMessage &&
+      (newHumanMessage || userInterventionDetected(messages, goal))
+    ) {
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -4422,6 +4461,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped) return
+      // With noInterruptOnUserMessage, a human message steers the running loop
+      // instead of pausing the goal for /goal resume.
+      if (goal.options.noInterruptOnUserMessage) return
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -5229,7 +5271,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // Latest instruction wins: if a real (non-plugin) user message arrived
         // since the last auto-continue, stop driving the loop and defer to the
         // human. They can /goal resume to hand control back to the plugin.
-        if (userInterventionDetected(messages, activeGoalAfterMessages)) {
+        if (
+          !activeGoalAfterMessages.options.noInterruptOnUserMessage &&
+          userInterventionDetected(messages, activeGoalAfterMessages)
+        ) {
           await pauseActiveGoal(sessionID, {
             stopReason: "user intervention",
             status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
