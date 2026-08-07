@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix goal auto-continue stalling after session compaction: a continuation
+  claim for a pre-compaction source turn could match the still-visible tail
+  assistant message after compaction and suppress the post-compaction
+  continuation until the user nudged the goal. The claim is now invalidated on
+  `session.compacted`, so the loop resumes on the next idle.
+
 ## 0.8.0 — 2026-08-06
 
 Both new options in this release were contributed by
