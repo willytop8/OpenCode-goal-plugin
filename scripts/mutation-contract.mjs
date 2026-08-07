@@ -13,6 +13,60 @@ function matchCheckoutNewlines(value, source) {
   return value.replace(/\r?\n/g, newline)
 }
 
+// An anchor may be a literal string or a RegExp, and `to` may be a replacement
+// string or a function receiving the match.
+//
+// Prefer a RegExp whenever the anchored line carries a value that legitimately
+// grows — a set's members, a list of names, an enumeration. A literal anchor
+// pins that value, so the next honest edit to it silently detaches the mutant
+// and the contract fails as if a safety property had broken. Anchor on the
+// declaration and mutate relative to the match instead.
+//
+// Literal anchors remain right for pinned *logic* — a comparison, a call, an
+// assignment — where a change to the line genuinely should force someone to
+// re-examine whether the mutant still expresses the property under test.
+//
+// RegExp anchors are matched against the file as checked out, so keep them to a
+// single line; a literal anchor spanning lines is normalised for CRLF, a RegExp
+// is not.
+function locateMutation(mutant, original) {
+  if (mutant.from instanceof RegExp) {
+    const flags = mutant.from.flags.includes("g")
+      ? mutant.from.flags
+      : `${mutant.from.flags}g`
+    const pattern = new RegExp(mutant.from.source, flags)
+    return {
+      occurrences: [...original.matchAll(pattern)].length,
+      mutate: () => original.replace(pattern, mutant.to),
+    }
+  }
+  const from = matchCheckoutNewlines(mutant.from, original)
+  const to =
+    typeof mutant.to === "function" ? mutant.to : matchCheckoutNewlines(mutant.to, original)
+  return {
+    occurrences: original.split(from).length - 1,
+    mutate: () => original.replace(from, to),
+  }
+}
+
+function staleAnchorMessage(mutant, occurrences) {
+  if (occurrences === 0) {
+    return (
+      `${mutant.name}: mutation anchor no longer matches anything in ${mutant.file}.\n` +
+      `This is a stale anchor, not a failed safety property: the source moved on and the\n` +
+      `mutant no longer points at it. Update this mutant in scripts/mutation-contract.mjs to\n` +
+      `match the current source. Note the property it guards is UNVERIFIED until you do.\n` +
+      `If the anchored value is one that legitimately changes over time, re-anchor it on the\n` +
+      `surrounding declaration with a RegExp so the next edit does not detach it again.`
+    )
+  }
+  return (
+    `${mutant.name}: mutation anchor matches ${mutant.file} ${occurrences} times and must\n` +
+    `match exactly once. Tighten the anchor in scripts/mutation-contract.mjs so it selects a\n` +
+    `single site — mutating several at once does not prove which one the test caught.`
+  )
+}
+
 const mutants = [
   {
     name: "verifier default deny",
@@ -24,8 +78,11 @@ const mutants = [
   {
     name: "mutating SDK calls are never replayed",
     file: "src/opencode-session-api.js",
-    from: 'new Set([\"messages\", \"get\"])',
-    to: 'new Set([\"messages\", \"get\", \"prompt\"])',
+    // Anchored on the declaration, not its members: the replay-safe set grows
+    // whenever a read-only operation is added, and a literal anchor detaches
+    // every time it does. Adding a mutating operation must stay caught.
+    from: /const REPLAY_SAFE_OPERATIONS = new Set\(\[[^\]]*\]\)/,
+    to: (match) => match.replace(/\]\)$/, ', "prompt"])'),
     test: "test/opencode-session-api.test.js",
   },
   {
@@ -505,11 +562,17 @@ try {
   for (const mutant of mutants) {
     const path = join(root, mutant.file)
     const original = await readFile(path, "utf8")
-    const from = matchCheckoutNewlines(mutant.from, original)
-    const to = matchCheckoutNewlines(mutant.to, original)
-    const occurrences = original.split(from).length - 1
-    assert.equal(occurrences, 1, `${mutant.name}: expected exactly one mutation target, found ${occurrences}`)
-    await writeFile(path, original.replace(from, to))
+    const { occurrences, mutate } = locateMutation(mutant, original)
+    assert.equal(occurrences, 1, staleAnchorMessage(mutant, occurrences))
+    const mutated = mutate()
+    assert.notEqual(
+      mutated,
+      original,
+      `${mutant.name}: anchor matched ${mutant.file} but the replacement left the source\n` +
+        `unchanged, so nothing was actually mutated and the test below would pass for the\n` +
+        `wrong reason. Check the 'to' replacement in scripts/mutation-contract.mjs.`,
+    )
+    await writeFile(path, mutated)
 
     const result = spawnSync(process.execPath, ["--test", mutant.test], { cwd: root, encoding: "utf8" })
     assert.notEqual(result.status, 0, `${mutant.name}: test suite survived the mutant`)

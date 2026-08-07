@@ -40,6 +40,9 @@ function legacyHomeStateFilePath(env = process.env) {
   return join(homeBase(env), ".opencode-goal-plugin", "state.json")
 }
 const MAX_HISTORY_ENTRIES = 20
+// Marks a plugin-synthesized parent wake so the receiving pass knows it is
+// re-examining an assistant turn that has already been scored.
+const CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake")
 const MAX_CHECKPOINTS = 5
 const CHECKPOINT_CHAR_LIMIT = 280
 const MAX_GOAL_OBJECTIVE_LENGTH = 4000
@@ -74,6 +77,8 @@ const DEFAULT_OPTIONS = {
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
   noToolCallTurnsBeforePause: 2,
+  noInterruptOnUserMessage: false,
+  noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
   warnDurationMsRemaining: 60 * 1000,
@@ -1176,6 +1181,8 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
+    noInterruptOnUserMessage: options.noInterruptOnUserMessage === true,
+    noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
         ? Number(options.budgetWrapupRatio)
@@ -4194,6 +4201,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     if (!goal) return false
     if (goal.stopped && goal.stopReason === reason) return false
     currentRuntime().continuationControllers.get(sessionID)?.abort()
+    // A goal stopping while deferred must release its watched children, or the
+    // watch outlives the goal and a later child idle re-drives a dead loop.
+    clearDeferredChildren(sessionID)
+    childDeferralNotices.delete(childDeferralKey(sessionID, goal))
     goal.stopped = true
     goal.stopReason = reason
     goal.lastStatus = `${status} Run /${commandName} resume to continue.`
@@ -4210,6 +4221,176 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     })
     if (abortAccepted) await abortAcceptedContinuation(sessionID)
     return true
+  }
+
+  // A child counts as active only when the host reports a non-idle status for
+  // it. OpenCode drops idle sessions from the `/session/status` map, so bare
+  // key presence happens to work today, but the SDK response type is
+  // `{[id: string]: SessionStatus}` and `SessionStatus` includes `{type:
+  // "idle"}`. A host that reports idle children explicitly would otherwise
+  // gate every continuation forever and stall the goal with no diagnostics.
+  // Unknown/unparseable status shapes stay "active" so the gate errs toward
+  // deferring rather than double-driving a session a child is working in.
+  const childStatusIsActive = (statusMap, childID) => {
+    if (!Object.hasOwn(statusMap, childID)) return false
+    const status = statusMap[childID]
+    return !(isPlainObject(status) && status.type === "idle")
+  }
+
+  // Hosts that cannot report children/status fail open, but the failure is a
+  // property of the host, not of a single turn: logging it on every
+  // continuation attempt would add one identical error per goal turn.
+  const childActivityProbeFailuresLogged = new Set()
+  const logChildActivityProbeFailure = (kind, message, error) => {
+    if (childActivityProbeFailuresLogged.has(kind)) return Promise.resolve()
+    childActivityProbeFailuresLogged.add(kind)
+    return logPluginError(
+      client,
+      `${message} (further ${kind} failures are suppressed for this plugin instance)`,
+      error,
+    )
+  }
+
+  // With noContinueWhileChildrenActive, auto-continue is deferred while any
+  // child session (subagent, background task) is still active, so the goal
+  // loop does not prompt the orchestrator over work a child is already doing.
+  // Fail open: if the host cannot report children/status, continue as before.
+  const activeChildSessionIDs = async (sessionID) => {
+    try {
+      const [children, status] = await Promise.all([
+        sessionApi.children(sessionID),
+        sessionApi.status(),
+      ])
+      // A live opencode SDK does not throw on an argument-shape mismatch; it
+      // resolves with `{error, request, response}` and no `data`. Treating that
+      // silently as "no children" would turn the whole gate into a no-op with
+      // no diagnostic, so an unusable payload takes the same logged fail-open
+      // path as a thrown error.
+      if (!Array.isArray(children) || !isPlainObject(status)) {
+        await logChildActivityProbeFailure(
+          "payload",
+          "Child session activity probe returned an unusable payload; continuing without the active-children gate",
+          new Error(
+            `children=${Array.isArray(children) ? "array" : typeof children}, status=${isPlainObject(status) ? "object" : typeof status}`,
+          ),
+        )
+        return []
+      }
+      return children
+        .filter(
+          (child) =>
+            isPlainObject(child) &&
+            typeof child.id === "string" &&
+            childStatusIsActive(status, child.id),
+        )
+        .map((child) => child.id)
+    } catch (error) {
+      await logChildActivityProbeFailure(
+        "probe",
+        "Failed to check child session activity; continuing without the active-children gate",
+        error,
+      )
+      return []
+    }
+  }
+
+  // Deferral is only announced on the transition into and out of the gated
+  // state. Without this the goal reports itself as running while doing nothing
+  // at all, which is indistinguishable from a hang in `/goal status`.
+  const childDeferralNotices = new Set()
+  const childDeferralKey = (sessionID, goal) =>
+    `${sessionID}\u0000${goal.goalId}\u0000${goal.runId}`
+
+  // Idle events are session-scoped and a child's completion is delivered only
+  // on the child's own session: a parent that is already idle emits nothing at
+  // all while a child runs and finishes (verified against a live opencode
+  // server). Because the continuation driver is purely event-driven, a goal
+  // deferred behind a child would never be retried. Remember the children we
+  // deferred on so their idle event can re-drive the parent exactly once.
+  // Entries carry the goal identity, not just the parent session: `cleanupGoal`
+  // runs on clear/replace/complete from many call sites, so rather than hooking
+  // every one of them the wake path re-validates that the goal which deferred is
+  // still the goal in focus. A stale entry is dropped instead of driving a
+  // continuation for a goal that never deferred.
+  const MAX_DEFERRED_CHILD_WATCH = 256
+  const deferredChildWatch = new Map()
+  // Monotonic marker for idle events seen from sessions that hold no goal. The
+  // probe is asynchronous, so a child can go idle between the status snapshot
+  // and the watch being armed: its event arrives with nothing armed, is
+  // dropped, and the watch is then set on a session that will never emit again.
+  // Recording the sequence at which each child was last seen idle lets the gate
+  // notice that and continue instead of waiting forever.
+  // Guards the synthesized parent wake below against re-entering itself. Keyed
+  // by parent session: the wake is awaited across several SDK round-trips, and
+  // a single shared counter would drop every other parent's wake arriving in
+  // that window — a permanent strand, silently, in an unrelated goal.
+  const childWakeInFlight = new Set()
+  let idleEventSequence = 0
+  const childIdleSequence = new Map()
+  const recordChildIdle = (childSessionID) => {
+    if (!childSessionID) return
+    idleEventSequence += 1
+    childIdleSequence.set(childSessionID, idleEventSequence)
+    while (childIdleSequence.size > MAX_DEFERRED_CHILD_WATCH) {
+      childIdleSequence.delete(childIdleSequence.keys().next().value)
+    }
+  }
+  const idledSince = (childSessionID, sequence) =>
+    (childIdleSequence.get(childSessionID) ?? 0) > sequence
+  // Returns false when the children cannot all be tracked. Deferring without a
+  // complete watch would strand the goal the moment an untracked child is the
+  // one that finishes, so the caller continues instead. Capacity is never
+  // reclaimed by evicting a live entry: that is the same silent strand seen
+  // from the other direction.
+  const watchDeferredChildren = (sessionID, goal, childIDs) => {
+    for (const [childID, watched] of deferredChildWatch) {
+      if (watched.sessionID === sessionID && !childIDs.includes(childID)) {
+        deferredChildWatch.delete(childID)
+      }
+    }
+    pruneDeferredChildState()
+    let otherSessionEntries = 0
+    for (const watched of deferredChildWatch.values()) {
+      if (watched.sessionID !== sessionID) otherSessionEntries += 1
+    }
+    if (otherSessionEntries + childIDs.length > MAX_DEFERRED_CHILD_WATCH) return false
+    for (const childID of childIDs) {
+      deferredChildWatch.set(childID, {
+        sessionID,
+        goalId: goal.goalId,
+        runId: goal.runId,
+      })
+    }
+    return true
+  }
+
+  // Bounded like every other runtime map in this file, but eviction must never
+  // discard a watch a live goal is waiting on: that would strand it with no
+  // diagnostic, which is the failure this whole mechanism exists to prevent.
+  // Entries whose goal has been cleared, replaced, completed or stopped are
+  // dead weight and are dropped first; the cap is only enforced against live
+  // entries as a last resort.
+  const deferralGoalIsLive = (watched) => {
+    const goal = goalStates.get(watched.sessionID)
+    return Boolean(
+      goal && goal.goalId === watched.goalId && goal.runId === watched.runId && !goal.stopped,
+    )
+  }
+  const pruneDeferredChildState = () => {
+    for (const [childID, watched] of deferredChildWatch) {
+      if (!deferralGoalIsLive(watched)) deferredChildWatch.delete(childID)
+    }
+    for (const key of childDeferralNotices) {
+      const [noticeSessionID, goalId, runId] = key.split("\u0000")
+      if (!deferralGoalIsLive({ sessionID: noticeSessionID, goalId, runId })) {
+        childDeferralNotices.delete(key)
+      }
+    }
+  }
+  const clearDeferredChildren = (sessionID) => {
+    for (const [childID, watched] of deferredChildWatch) {
+      if (watched.sessionID === sessionID) deferredChildWatch.delete(childID)
+    }
   }
 
   const claimContinuationSource = async (
@@ -4246,16 +4427,87 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       return null
     }
 
+    // Human intervention is evaluated before the active-children gate: a real
+    // user message must pause the goal immediately, not once the subagents
+    // happen to go idle.
     const newHumanMessage =
       refreshed.latestRealUserMessageID &&
       refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID
-    if (newHumanMessage || userInterventionDetected(messages, goal)) {
+    if (
+      !goal.options.noInterruptOnUserMessage &&
+      (newHumanMessage || userInterventionDetected(messages, goal))
+    ) {
+      childDeferralNotices.delete(childDeferralKey(sessionID, goal))
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
         history: "Paused auto-continue after a real user message arrived; latest instruction wins.",
       })
       return null
+    }
+
+    if (goal.options.noContinueWhileChildrenActive) {
+      const deferralKey = childDeferralKey(sessionID, goal)
+      const sequenceBeforeProbe = idleEventSequence
+      let activeChildren = await activeChildSessionIDs(sessionID)
+      // A child running a goal of its own consumes its idle events for that
+      // goal, so it cannot deliver the wake this gate depends on. Deferring
+      // behind one would strand the parent silently; the gate steps aside.
+      const selfDrivenChildren = activeChildren.filter((childID) => goalStates.has(childID))
+      if (selfDrivenChildren.length > 0) {
+        await logChildActivityProbeFailure(
+          "self-driven-child",
+          `Active child session(s) ${selfDrivenChildren.join(", ")} run goals of their own and cannot wake this goal; continuing without the active-children gate`,
+          new Error("watched child holds its own goal state"),
+        )
+        activeChildren = []
+      }
+      if (activeChildren.length > 0) {
+        // Arm the watch, then confirm the children are still active. A child
+        // that went idle while the first probe was in flight would already have
+        // delivered its event, finding nothing armed, and the goal would wait
+        // for a wake-up that can never come. Re-probing after arming closes
+        // that window: from here on any transition is observed by the watch.
+        if (!watchDeferredChildren(sessionID, goal, activeChildren)) {
+          // More concurrent children than the watch can hold. Continuing is the
+          // safe direction: the gate is an optimisation, a stranded goal is not.
+          await logChildActivityProbeFailure(
+            "watch-capacity",
+            `Cannot track ${activeChildren.length} active child session(s) within the watch limit; continuing without the active-children gate`,
+            new Error(`watch limit ${MAX_DEFERRED_CHILD_WATCH} exceeded`),
+          )
+          activeChildren = []
+        } else {
+          activeChildren = await activeChildSessionIDs(sessionID)
+          // Drop any child that went idle while a probe was in flight: its wake
+          // event has already been delivered and will not come again.
+          activeChildren = activeChildren.filter(
+            (childID) => !idledSince(childID, sequenceBeforeProbe),
+          )
+        }
+      }
+      if (activeChildren.length > 0) {
+        if (!childDeferralNotices.has(deferralKey)) {
+          childDeferralNotices.add(deferralKey)
+          goal.lastStatus =
+            "Auto-continue deferred while a child session (subagent or background task) is still active. The goal is still running and continues once the children finish."
+          // One entry per episode, not one per transition: history is a
+          // 20-entry ring and a subagent-heavy run would otherwise evict
+          // checkpoints and limit warnings.
+          pushHistory(
+            goal,
+            "deferred",
+            "Deferred auto-continue while child sessions were active.",
+          )
+          await persist(sessionID)
+        }
+        return null
+      }
+      clearDeferredChildren(sessionID)
+      if (childDeferralNotices.delete(deferralKey)) {
+        goal.lastStatus = "Child sessions went idle; auto-continue resumed."
+        await persist(sessionID)
+      }
     }
 
     if (
@@ -4422,6 +4674,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped) return
+      // With noInterruptOnUserMessage, a human message steers the running loop
+      // instead of pausing the goal for /goal resume.
+      if (goal.options.noInterruptOnUserMessage) return
       await pauseActiveGoal(sessionID, {
         stopReason: "user intervention",
         status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -5147,12 +5402,62 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       if (!isIdleEvent(event)) return
 
-      const sessionID = getSessionID(event)
+      const emittingSessionID = getSessionID(event)
+      let sessionID = emittingSessionID
+      // A child we deferred on has gone idle. The parent emits no event of its
+      // own, so this is the only chance to re-drive its continuation. Consumed
+      // once: unrelated children (the completion auditor's own session, for
+      // example) are never watched and so can never trigger a continuation.
+      let childWakeEvent = event?.[CHILD_WAKE_EVENT_FLAG] === true
+      if (sessionID && !goalStates.has(sessionID)) recordChildIdle(sessionID)
+      if (sessionID && deferredChildWatch.has(sessionID)) {
+        const watched = deferredChildWatch.get(sessionID)
+        deferredChildWatch.delete(sessionID)
+        // The goal that deferred must still be the goal in focus. If it was
+        // cleared, replaced, completed or restarted in the meantime, this wake
+        // belongs to nothing and must not drive the goal that took its place.
+        const parentGoal = goalStates.get(watched.sessionID)
+        const parentStillWaiting =
+          parentGoal &&
+          parentGoal.goalId === watched.goalId &&
+          parentGoal.runId === watched.runId
+        if (parentStillWaiting && !goalStates.has(sessionID)) {
+          sessionID = watched.sessionID
+          childWakeEvent = true
+        } else if (
+          parentStillWaiting &&
+          !childWakeInFlight.has(watched.sessionID) &&
+          currentRuntime().sessionStatuses.get(watched.sessionID) === "idle"
+        ) {
+          // The child acquired a goal of its own after being watched, so it
+          // needs this event for its own loop. Serving only one of the two
+          // would starve the other, so the parent is woken through a
+          // synthesized idle of its own before the child's event continues.
+          childWakeInFlight.add(watched.sessionID)
+          try {
+            await hooks.event({
+              event: {
+                type: "session.idle",
+                properties: { sessionID: watched.sessionID },
+                // B: the synthesized event is a wake pass like any other, so it
+                // must not re-charge the stall gates for an assistant turn the
+                // deferring pass already scored.
+                [CHILD_WAKE_EVENT_FLAG]: true,
+              },
+            })
+          } finally {
+            childWakeInFlight.delete(watched.sessionID)
+          }
+        }
+      }
       // Deprecated session.idle carries no status object but is itself an
       // authoritative idle signal. Current session.status events were recorded
-      // above before entering this branch.
+      // above before entering this branch. Record it against the session that
+      // actually emitted it: a child going idle says nothing about whether its
+      // parent is idle, and claiming otherwise would defeat the idle guard in
+      // the continuation claim.
       if (event?.type === "session.idle") {
-        currentRuntime().sessionStatuses.set(sessionID, "idle")
+        currentRuntime().sessionStatuses.set(emittingSessionID, "idle")
       }
       const eventID = typeof event?.id === "string" ? event.id : ""
       const seenIdleEventIDs = currentRuntime().seenIdleEventIDs
@@ -5229,7 +5534,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // Latest instruction wins: if a real (non-plugin) user message arrived
         // since the last auto-continue, stop driving the loop and defer to the
         // human. They can /goal resume to hand control back to the plugin.
-        if (userInterventionDetected(messages, activeGoalAfterMessages)) {
+        if (
+          !activeGoalAfterMessages.options.noInterruptOnUserMessage &&
+          userInterventionDetected(messages, activeGoalAfterMessages)
+        ) {
           await pauseActiveGoal(sessionID, {
             stopReason: "user intervention",
             status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
@@ -5575,7 +5883,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           !latestHasToolCall &&
           !latestHasThinkingTokens &&
           (assistantRepeated || !latestText || !assistantChanged)
-        if (lowOutputLooksStalled) {
+        // A child-wake pass re-examines an assistant turn the parent already
+        // produced and was already charged for: the parent ran nothing in
+        // between. Charging the stall gates again would pause a healthy goal
+        // after one talk-only turn plus one deferral.
+        if (lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noProgressTurns += 1
           if (
             activeGoalAfterMessages.noProgressTurns >=
@@ -5615,7 +5927,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             "warning",
             `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`,
           )
-        } else if (latestOutputTokens !== null || assistantChanged || !latestAssistant) {
+        } else if (
+          // A wake pass observes the same assistant turn the deferring pass
+          // already scored, so it must neither charge nor clear the counter.
+          // Resetting here would let an alternating defer/wake cycle keep a
+          // genuinely stalled loop running indefinitely.
+          !childWakeEvent &&
+          (latestOutputTokens !== null || assistantChanged || !latestAssistant)
+        ) {
           activeGoalAfterMessages.noProgressTurns = 0
         }
 
@@ -5636,7 +5955,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           !activationBoundary &&
           Boolean(latestAssistant) &&
           !latestHasToolCall
-        if (noToolCallContinuation && !lowOutputLooksStalled) {
+        if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noToolCallTurns += 1
           if (
             activeGoalAfterMessages.noToolCallTurns >=

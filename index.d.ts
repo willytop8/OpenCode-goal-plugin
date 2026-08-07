@@ -175,6 +175,25 @@ export interface GoalPluginOptions {
   noToolCallTurnsBeforePause?: number
 
   /**
+   * When `true`, a new human message does not pause an active goal: the goal
+   * loop keeps running and the message steers the next continuation instead of
+   * stopping with `stopReason: "user intervention"`. Plugin-owned command and
+   * continuation messages are never treated as interventions either way.
+   * @default false
+   */
+  noInterruptOnUserMessage?: boolean
+
+  /**
+   * When `true`, auto-continue is deferred while the session has active child
+   * sessions (subagents or background tasks), so the goal loop does not prompt
+   * the orchestrator over work a child is already doing. The goal stays
+   * running and the next idle event continues once the children are done.
+   * Hosts that cannot report children/status fail open (continuation proceeds).
+   * @default false
+   */
+  noContinueWhileChildrenActive?: boolean
+
+  /**
    * Fraction (between 0 and 1, exclusive) of any budget (turns, duration,
    * or tokens) at which the plugin sends a one-time "wrap up" prompt
    * nudging the model to finish before the hard limit is hit.

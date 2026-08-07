@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import nodeTest from "node:test"
 import { randomUUID } from "node:crypto"
 import {
   mkdir,
@@ -26,6 +26,19 @@ import {
   PersistenceLeaseContendedError,
   persistenceLeaseInternals,
 } from "../src/persistence-lease.js"
+
+// Every test in this file waits on real filesystem locking, and several of the
+// mutation-contract mutants remove the very guard that lets one of those waits
+// finish. An unbounded test does not then fail — it hangs the whole run until
+// CI's job timeout, reporting nothing about which mutant caused it. Node 18 has
+// no `--test-timeout`, so the bound is applied here instead. Generous on
+// purpose: normal runs finish in milliseconds, so this only ever fires on a
+// genuine hang, never on a slow runner.
+const LEASE_TEST_TIMEOUT_MS = 30_000
+const test = (name, options, run) =>
+  typeof options === "function"
+    ? nodeTest(name, { timeout: LEASE_TEST_TIMEOUT_MS }, options)
+    : nodeTest(name, { timeout: LEASE_TEST_TIMEOUT_MS, ...options }, run)
 
 async function createV2LeaseDirectory(lockPath) {
   const guard = await persistenceLeaseInternals.publishLegacyGuard(lockPath)
@@ -783,7 +796,12 @@ test("concurrent release calls cannot delete a replacement lease", async () => {
   }
 })
 
-test("persistence lease prevents a second Node process from owning the same state", async () => {
+// Bounded like the child-process tests in session-concurrency.test.js. This test
+// waits on a second Node process twice — for readiness, and for exit after the
+// stop signal — and a mutant that stops the child ever reaching either point
+// would otherwise wedge the whole run until the CI job's 15-minute timeout,
+// reporting nothing about which mutant did it.
+test("persistence lease prevents a second Node process from owning the same state", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "goal-lease-process-"))
   const state = join(dir, "state.json")
   const moduleURL = new URL("../src/persistence-lease.js", import.meta.url).href
@@ -793,10 +811,40 @@ test("persistence lease prevents a second Node process from owning the same stat
     process.stdout.write("READY\\n")
     process.stdin.once("data", async () => { await lease.release(); process.exit(0) })
   `], { stdio: ["pipe", "pipe", "pipe"] })
+  // Reap the holder however this test ends. The `finally` below does not run
+  // when the test times out, and a surviving child keeps its stdio pipes open —
+  // which keeps the whole test runner process alive after the suite finishes.
+  // A mutant that stops the child exiting therefore hangs the entire run rather
+  // than failing one test.
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL")
+    child.stdin.destroy()
+    child.stdout.destroy()
+    child.stderr.destroy()
+  })
+  let stderr = ""
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString()
+  })
+  // The holder announces itself on stdout before the parent can meaningfully
+  // contend for the lease. Race that against the child exiting: if it dies first
+  // — a fail-closed acquire, an import error, anything — nothing will ever be
+  // written, and waiting on stdout alone blocks forever. That is not
+  // hypothetical: with the guard-completion mutant applied the child correctly
+  // throws ERR_GOAL_PERSISTENCE_LEASE_PATH and exits, and this test used to hang
+  // until the CI job's own timeout killed it, reporting nothing useful.
+  const exitedEarly = once(child, "exit").then(([code, signal]) => {
+    throw new Error(
+      `lease holder exited before signalling READY (code ${code}, signal ${signal})` +
+        (stderr ? `\nchild stderr:\n${stderr}` : ""),
+    )
+  })
+  // The loop below may finish first and leave this rejection unobserved.
+  exitedEarly.catch(() => {})
   try {
     let output = ""
     while (!output.includes("READY")) {
-      const [chunk] = await once(child.stdout, "data")
+      const [chunk] = await Promise.race([once(child.stdout, "data"), exitedEarly])
       output += chunk.toString()
     }
     await assert.rejects(acquirePersistenceLease(state), (error) => {
