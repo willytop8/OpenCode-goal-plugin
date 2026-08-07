@@ -4363,6 +4363,49 @@ test("totalTokens resets to zero after session compaction", async () => {
   assert.equal(currentGoal(session).totalTokens, 45_000, "post-compaction tokens accumulate from zero")
 })
 
+test("auto-continue fires after compaction despite a pre-compaction continuation claim", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [pluginContinuationMessage(), message("did a step")],
+      }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+  // A continuation was claimed for the latest assistant turn right before the
+  // compaction interrupted it; after compaction the recent tail still ends on
+  // that same assistant message, so the stale claim must not suppress the
+  // post-compaction continuation.
+  goal.continuationClaim = { runId: goal.runId, sourceAssistantMessageID: "msg-assistant" }
+
+  await hooks.event({
+    event: { type: "session.compacted", properties: { sessionID: "session-1" } },
+  })
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
 test("parses --max-duration-ms flag directly", () => {
   const parsed = parseGoalArguments("fix tests --max-duration-ms 90000", normalizeOptions())
   assert.equal(parsed.condition, "fix tests")

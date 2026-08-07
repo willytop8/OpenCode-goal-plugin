@@ -5331,6 +5331,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!goal) return
         goal.messageIDs = new Set()
         goal.totalTokens = 0
+        // Compaction rewrites the context: a continuation claim for a
+        // pre-compaction source turn must not suppress the post-compaction
+        // continuation (the recent tail can still end on the same assistant
+        // message, which would otherwise stall the goal loop until the user
+        // nudges it).
+        goal.continuationClaim = null
         await persist(sessionID)
         return
       }
