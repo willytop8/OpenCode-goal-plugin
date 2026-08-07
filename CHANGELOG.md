@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-08-06
+
+Both new options in this release were contributed by
+[@harryzhou2000](https://github.com/harryzhou2000) in
+[#53](https://github.com/willytop8/OpenCode-goal-plugin/pull/53).
+
 - Add `noInterruptOnUserMessage` plugin option. When `true`, a new human message steers an active goal — the loop keeps running and the message is included in the next continuation — instead of pausing it with `stopReason: "user intervention"`. The pause-on-intervention default is unchanged.
-- Add `noContinueWhileChildrenActive` plugin option. When `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks), so the goal loop does not prompt the orchestrator over work a child is already doing; the goal stays running and continues on a later idle once the children finish. Hosts that cannot report children/status fail open.
+- Add `noContinueWhileChildrenActive` plugin option. When `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks), so the goal loop does not prompt the orchestrator over work a child is already doing; the goal stays running and continues on a later idle once the children finish. A child counts as active only while the host reports a non-idle status for it. Each deferral episode records a `deferred` history event and a status line so `/goal status` distinguishes "waiting on a subagent" from a hung loop. A deferred goal is re-driven by the child's own idle event, since a parent that is already idle emits no event of its own while a child runs. Hosts that cannot report children/status, and sessions with more concurrent children than the plugin can track, fail open and log once per plugin instance.
 
 ## 0.7.0 — 2026-08-02
 
