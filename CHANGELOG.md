@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-08-07
+
 - Fix goal auto-continue stalling after session compaction: a continuation
   claim for a pre-compaction source turn could match the still-visible tail
   assistant message after compaction and suppress the post-compaction
   continuation until the user nudged the goal. The claim is now invalidated on
-  `session.compacted`, so the loop resumes on the next idle.
+  `session.compacted`, so the loop resumes on the next idle. Contributed by
+  [@harryzhou2000](https://github.com/harryzhou2000) in
+  [#58](https://github.com/willytop8/OpenCode-goal-plugin/pull/58).
+- Update the bundled `zod` dependency from 4.1.8 to 4.4.3.
 
 ## 0.8.0 — 2026-08-06
 
