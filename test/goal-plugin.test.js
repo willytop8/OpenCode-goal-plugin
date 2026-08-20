@@ -4369,7 +4369,10 @@ test("auto-continue fires after compaction despite a pre-compaction continuation
     app: { log: async () => {} },
     session: {
       messages: async () => ({
-        data: [pluginContinuationMessage(), message("did a step")],
+        data: [
+          pluginContinuationMessage(),
+          message("did a step", { input: 1, output: 1, reasoning: 0 }),
+        ],
       }),
       promptAsync: async (input) => {
         calls.push(input)
@@ -4379,7 +4382,7 @@ test("auto-continue fires after compaction despite a pre-compaction continuation
   }
   const hooks = await GoalPlugin(
     { client },
-    { persistState: false, minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+    { persistState: false, minDelayMs: 1, noToolCallTurnsBeforePause: 1 },
   )
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -4392,11 +4395,28 @@ test("auto-continue fires after compaction despite a pre-compaction continuation
   // compaction interrupted it; after compaction the recent tail still ends on
   // that same assistant message, so the stale claim must not suppress the
   // post-compaction continuation.
-  goal.continuationClaim = { runId: goal.runId, sourceAssistantMessageID: "msg-assistant" }
+  goal.continuationClaim = {
+    runId: goal.runId,
+    compactionEpoch: goal.compactionEpoch,
+    sourceAssistantMessageID: "msg-assistant",
+  }
 
   await hooks.event({
     event: { type: "session.compacted", properties: { sessionID: "session-1" } },
   })
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        message: message(
+          "did a step",
+          { input: 1, output: 1, reasoning: 0 },
+          "msg-assistant",
+        ),
+      },
+    },
+  })
+  assert.equal(goal.stalledCompactions, 1, "retained source is not new work progress")
 
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
@@ -4404,6 +4424,200 @@ test("auto-continue fires after compaction despite a pre-compaction continuation
 
   assert.equal(calls.length, 1)
   assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").compactionEpoch, 1)
+  assert.deepEqual(currentGoal("session-1").continuationClaim, {
+    runId: goal.runId,
+    compactionEpoch: 1,
+    sourceAssistantMessageID: "msg-assistant",
+  })
+
+  await hooks.event({
+    event: { id: "idle-after-compact-duplicate", type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1, "one compaction epoch must send only one continuation")
+})
+
+test("duplicate session.compacted delivery does not open another continuation epoch", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-compact-duplicate", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const compacted = {
+    id: "compact-event-1",
+    type: "session.compacted",
+    properties: { sessionID: "session-compact-duplicate" },
+  }
+  await hooks.event({ event: compacted })
+  await hooks.event({
+    event: { id: "idle-compact-1", type: "session.status", properties: { sessionID: "session-compact-duplicate", status: { type: "idle" } } },
+  })
+  await hooks.event({ event: structuredClone(compacted) })
+  await hooks.event({
+    event: { id: "idle-compact-2", type: "session.status", properties: { sessionID: "session-compact-duplicate", status: { type: "idle" } } },
+  })
+
+  const goal = currentGoal("session-compact-duplicate")
+  assert.equal(calls.length, 1)
+  assert.equal(goal.compactionEpoch, 1)
+  assert.equal(goal.stalledCompactions, 1)
+  assert.equal(goal.stopped, false)
+})
+
+test("repeated compactions without work progress pause and abort the active goal", async () => {
+  const { aborts, calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-stalled"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { id: "compact-stalled-1", type: "session.compacted", properties: { sessionID } },
+  })
+  await hooks.event({
+    event: { id: "idle-stalled-1", type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  await hooks.event({
+    event: { id: "compact-stalled-2", type: "session.compacted", properties: { sessionID } },
+  })
+
+  const goal = currentGoal(sessionID)
+  assert.equal(calls.length, 1)
+  assert.equal(aborts.length, 1)
+  assert.equal(aborts[0].path.id, sessionID)
+  assert.equal(goal.compactionEpoch, 2)
+  assert.equal(goal.stalledCompactions, 2)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "stalled compaction")
+})
+
+test("a productive tool turn resets the stalled-compaction circuit breaker", async () => {
+  const { aborts, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-progress"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { id: "compact-progress-1", type: "session.compacted", properties: { sessionID } },
+  })
+  const toolTurn = {
+    info: {
+      id: "msg-tool-progress",
+      role: "assistant",
+      sessionID,
+      tokens: { input: 1, output: 0, reasoning: 0 },
+    },
+    parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }],
+  }
+  await hooks.event({
+    event: { type: "message.updated", properties: { message: toolTurn } },
+  })
+  assert.equal(currentGoal(sessionID).stalledCompactions, 0)
+
+  await hooks.event({
+    event: { id: "compact-progress-2", type: "session.compacted", properties: { sessionID } },
+  })
+  const goal = currentGoal(sessionID)
+  assert.equal(aborts.length, 0)
+  assert.equal(goal.stalledCompactions, 1)
+  assert.equal(goal.stopped, false)
+})
+
+test("compaction-summary assistants are neither progress nor continuation sources", async () => {
+  const workAssistant = message(
+    "implemented the next step",
+    undefined,
+    "msg-real-work",
+    "session-compact-summary",
+  )
+  const compactSummary = {
+    info: {
+      id: "msg-compact-summary",
+      role: "assistant",
+      sessionID: "session-compact-summary",
+      summary: true,
+      mode: "compaction",
+      tokens: { input: 100, output: 100, reasoning: 0 },
+    },
+    parts: [textPart("What did we do so far?")],
+  }
+  const { aborts, calls, hooks } = await createHooks({
+    messages: async () => ({ data: [workAssistant, compactSummary] }),
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-summary"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { id: "compact-summary-1", type: "session.compacted", properties: { sessionID } },
+  })
+  await hooks.event({
+    event: { type: "message.updated", properties: { message: compactSummary } },
+  })
+  assert.equal(currentGoal(sessionID).stalledCompactions, 1)
+
+  await hooks.event({
+    event: { id: "idle-compact-summary", type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal(sessionID).continuationClaim.sourceAssistantMessageID, "msg-real-work")
+
+  await hooks.event({
+    event: { id: "compact-summary-2", type: "session.compacted", properties: { sessionID } },
+  })
+  assert.equal(aborts.length, 1)
+  assert.equal(currentGoal(sessionID).stopReason, "stalled compaction")
+})
+
+test("compaction after claim persistence invalidates the stale idle handler", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-claim-race"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal(sessionID)
+  let claim = null
+  let compactionPromise = null
+  Object.defineProperty(goal, "continuationClaim", {
+    configurable: true,
+    get: () => claim,
+    set: (value) => {
+      claim = value
+      if (value && !compactionPromise) {
+        queueMicrotask(() => {
+          compactionPromise = hooks.event({
+            event: { id: "compact-claim-race", type: "session.compacted", properties: { sessionID } },
+          })
+        })
+      }
+    },
+  })
+
+  await hooks.event({
+    event: { id: "idle-claim-race", type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  await compactionPromise
+
+  assert.equal(calls.length, 0)
+  assert.equal(goal.compactionEpoch, 1)
+  assert.equal(goal.continuationClaim, null)
 })
 
 test("parses --max-duration-ms flag directly", () => {
@@ -4776,6 +4990,7 @@ test("continuation source claims and initiating execution context persist before
     })
     assert.deepEqual(goal.continuationClaim, {
       runId: goal.runId,
+      compactionEpoch: 0,
       sourceAssistantMessageID: "assistant-durable-source",
     })
 
