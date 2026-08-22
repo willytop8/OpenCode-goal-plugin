@@ -40,6 +40,7 @@ function legacyHomeStateFilePath(env = process.env) {
   return join(homeBase(env), ".opencode-goal-plugin", "state.json")
 }
 const MAX_HISTORY_ENTRIES = 20
+const MAX_STALLED_COMPACTIONS = 2
 // Marks a plugin-synthesized parent wake so the receiving pass knows it is
 // re-examining an assistant turn that has already been scored.
 const CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake")
@@ -1104,6 +1105,11 @@ function resetGoalBudget(goal) {
   goal.formatFailures = 0
   goal.lastAssistantMessageID = ""
   goal.continuationClaim = null
+  goal.compactionEpoch = 0
+  goal.stalledCompactions = 0
+  goal.lastCompactionEventID = ""
+  goal.messageSeenSinceCompaction = true
+  goal.compactionSourceAssistantMessageID = ""
   goal.skipNextTerminalCheck = false
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
 }
@@ -1433,15 +1439,31 @@ function normalizePersistedGoal(rawGoal) {
     stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
     promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
     formatFailures: toNonNegativeInteger(rawGoal.formatFailures),
+    compactionEpoch: toNonNegativeInteger(rawGoal.compactionEpoch),
+    stalledCompactions: toNonNegativeInteger(rawGoal.stalledCompactions),
+    lastCompactionEventID:
+      typeof rawGoal.lastCompactionEventID === "string" &&
+      rawGoal.lastCompactionEventID.length <= MAX_GOAL_META_LENGTH
+        ? rawGoal.lastCompactionEventID
+        : "",
+    messageSeenSinceCompaction: rawGoal.messageSeenSinceCompaction !== false,
+    compactionSourceAssistantMessageID:
+      typeof rawGoal.compactionSourceAssistantMessageID === "string" &&
+      rawGoal.compactionSourceAssistantMessageID.length <= MAX_GOAL_META_LENGTH
+        ? rawGoal.compactionSourceAssistantMessageID
+        : "",
     executionContext: normalizeExecutionContext(rawGoal.executionContext),
     continuationClaim:
       isPlainObject(rawGoal.continuationClaim) &&
       typeof rawGoal.continuationClaim.runId === "string" &&
       rawGoal.continuationClaim.runId.length <= MAX_GOAL_META_LENGTH &&
+      Number.isSafeInteger(rawGoal.continuationClaim.compactionEpoch) &&
+      rawGoal.continuationClaim.compactionEpoch >= 0 &&
       typeof rawGoal.continuationClaim.sourceAssistantMessageID === "string" &&
       rawGoal.continuationClaim.sourceAssistantMessageID.length <= MAX_GOAL_META_LENGTH
         ? {
             runId: rawGoal.continuationClaim.runId,
+            compactionEpoch: rawGoal.continuationClaim.compactionEpoch,
             sourceAssistantMessageID: rawGoal.continuationClaim.sourceAssistantMessageID,
           }
         : null,
@@ -2635,7 +2657,42 @@ function systemBlockContainsGoal(block, goalId) {
 }
 
 function findLatestAssistantMessage(messages) {
-  return [...(messages || [])].reverse().find((message) => messageRole(message) === "assistant") || null
+  return [...(messages || [])]
+    .reverse()
+    .find(
+      (message) =>
+        messageRole(message) === "assistant" && !isCompactionAssistantMessage(message),
+    ) || null
+}
+
+function isCompactionAssistantMessage(message) {
+  if (messageRole(message) !== "assistant") return false
+  const info = isPlainObject(message?.info) ? message.info : message
+  return (
+    info?.summary === true ||
+    info?.agent === "compaction" ||
+    info?.mode === "compaction" ||
+    message?.agent === "compaction" ||
+    message?.mode === "compaction"
+  )
+}
+
+function compactionEventIdentity(event) {
+  const candidates = [
+    event?.id,
+    event?.properties?.compactionID,
+    event?.properties?.summaryID,
+    event?.properties?.messageID,
+    event?.properties?.id,
+    event?.data?.compactionID,
+    event?.data?.summaryID,
+    event?.data?.messageID,
+    event?.data?.id,
+  ]
+  const identity = candidates.find(
+    (candidate) => typeof candidate === "string" && candidate.length > 0,
+  )
+  return identity && identity.length <= MAX_GOAL_META_LENGTH ? identity : ""
 }
 
 function messageParentID(message) {
@@ -2771,6 +2828,7 @@ function continuationSnapshot(messages, ownedMessages = currentRuntime().ownedPl
     .reverse()
     .find((message) =>
       (messageRole(message) === "assistant" || messageRole(message) === "user") &&
+      !isCompactionAssistantMessage(message) &&
       !isPluginGeneratedMessage(message, ownedMessages),
     )
   return {
@@ -2939,6 +2997,11 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     stopReason: "",
     promptFailures: 0,
     formatFailures: 0,
+    compactionEpoch: 0,
+    stalledCompactions: 0,
+    lastCompactionEventID: "",
+    messageSeenSinceCompaction: true,
+    compactionSourceAssistantMessageID: "",
     executionContext: normalizeExecutionContext(
       meta.executionContext || currentRuntime().sessionExecutionContexts.get(sessionID),
     ),
@@ -4397,18 +4460,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     sessionID,
     goalID,
     runID,
+    compactionEpoch,
     baselineMessages,
     { refreshMessages = false } = {},
   ) => {
     const goalBeforeRefresh = activeGoal(sessionID, goalID, runID)
-    if (!goalBeforeRefresh) return null
+    if (!goalBeforeRefresh || goalBeforeRefresh.compactionEpoch !== compactionEpoch) return null
     const hostMessages = refreshMessages
       ? await sessionApi.messages(sessionID, {
           limit: goalBeforeRefresh.options.maxRecentMessages,
         })
       : baselineMessages
     const goal = activeGoal(sessionID, goalID, runID)
-    if (!goal) return null
+    if (!goal || goal.compactionEpoch !== compactionEpoch) return null
     const messages = Array.isArray(hostMessages)
       ? hostMessages.slice(-goal.options.maxRecentMessages)
       : []
@@ -4523,12 +4587,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const sourceAssistantMessageID = refreshed.latestAssistantID || "<no-assistant>"
     if (
       goal.continuationClaim?.runId === runID &&
+      goal.continuationClaim?.compactionEpoch === compactionEpoch &&
       goal.continuationClaim?.sourceAssistantMessageID === sourceAssistantMessageID
     ) {
       return null
     }
 
-    goal.continuationClaim = { runId: runID, sourceAssistantMessageID }
+    goal.continuationClaim = { runId: runID, compactionEpoch, sourceAssistantMessageID }
     const claimPersisted = await persist(sessionID)
     if (!claimPersisted && persistenceOptions.persistState) {
       goal.continuationClaim = null
@@ -4545,7 +4610,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       })
       return null
     }
-    return goal
+    // Let an already-published compaction event invalidate this claim before
+    // the caller enters promptAsync. The final epoch check is the atomic edge:
+    // a claim is valid only while its context epoch is still current.
+    await Promise.resolve()
+    return activeGoal(sessionID, goalID, runID)?.compactionEpoch === compactionEpoch
+      ? goal
+      : null
   }
 
   const retireCompletedCommandTurnOnIdle = async (sessionID, messageLimit) => {
@@ -5328,15 +5399,59 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (event?.type === "session.compacted") {
         const sessionID = getSessionID(event)
         const goal = goalStates.get(sessionID)
-        if (!goal) return
+        if (!goal || goal.stopped) return
+        const identity = compactionEventIdentity(event)
+        if (identity) {
+          if (identity === goal.lastCompactionEventID) return
+          goal.lastCompactionEventID = identity
+        } else if (goal.compactionEpoch > 0 && !goal.messageSeenSinceCompaction) {
+          // A real OpenCode `session.compacted` carries only `sessionID` (SDK:
+          // EventSessionCompacted has no id/compactionID/summaryID/messageID and
+          // no sync variant), so compactionEventIdentity() returns "" for every
+          // host-delivered compaction and the identity dedup above never fires
+          // in production. Recognize a re-delivery by the absence of message
+          // activity instead: a genuine new compaction is always preceded by
+          // messages, because the context has to grow again to trigger one.
+          return
+        }
+        goal.messageSeenSinceCompaction = false
+
+        goal.compactionEpoch += 1
+        goal.stalledCompactions += 1
+        goal.compactionSourceAssistantMessageID =
+          goal.continuationClaim?.runId === goal.runId
+            ? goal.continuationClaim.sourceAssistantMessageID
+            : ""
         goal.messageIDs = new Set()
         goal.totalTokens = 0
-        // Compaction rewrites the context: a continuation claim for a
-        // pre-compaction source turn must not suppress the post-compaction
-        // continuation (the recent tail can still end on the same assistant
-        // message, which would otherwise stall the goal loop until the user
-        // nudges it).
+        // Compaction rewrites the context. The epoch-scoped claim lets the same
+        // retained assistant source continue once in the new epoch without
+        // allowing duplicate idle delivery to continue it twice.
         goal.continuationClaim = null
+
+        // An idle handler can already have persisted its source claim when the
+        // compaction lands. Abort its cooldown and release the per-session guard;
+        // the epoch checks around promptAsync prevent that stale handler from
+        // sending while allowing the post-compaction idle to start immediately.
+        currentRuntime().continuationControllers.get(sessionID)?.abort()
+        currentRuntime().continuationControllers.delete(sessionID)
+        activeContinues.delete(sessionID)
+
+        if (goal.stalledCompactions >= MAX_STALLED_COMPACTIONS) {
+          await pauseActiveGoal(sessionID, {
+            stopReason: "stalled compaction",
+            status: `Goal paused after ${goal.stalledCompactions} compactions without a productive assistant or tool turn.`,
+            history: `Paused after ${goal.stalledCompactions} compactions without productive non-compaction work.`,
+          })
+          if (typeof client?.session?.abort === "function") {
+            try {
+              await sessionApi.abort(sessionID)
+            } catch (error) {
+              await logPluginError(client, "Failed to abort a stalled compaction loop", error)
+            }
+          }
+          return
+        }
         await persist(sessionID)
         return
       }
@@ -5344,6 +5459,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (event?.type === "message.updated") {
         const message = messageInfoFromEvent(event)
         if (!message) return
+        const messageEnvelope =
+          event?.properties?.message || event?.data?.message || message
 
         const currentMessageID = messageID(message)
         if (!currentMessageID) return
@@ -5352,6 +5469,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
         const goal = goalStates.get(currentSessionID)
         if (!goal) return
+
+        // Any message traffic for this goal marks the current compaction epoch
+        // as having seen activity, which is what lets an identity-less
+        // `session.compacted` re-delivery be told apart from a real one. Recorded
+        // before the stale-redelivery guard below: a message that is stale for
+        // token accounting still proves the host is delivering message events.
+        goal.messageSeenSinceCompaction = true
 
         // Skip stale re-deliveries from a prior budget window or a replaced goal.
         // resetGoalBudget and cleanupGoal both leave seenTokens entries in place
@@ -5395,10 +5519,31 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
         if (
           messageRole(message) === "assistant" &&
+          !isCompactionAssistantMessage(messageEnvelope) &&
+          currentMessageID !== goal.compactionSourceAssistantMessageID &&
           currentOutputTokens > previousOutputTokens &&
           runtime.suppressedCommandAssistants.get(currentMessageID) !== currentSessionID
         ) {
           goal.lastProgressAt = Date.now()
+          changed = true
+        }
+
+        // Productive-turn reset. `message.updated` carries only
+        // `properties.info` (SDK: EventMessageUpdated) and never any parts —
+        // tool parts arrive on the separate `message.part.updated` event, which
+        // this plugin does not observe. A messageHasToolCall() check against the
+        // event envelope is therefore always false and cannot serve as the reset
+        // signal. Growing output tokens is the signal that does work: an
+        // assistant turn that calls a tool still emits output tokens for it.
+        if (
+          messageRole(message) === "assistant" &&
+          !isCompactionAssistantMessage(messageEnvelope) &&
+          currentMessageID !== goal.compactionSourceAssistantMessageID &&
+          currentOutputTokens > previousOutputTokens &&
+          goal.stalledCompactions > 0
+        ) {
+          goal.stalledCompactions = 0
+          goal.compactionSourceAssistantMessageID = ""
           changed = true
         }
 
@@ -5497,10 +5642,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (!goal || goal.stopped || activeContinues.has(sessionID)) return
       const goalID = goal.goalId
       const runID = goal.runId
+      const compactionEpoch = goal.compactionEpoch
 
       const continueToken = randomUUID()
       const continueController = new AbortController()
       let claimedSourceAssistantMessageID = ""
+      let claimedCompactionEpoch = -1
       activeContinues.set(sessionID, continueToken)
       currentRuntime().continuationControllers.set(sessionID, continueController)
       try {
@@ -5513,7 +5660,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           ? hostMessages.slice(-goal.options.maxRecentMessages)
           : []
         const activeGoalAfterMessages = activeGoal(sessionID, goalID, runID)
-        if (!activeGoalAfterMessages) return
+        if (
+          !activeGoalAfterMessages ||
+          activeGoalAfterMessages.compactionEpoch !== compactionEpoch
+        ) return
         if (!activeGoalAfterMessages.executionContext) {
           activeGoalAfterMessages.executionContext = findLatestExecutionContext(messages)
         }
@@ -5526,9 +5676,21 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const assistantChanged = summarizeText(latestText) !== summarizeText(previousAssistantText)
         const assistantRepeated =
           latestAssistantID && latestAssistantID === activeGoalAfterMessages.lastAssistantMessageID
-        const activationBoundary =
+        // A retained pre-compaction assistant must not be scored as fresh
+        // progress, so the compaction source gates checkpointing and the stall
+        // heuristics. It must NOT gate the terminal checks: a [goal:complete] or
+        // [goal:blocked] on that retained turn has not been acted on yet — it
+        // survived the compaction unprocessed — and swallowing it discards a
+        // real result and spends another continuation to re-derive it.
+        const terminalBoundary =
           currentRuntime().suppressedCommandAssistants.get(latestAssistantID) === sessionID ||
           activeGoalAfterMessages.skipNextTerminalCheck === true
+        const activationBoundary =
+          terminalBoundary ||
+          Boolean(
+            activeGoalAfterMessages.compactionSourceAssistantMessageID &&
+            activeGoalAfterMessages.compactionSourceAssistantMessageID === latestAssistantID,
+          )
         activeGoalAfterMessages.skipNextTerminalCheck = false
 
         if (!activationBoundary && latestText && (!assistantRepeated || assistantChanged)) {
@@ -5555,6 +5717,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const sourceAssistantMessageID = latestAssistantID || "<no-assistant>"
         if (
           activeGoalAfterMessages.continuationClaim?.runId === runID &&
+          activeGoalAfterMessages.continuationClaim?.compactionEpoch === compactionEpoch &&
           activeGoalAfterMessages.continuationClaim?.sourceAssistantMessageID ===
             sourceAssistantMessageID
         ) {
@@ -5569,7 +5732,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         let completionUnverified = false
         let blockerUnstated = false
 
-        if (!activationBoundary && goalIsComplete(latestText)) {
+        if (!terminalBoundary && goalIsComplete(latestText)) {
           const evidence = extractCompletionEvidence(latestText)
           if (evidence) {
             await announceAudit(
@@ -5731,7 +5894,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             "completion-unverified",
             "Assistant output [goal:complete] without a [goal:evidence] line; completion rejected, continuing.",
           )
-        } else if (!activationBoundary && goalIsBlocked(latestText)) {
+        } else if (!terminalBoundary && goalIsBlocked(latestText)) {
           const reason = extractBlockedReason(latestText)
           if (reason) {
             await announceAudit(
@@ -5801,6 +5964,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               sessionID,
               goalID,
               runID,
+              compactionEpoch,
               messages,
             )
             if (!claimedGoal) return
@@ -6014,12 +6178,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           sessionID,
           goalID,
           runID,
+          compactionEpoch,
           messages,
           { refreshMessages: cooldownWaited },
         )
         if (!activeGoalBeforePrompt) return
         claimedSourceAssistantMessageID =
           activeGoalBeforePrompt.continuationClaim?.sourceAssistantMessageID || ""
+        claimedCompactionEpoch =
+          activeGoalBeforePrompt.continuationClaim?.compactionEpoch ?? -1
+        if (claimedCompactionEpoch !== activeGoalBeforePrompt.compactionEpoch) return
 
         const budgetWrapup = budgetWrapupNeeded(activeGoalBeforePrompt)
         if (budgetWrapup) {
@@ -6115,6 +6283,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
           if (
+            activeGoalAfterPrompt?.continuationClaim?.compactionEpoch ===
+              claimedCompactionEpoch &&
             activeGoalAfterPrompt?.continuationClaim?.sourceAssistantMessageID ===
             claimedSourceAssistantMessageID
           ) {
@@ -6133,6 +6303,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         } else {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           if (
+            activeGoalAfterPrompt?.continuationClaim?.compactionEpoch ===
+              claimedCompactionEpoch &&
             activeGoalAfterPrompt?.continuationClaim?.sourceAssistantMessageID ===
             claimedSourceAssistantMessageID
           ) {
@@ -6164,6 +6336,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (activeGoalAfterError) {
           if (
             claimedSourceAssistantMessageID &&
+            activeGoalAfterError.continuationClaim?.compactionEpoch ===
+              claimedCompactionEpoch &&
             activeGoalAfterError.continuationClaim?.sourceAssistantMessageID ===
               claimedSourceAssistantMessageID
           ) {

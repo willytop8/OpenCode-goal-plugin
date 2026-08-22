@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Harden the post-compaction goal continuation guard introduced in
+  [#58](https://github.com/willytop8/OpenCode-goal-plugin/pull/58). Building on
+  the epoch-guard groundwork contributed by
+  [@harryzhou2000](https://github.com/harryzhou2000), the stalled-compaction
+  circuit breaker no longer misfires on two conditions that OpenCode produces in
+  practice:
+  - A re-delivered `session.compacted` event no longer counts as a second
+    compaction. Real OpenCode compaction events carry only a `sessionID` (no
+    identity field), so identity-based deduplication could never fire against a
+    live host; a duplicate host delivery could therefore trip the two-strike
+    breaker and abort the session. Re-deliveries are now recognized by the
+    absence of any message activity since the previous compaction.
+  - A `[goal:complete]` or `[goal:blocked]` reported on the assistant turn that
+    a compaction retains as its continuation source is now honored instead of
+    being suppressed, so a finished goal is archived rather than driven for one
+    more redundant continuation.
+- Remove a productive-turn detection branch that inspected message parts on the
+  `message.updated` event. That event never carries parts (they arrive on
+  `message.part.updated`, which the plugin does not observe), so the check was
+  inert; the stalled-compaction breaker resets on assistant output-token
+  progress, which a tool-using turn also produces.
+
 ## 0.8.1 — 2026-08-07
 
 - Fix goal auto-continue stalling after session compaction: a continuation
