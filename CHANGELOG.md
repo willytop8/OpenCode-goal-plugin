@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.2 — 2026-08-21
+
 - Harden the post-compaction goal continuation guard introduced in
   [#58](https://github.com/willytop8/OpenCode-goal-plugin/pull/58). Building on
   the epoch-guard groundwork contributed by
