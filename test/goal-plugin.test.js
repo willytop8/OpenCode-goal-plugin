@@ -4507,30 +4507,171 @@ test("a productive tool turn resets the stalled-compaction circuit breaker", asy
     { parts: [] },
   )
 
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
+  // Canonical host shape: EventMessageUpdated is { type, properties: { info } }.
+  // Parts never ride on this event, so a tool-calling turn is recognized by the
+  // output tokens it emitted, not by inspecting parts on the envelope.
   await hooks.event({
-    event: { id: "compact-progress-1", type: "session.compacted", properties: { sessionID } },
-  })
-  const toolTurn = {
-    info: {
-      id: "msg-tool-progress",
-      role: "assistant",
-      sessionID,
-      tokens: { input: 1, output: 0, reasoning: 0 },
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-tool-progress",
+          role: "assistant",
+          sessionID,
+          tokens: { input: 1, output: 64, reasoning: 0 },
+        },
+      },
     },
-    parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }],
-  }
-  await hooks.event({
-    event: { type: "message.updated", properties: { message: toolTurn } },
   })
   assert.equal(currentGoal(sessionID).stalledCompactions, 0)
 
-  await hooks.event({
-    event: { id: "compact-progress-2", type: "session.compacted", properties: { sessionID } },
-  })
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
   const goal = currentGoal(sessionID)
   assert.equal(aborts.length, 0)
   assert.equal(goal.stalledCompactions, 1)
   assert.equal(goal.stopped, false)
+})
+
+test("a re-delivered identity-less compaction does not trip the circuit breaker", async () => {
+  const { aborts, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-redelivery"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  // A real EventSessionCompacted carries only sessionID, so a host re-delivery
+  // is indistinguishable by identity. Delivering the same event twice must not
+  // count as two compactions and must not pause or abort the session.
+  const compacted = { type: "session.compacted", properties: { sessionID } }
+  await hooks.event({ event: compacted })
+  assert.equal(currentGoal(sessionID).stalledCompactions, 1)
+
+  await hooks.event({ event: compacted })
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.stalledCompactions, 1)
+  assert.equal(goal.compactionEpoch, 1)
+  assert.equal(goal.stopped, false)
+  assert.equal(aborts.length, 0)
+})
+
+test("identity-less compactions separated by message activity still trip the breaker", async () => {
+  const { aborts, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-genuine"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
+  // Message traffic between the two compactions proves the second is genuine
+  // rather than a re-delivery. A compaction summary is activity but not
+  // productive work, so the breaker must still close.
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-compaction-summary",
+          role: "assistant",
+          sessionID,
+          summary: true,
+          mode: "compaction",
+          tokens: { input: 100, output: 100, reasoning: 0 },
+        },
+      },
+    },
+  })
+  assert.equal(currentGoal(sessionID).stalledCompactions, 1)
+
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.stalledCompactions, 2)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "stalled compaction")
+  assert.equal(aborts.length, 1)
+})
+
+test("tool parts decorating a message.updated event are not a productive-turn signal", async () => {
+  const { hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-compact-parts"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
+  // The host never puts parts on message.updated; they arrive on
+  // message.part.updated, which this plugin does not observe. Nothing may come
+  // to depend on parts here, because in production they are always absent.
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-no-output",
+          role: "assistant",
+          sessionID,
+          tokens: { input: 1, output: 0, reasoning: 0 },
+        },
+        parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }],
+      },
+    },
+  })
+  assert.equal(currentGoal(sessionID).stalledCompactions, 1)
+})
+
+test("a completion claim on the retained compaction source is honored", async () => {
+  const sessionID = "session-compact-complete"
+  let sessionMessages = []
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: sessionMessages }),
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  // An idle establishes a continuation claim sourced from msg-retained.
+  sessionMessages = [message("still working", undefined, "msg-retained", sessionID)]
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(
+    currentGoal(sessionID).continuationClaim.sourceAssistantMessageID,
+    "msg-retained",
+  )
+
+  // Compaction retains that same assistant as the epoch's source turn.
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
+  assert.equal(currentGoal(sessionID).compactionSourceAssistantMessageID, "msg-retained")
+
+  // That retained turn is the one carrying the completion claim, and it survived
+  // the compaction unprocessed. Suppressing it would discard a real result and
+  // spend another continuation re-deriving it.
+  sessionMessages = [
+    message(
+      "All done.\n[goal:evidence] ran npm test, 313 pass\n[goal:complete]",
+      undefined,
+      "msg-retained",
+      sessionID,
+    ),
+  ]
+  const callsBefore = calls.length
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+
+  assert.equal(currentGoal(sessionID), null)
+  assert.equal(calls.length, callsBefore)
 })
 
 test("compaction-summary assistants are neither progress nor continuation sources", async () => {
