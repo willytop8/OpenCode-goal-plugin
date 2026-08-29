@@ -437,6 +437,10 @@ A planning-only agent is never driven into execution by the goal loop. OpenCode'
 - Auto-continue stays suppressed on **every idle** while a restricted agent is active, so switching into `plan` mid-goal pauses the loop.
 - Continuations retain the agent that started the goal, so the loop cannot drift into a different agent.
 
+The active agent is read from the execution context the host reports, falling back to the session record. That fallback matters: OpenCode runs `command.execute.before` before any `chat.message`/`chat.params` for the turn, so the context is empty for the first command in a session — the exact case a freshly opened Plan-mode session hits.
+
+**What this does and does not prevent.** The restriction stops the *goal loop*: a held goal sends zero auto-continues, so no unattended work happens. It cannot stop a model from acting on the single routed command turn, because OpenCode's `command.execute.before` does not fully intercept command text (see [Limitations](#limitations)). A held goal's routed text explicitly tells the model not to begin work and is sent as a read-only control turn, but a non-compliant model may still act on that one turn. Verified against OpenCode 1.18.25: a goal set under Plan records `stopped: true`, `stopReason: plan agent active`, and `turnCount: 0`.
+
 Run `/goal resume` after switching back to an executing agent to start the work.
 
 | Option | Default | Controls |

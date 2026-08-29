@@ -10086,3 +10086,91 @@ test("a failing session-title update never breaks the goal loop", async () => {
   assert.equal(currentGoal("session-1").condition, "ship it", "the goal must still be created")
   assert.ok(output.parts.length > 0, "the command must still produce output")
 })
+
+test("a goal set in Plan mode is held even when no execution context exists yet", async () => {
+  // Reproduces the live-canary failure on OpenCode 1.18: the TUI runs
+  // `command.execute.before` before any chat.message/chat.params fires, so the
+  // cached execution context is empty for the first command in a session. The
+  // guard must fall back to the session record rather than failing open.
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+      abort: async () => ({}),
+      // The ONLY place the agent is visible — exactly the live situation.
+      get: async () => ({ data: { id: "session-1", agent: "plan", title: "t" } }),
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "make it print goodbye" },
+    output,
+  )
+
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, true, "must be held despite an empty execution context")
+  assert.equal(goal.stopReason, "plan agent active")
+  const text = output.parts.map((part) => part.text).join("\n")
+  assert.ok(!text.includes("Start working toward this goal now."), "must not instruct the model to start")
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+})
+
+test("session-agent lookup failure fails open rather than blocking every goal", async () => {
+  // A host that does not expose the agent must not have every goal held.
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+      get: async () => {
+        throw new Error("host does not support session.get")
+      },
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("session-1").stopped, false, "must fail open when the agent is unknowable")
+})
+
+test("a cached execution context is preferred over refetching the session", async () => {
+  let getCalls = 0
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+      get: async () => {
+        getCalls += 1
+        return { data: { id: "session-1", agent: "plan" } }
+      },
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  // Host reports "build" through the normal signal path first.
+  await hooks["chat.message"](
+    { sessionID: "session-1", agent: "build" },
+    { message: { id: "m1", role: "user", sessionID: "session-1", agent: "build" }, parts: [textPart("go")] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("session-1").stopped, false, "the cached build context must win")
+  assert.equal(getCalls, 0, "a known agent must not cost a session fetch")
+})
