@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Document OpenCode 2 status explicitly: unsupported and untested, with the existing dual-shape session adapter noted and a concrete checklist of what a supported claim would require. Records that this plugin is server-only, so its configuration lives entirely in `opencode.json` on any OpenCode line.
+- Add an opt-in session-title status indicator (`sessionTitleStatus`), mirroring live goal status — state icon, objective, turns, elapsed, and tokens — into the OpenCode session title so unattended runs show a continuous heartbeat. The original title is captured before the first overwrite and restored by `/goal clear`; unchanged renders skip the API call, and update failures are logged at debug level without interrupting the goal loop. The indicator refreshes on commands and on idle/compaction/interruption events but never on the `message.updated` events that stream during a turn, keeping API round-trips out of the response path. Status lines written by a previous process are recognized as the plugin's own, so a restart followed by `/goal clear` cannot promote stale goal status to the session's permanent title.
+
 - Hold new goals created while a planning-only agent is active instead of starting them. Previously the idle guard caught a Plan-agent session only on the *next* idle, so `/goal <objective>` in Plan mode created a live goal and the routed command text still told the model to start working. Such a goal is now recorded with stop reason `plan agent active`, keeps its budget, and is announced through a read-only control turn that explicitly tells the model not to begin work.
 - Add `restrictedAgents` (default `["plan"]`) and `allowGoalExecutionFromPlan` (default `false`) so the planning-only restriction can name other agents or be released entirely. The default-on behavior is pinned by the mutation contract.
 

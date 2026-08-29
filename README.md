@@ -31,6 +31,7 @@ This project is independently implemented for OpenCode. Product names used elsew
 | Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows |
 | Package entrypoint | Installed-tarball contracts verify both export paths, consumer TypeScript resolution, hooks, and all 11 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
+| OpenCode 2 | Not supported and not yet tested; the peer/engine pin is `>=1.17.15 <2`. See the [OpenCode 2 section](docs/compatibility.md#opencode-2) |
 
 See the [compatibility policy](docs/compatibility.md) for the supported public
 surface and versioning expectations.
@@ -400,6 +401,32 @@ await GoalPlugin(
 ```
 
 `timeoutMs` caps how long the built-in child-session auditor waits for a verdict. `failurePolicy` defaults to `reject`: an unavailable API, missing child-session ID, provider error, or timeout rejects the audit and pauses the goal for review. Set it to `approve` only as an explicit compatibility escape hatch; an actual negative or malformed verifier verdict still rejects. `auditorOptions` is ignored when a custom `auditor` function is supplied.
+
+## Status indicator
+
+Unattended runs are easier to trust when you can see the goal is still alive. Set `sessionTitleStatus: true` and the plugin mirrors live goal status into the OpenCode session title, which the TUI renders persistently:
+
+```
+▶ ship the release · 3/10 · 2m · 45k/200k
+```
+
+Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+
+```json
+{
+  "plugin": [
+    ["opencode-goal-plugin", { "sessionTitleStatus": true }]
+  ]
+}
+```
+
+The option is **off by default** because it overwrites a user-visible field. When enabled, the session's original title is captured before the first overwrite and restored by `/goal clear`. A render identical to the last one skips the API call, so `/goal status` and other read-only commands cost nothing. Title updates are cosmetic: a failure is logged at debug level and never interrupts the goal loop.
+
+The indicator refreshes on goal commands and on idle, compaction, and interruption events — **not** on the `message.updated` events that stream during an assistant turn. Streaming refreshes would put an API round-trip in the response path for a cosmetic update, and idle is the cadence a human actually reads the indicator at.
+
+The captured original title lives in memory only, so a hard process kill leaves the last status line on the session. The plugin recognizes its own status lines and will not mistake one for your title, so `/goal clear` after a restart leaves the host's title alone rather than restoring stale goal status — but it cannot recover the title the session had before the goal started. Rename the session if you want it back.
+
+This needs no TUI plugin entrypoint, no `@opentui` dependencies, and no build step.
 
 ## Plan-mode safety
 

@@ -81,6 +81,56 @@ comes from the rewritten turn's escaped reporting frame, fail-closed tool
 blocking, and parent-correlated lifecycle suppression. The system transform
 remains registered as additional protection for hosts that support it.
 
+## OpenCode 2
+
+**Status: not supported, and not yet tested.**
+
+The package declares `engines.opencode` and the `@opencode-ai/plugin` peer as
+`>=1.17.15 <2`. That bound is deliberate: no claim in this repository is made
+without a verified run behind it, and the project has not yet exercised the
+plugin against an OpenCode 2 build. Treat OpenCode 2 as unverified rather than
+as known-broken.
+
+### What already exists in this direction
+
+- `createOpenCodeSessionApi` speaks both the legacy generated-client shape
+  (`{ path, body, query }`) and the flattened shape (`{ sessionID, ... }`),
+  selected per operation and remembered after the first success. The
+  `sdkShape: "flat"` option pins the flattened shape for embedded clients.
+- Only read-only operations are ever replayed against the alternate shape, so a
+  shape probe can never duplicate a mutating call. This invariant is pinned by
+  the mutation contract.
+
+### What a supported v2 claim would require
+
+Before the pin is widened, all of the following need to pass against a real
+OpenCode 2 build, not a mock:
+
+1. Plugin load and hook registration through the v2 plugin entrypoint.
+2. `command.execute.before`, `event`, `experimental.chat.system.transform`,
+   `experimental.session.compacting`, and `experimental.compaction.autocontinue`
+   firing with the shapes the plugin expects.
+3. The execution-context signals (`chat.message`, `chat.params`,
+   `session.updated`) still reporting the active agent, which the planning-only
+   restriction depends on.
+4. Session-API calls (`messages`, `promptAsync`, `create`, `get`, `update`,
+   `abort`) under whichever argument shape v2 ships.
+5. Goal-specific compaction context and recovery of running child sessions after
+   a plugin restart, which are the areas most likely to differ.
+
+### Configuration
+
+This plugin is **server-only**: `package.json` exports the root and
+`opencode-goal-plugin/server`, and there is no TUI plugin entrypoint. Its
+configuration therefore lives entirely in `opencode.json` (the `plugin` and
+`command` keys) on any OpenCode line.
+
+Plugins that *do* ship a TUI component are registered in a second file whose
+location differs between OpenCode lines, and those formats must not be mixed.
+That distinction does not apply here — including for the
+[status indicator](../README.md#status-indicator), which reaches the TUI through
+the session title rather than through a TUI plugin.
+
 ## Versioning
 
 Semantic-versioning intent is:

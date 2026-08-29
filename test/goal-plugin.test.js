@@ -37,6 +37,11 @@ const {
   isPluginCommandMessage,
   isPluginContinuationMessage,
   isPlanAgent,
+  buildSessionTitle,
+  formatCompactDuration,
+  formatCompactTokens,
+  goalStatusIcon,
+  looksLikePluginSessionTitle,
   isRestrictedAgent,
   normalizeRestrictedAgents,
   isPluginGeneratedMessage,
@@ -9862,4 +9867,222 @@ test("restrictedAgents: [] releases the built-in Plan restriction", async () => 
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
   })
   assert.equal(calls.length, 1, "an empty restricted list is a deliberate opt-out")
+})
+
+// ---------------------------------------------------------------------------
+// Session-title status indicator
+// ---------------------------------------------------------------------------
+
+async function createTitleHooks(overrides = {}) {
+  const updates = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [message("still working")] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+      get: overrides.get || (async () => ({ data: { title: "my original title" } })),
+      update:
+        overrides.update ||
+        (async (input) => {
+          updates.push(input)
+          return {}
+        }),
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, sessionTitleStatus: true, ...(overrides.options || {}) },
+  )
+  return { hooks, updates }
+}
+
+test("formatCompactDuration and formatCompactTokens abbreviate for a narrow title", () => {
+  assert.equal(formatCompactDuration(0), "0s")
+  assert.equal(formatCompactDuration(45_000), "45s")
+  assert.equal(formatCompactDuration(60_000), "1m")
+  // Elapsed time floors rather than rounds: 90s is "1m so far", not "2m".
+  assert.equal(formatCompactDuration(90_000), "1m")
+  assert.equal(formatCompactDuration(60 * 60_000), "1h")
+  assert.equal(formatCompactDuration(95 * 60_000), "1h35m")
+  // Clock skew must not render as garbage.
+  assert.equal(formatCompactDuration(-5000), "0s")
+
+  assert.equal(formatCompactTokens(0), "0")
+  assert.equal(formatCompactTokens(999), "999")
+  assert.equal(formatCompactTokens(1500), "1.5k")
+  assert.equal(formatCompactTokens(45_000), "45k")
+  assert.equal(formatCompactTokens(1_500_000), "1.5m")
+})
+
+test("goalStatusIcon distinguishes running, paused, and blocked", () => {
+  assert.equal(goalStatusIcon({ stopped: false, blockedReason: "" }), "▶")
+  assert.equal(goalStatusIcon({ stopped: true, blockedReason: "" }), "⏸")
+  // Blocked outranks paused: it needs the user, not just a resume.
+  assert.equal(goalStatusIcon({ stopped: true, blockedReason: "needs a token" }), "⛔")
+})
+
+test("buildSessionTitle renders a compact one-line status", () => {
+  const now = Date.now()
+  const goal = {
+    condition: "ship the release",
+    stopped: false,
+    blockedReason: "",
+    turnCount: 3,
+    totalTokens: 45_000,
+    startedAt: now - 120_000,
+    pausedAt: 0,
+    options: { maxTurns: 10, maxTokens: 200_000 },
+  }
+  assert.equal(buildSessionTitle(goal, now), "▶ ship the release · 3/10 · 2m · 45k/200k")
+
+  // A paused goal freezes its elapsed clock instead of running on.
+  assert.equal(
+    buildSessionTitle({ ...goal, stopped: true, pausedAt: now - 60_000 }, now),
+    "⏸ ship the release · 3/10 · 1m · 45k/200k",
+  )
+
+  const title = buildSessionTitle({ ...goal, condition: "x".repeat(200) }, now)
+  assert.ok(title.includes("…"), "a long objective must be truncated")
+  assert.ok(title.length < 100, `title should stay compact, got ${title.length}`)
+})
+
+test("looksLikePluginSessionTitle recognizes titles this plugin wrote", () => {
+  assert.equal(looksLikePluginSessionTitle("▶ ship it · 3/10 · 2m · 45k/200k"), true)
+  assert.equal(looksLikePluginSessionTitle("⏸ ship it · 3/10 · 2m · 45k/200k"), true)
+  assert.equal(looksLikePluginSessionTitle("⛔ ship it · 3/10 · 2m · 45k/200k"), true)
+  assert.equal(looksLikePluginSessionTitle("my own session title"), false)
+  assert.equal(looksLikePluginSessionTitle(""), false)
+  assert.equal(looksLikePluginSessionTitle(undefined), false)
+  // A user title merely mentioning an icon, not in the leading marker form.
+  assert.equal(looksLikePluginSessionTitle("play ▶ button work"), false)
+})
+
+test("session-title status is off by default and never touches the title", async () => {
+  // The client here DOES expose session.update, so a call would be recorded;
+  // the assertion is meaningful only because the option is left unset.
+  const { hooks, updates } = await createTitleHooks({
+    options: { sessionTitleStatus: undefined },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "pause" },
+    { parts: [] },
+  )
+  assert.equal(updates.length, 0, "the default must not rewrite the session title")
+})
+
+test("sessionTitleStatus mirrors goal state into the title and restores it on clear", async () => {
+  const { hooks, updates } = await createTitleHooks()
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.ok(updates.length >= 1, "setting a goal must publish a title")
+  assert.match(updates[0].body.title, /^▶ ship it · 0\/\d+ · /)
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "pause" },
+    { parts: [] },
+  )
+  assert.match(updates.at(-1).body.title, /^⏸ ship it/, "pausing re-renders the indicator")
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "clear" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.title, "my original title", "clear must restore the original")
+})
+
+test("an unchanged session title is not rewritten", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const afterSet = updates.length
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "status" },
+    { parts: [] },
+  )
+  assert.equal(updates.length, afterSet, "an unchanged render must skip the API call")
+})
+
+test("streaming message.updated events do not trigger session-title writes", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const afterSet = updates.length
+
+  for (let i = 1; i <= 25; i += 1) {
+    await hooks.event({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: `msg-stream-${i}`,
+            role: "assistant",
+            sessionID: "session-1",
+            tokens: { input: i * 1000, output: i * 100, reasoning: 0 },
+          },
+        },
+      },
+    })
+  }
+
+  assert.equal(
+    updates.length,
+    afterSet,
+    `streaming must not write titles, got ${updates.length - afterSet} extra writes`,
+  )
+})
+
+test("a status title left by a killed process is not restored as the user's title", async () => {
+  // After a hard kill the session still carries the plugin's own status line.
+  // Capturing that as the "original" would make /goal clear promote a stale
+  // status string to the permanent session title.
+  const stale = "▶ previous goal · 7/10 · 5m · 90k/200k"
+  const { hooks, updates } = await createTitleHooks({
+    get: async () => ({ data: { title: stale } }),
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "clear" },
+    { parts: [] },
+  )
+
+  assert.ok(
+    !updates.some((u) => u.body.title === stale),
+    `clear must never write the stale status line back, got ${JSON.stringify(updates.map((u) => u.body.title))}`,
+  )
+  assert.ok(
+    updates.every((u) => u.body.title.startsWith("▶ ship it") || u.body.title.startsWith("⏸ ship it")),
+    `only the live goal's own status should be written, got ${JSON.stringify(updates.map((u) => u.body.title))}`,
+  )
+})
+
+test("a failing session-title update never breaks the goal loop", async () => {
+  const { hooks } = await createTitleHooks({
+    update: async () => {
+      throw new Error("host refused the title update")
+    },
+  })
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    output,
+  )
+
+  assert.equal(currentGoal("session-1").condition, "ship it", "the goal must still be created")
+  assert.ok(output.parts.length > 0, "the command must still produce output")
 })
