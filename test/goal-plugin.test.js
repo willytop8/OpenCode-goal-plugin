@@ -36,6 +36,9 @@ const {
   isIdleEvent,
   isPluginCommandMessage,
   isPluginContinuationMessage,
+  isPlanAgent,
+  isRestrictedAgent,
+  normalizeRestrictedAgents,
   isPluginGeneratedMessage,
   ledgerPathFor,
   legacyStateFilePaths,
@@ -9722,4 +9725,141 @@ test("null-assistant idle does not accumulate noProgressTurns", async () => {
   // Must have been reset to 0 rather than incremented to 2.
   assert.equal(currentGoal("null-asst-noprog").noProgressTurns, 0, "noProgressTurns must reset on null-assistant idle")
   assert.equal(currentGoal("null-asst-noprog").stopped, false, "must not be stopped")
+})
+
+// ---------------------------------------------------------------------------
+// Planning-only agent hardening
+// ---------------------------------------------------------------------------
+
+function planContextEvent(sessionID = "session-1", agent = "Plan") {
+  return {
+    event: {
+      type: "session.updated",
+      properties: {
+        sessionID,
+        info: { sessionID, agent, model: { providerID: "openai", id: "gpt-5" } },
+      },
+    },
+  }
+}
+
+test("normalizeRestrictedAgents defaults, normalizes, and honors explicit opt-out", () => {
+  assert.deepEqual(normalizeRestrictedAgents(undefined), ["plan"])
+  assert.deepEqual(normalizeRestrictedAgents(null), ["plan"])
+  // A non-array is not trusted; fall back to the safe default.
+  assert.deepEqual(normalizeRestrictedAgents("plan"), ["plan"])
+  // An explicit empty array is a deliberate opt-out.
+  assert.deepEqual(normalizeRestrictedAgents([]), [])
+  assert.deepEqual(normalizeRestrictedAgents([" Plan ", "REVIEW", "plan", "", 7]), ["plan", "review"])
+})
+
+test("isRestrictedAgent matches case-insensitively; isPlanAgent keeps built-in behavior", () => {
+  assert.equal(isRestrictedAgent("Plan", ["plan"]), true)
+  assert.equal(isRestrictedAgent("build", ["plan"]), false)
+  assert.equal(isRestrictedAgent("review", ["plan", "review"]), true)
+  assert.equal(isRestrictedAgent("", ["plan"]), false)
+  assert.equal(isRestrictedAgent(undefined, ["plan"]), false)
+  assert.equal(isPlanAgent("Plan"), true)
+  assert.equal(isPlanAgent("review"), false)
+})
+
+test("a goal set while Plan is active is recorded but held, and is not told to start work", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks.event(planContextEvent())
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "refactor everything" },
+    output,
+  )
+
+  const goal = currentGoal("session-1")
+  assert.equal(goal.condition, "refactor everything", "the goal must still be recorded")
+  assert.equal(goal.stopped, true, "a goal created under Plan must not be live")
+  assert.equal(goal.stopReason, "plan agent active")
+
+  const text = output.parts.map((part) => part.text).join("\n")
+  assert.ok(!text.includes("Start working toward this goal now."), "must not instruct the model to start")
+  assert.match(text, /planning-only/)
+  assert.match(text, /Do not begin work on it now/)
+
+  // And the following idle must not continue it.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+})
+
+test("a goal set under a normal agent still starts work as before", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    output,
+  )
+
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, false)
+  const text = output.parts.map((part) => part.text).join("\n")
+  assert.match(text, /Start working toward this goal now\./)
+  assert.ok(!text.includes("planning-only"), "no plan-hold language on a normal goal")
+})
+
+test("allowGoalExecutionFromPlan opts out of the planning-only restriction", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, allowGoalExecutionFromPlan: true },
+  })
+  await hooks.event(planContextEvent())
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    output,
+  )
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, false, "the opt-out must let a Plan-mode goal run")
+  assert.match(output.parts.map((part) => part.text).join("\n"), /Start working toward this goal now\./)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1, "auto-continue must fire when the guard is opted out")
+})
+
+test("restrictedAgents can name agents other than plan", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, restrictedAgents: ["review"] },
+  })
+  await hooks.event(planContextEvent("session-1", "review"))
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, true, "a configured restricted agent must hold the goal")
+  assert.equal(goal.stopReason, "review agent active")
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+})
+
+test("restrictedAgents: [] releases the built-in Plan restriction", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, restrictedAgents: [] },
+  })
+  await hooks.event(planContextEvent())
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1, "an empty restricted list is a deliberate opt-out")
 })
