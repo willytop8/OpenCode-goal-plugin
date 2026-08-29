@@ -86,6 +86,13 @@ const mutants = [
     test: "test/opencode-session-api.test.js",
   },
   {
+    name: "planning-only agents hold new goals unless explicitly opted out",
+    file: "src/goal-plugin.js",
+    from: "const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true",
+    to: "const allowGoalExecutionFromPlan = true",
+    test: "test/goal-plugin.test.js",
+  },
+  {
     name: "completion evidence must be adjacent",
     file: "src/goal-plugin.js",
     from: "const previous = markerIndex - 1",

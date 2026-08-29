@@ -311,6 +311,22 @@ export interface GoalPluginOptions {
   /** Register collision-safe native `goal` and `goal-verify` agents through OpenCode's config hook. */
   registerAgents?: boolean
 
+  /**
+   * Agent names treated as planning-only. A goal created while one of these
+   * agents is active is recorded but held paused instead of starting, and
+   * auto-continue stays suppressed while one is active. Matching is
+   * case-insensitive. Pass `[]` to release the restriction entirely.
+   * @default ["plan"]
+   */
+  restrictedAgents?: string[]
+
+  /**
+   * Opt out of the planning-only restriction, allowing goals to be created and
+   * auto-continued while a {@link restrictedAgents} agent is active.
+   * @default false
+   */
+  allowGoalExecutionFromPlan?: boolean
+
   /** Name of the native primary goal agent. @default "goal" */
   goalAgentName?: string
 

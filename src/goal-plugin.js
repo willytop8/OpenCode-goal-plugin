@@ -396,8 +396,37 @@ function continuationContextInput(goal) {
   return context ? { ...context } : {}
 }
 
+// Planning-only agents must never be driven into execution by the goal loop.
+// `plan` is OpenCode's built-in read-only agent; `restrictedAgents` lets a
+// deployment name others (for example a review-only agent).
+const DEFAULT_RESTRICTED_AGENTS = ["plan"]
+
+function normalizeRestrictedAgents(value) {
+  // Anything that is not an array (including undefined) keeps the safe default;
+  // an explicit empty array is a deliberate opt-out.
+  if (!Array.isArray(value)) return [...DEFAULT_RESTRICTED_AGENTS]
+  const names = value
+    .map((entry) => (typeof entry === "string" ? entry.trim().toLowerCase() : ""))
+    .filter(Boolean)
+  return [...new Set(names)]
+}
+
+function isRestrictedAgent(agent, restrictedAgents = DEFAULT_RESTRICTED_AGENTS) {
+  if (typeof agent !== "string") return false
+  const name = agent.trim().toLowerCase()
+  if (!name) return false
+  return restrictedAgents.includes(name)
+}
+
 function isPlanAgent(agent) {
-  return typeof agent === "string" && agent.trim().toLowerCase() === "plan"
+  return isRestrictedAgent(agent, DEFAULT_RESTRICTED_AGENTS)
+}
+
+// Stop reason for a goal held because a planning-only agent is active. The
+// built-in `plan` case keeps its established wording so persisted state and
+// existing consumers stay stable.
+function restrictedAgentStopReason(agent) {
+  return isPlanAgent(agent) ? "plan agent active" : `${String(agent).trim().toLowerCase()} agent active`
 }
 
 function terminalEvent(event) {
@@ -3956,6 +3985,33 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     cwd: pluginOptions.cwd || directory,
   })
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
+  const restrictedAgents = normalizeRestrictedAgents(pluginOptions.restrictedAgents)
+  // Opt-out for deployments that deliberately drive execution from a planning
+  // agent. Defaults to false: unattended work must not escape Plan mode.
+  const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
+
+  // The restricted agent currently driving this session, or "" when execution
+  // is permitted. Reads the execution context the host reports through
+  // `chat.message`, `chat.params`, and `session.updated`.
+  const restrictedAgentFor = (sessionID) => {
+    if (allowGoalExecutionFromPlan) return ""
+    const agent = currentRuntime().sessionExecutionContexts.get(sessionID)?.agent
+    return isRestrictedAgent(agent, restrictedAgents) ? String(agent).trim() : ""
+  }
+
+  // Record a newly created goal as held rather than active. Mirrors the idle
+  // guard's stop reason so `/goal status` reads the same either way.
+  const holdGoalForRestrictedAgent = (goal, agent) => {
+    const label = isPlanAgent(agent) ? "Plan" : agent
+    goal.stopped = true
+    goal.stopReason = restrictedAgentStopReason(agent)
+    goal.lastStatus =
+      `Goal recorded but held: the ${label} agent is planning-only. ` +
+      `Switch to an executing agent, then run /${commandName} resume to start work.`
+    pauseGoalClock(goal)
+    pushHistory(goal, "paused", `Created while the ${label} agent was active; held until an executing agent resumes it.`)
+    return label
+  }
 
   // Each session owns an independent snapshot, ledger, write chain, and
   // lifetime lease. A project can therefore host any number of unrelated goal
@@ -4481,12 +4537,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     if (currentRuntime().sessionStatuses.get(sessionID) !== "idle") return null
 
-    const currentContext = currentRuntime().sessionExecutionContexts.get(sessionID)
-    if (isPlanAgent(currentContext?.agent)) {
+    const activeRestrictedAgent = restrictedAgentFor(sessionID)
+    if (activeRestrictedAgent) {
+      const label = isPlanAgent(activeRestrictedAgent) ? "Plan" : activeRestrictedAgent
       await pauseActiveGoal(sessionID, {
-        stopReason: "plan agent active",
-        status: "Auto-continue paused because the active agent switched to Plan.",
-        history: "Paused before auto-continue because the active session agent switched to Plan.",
+        stopReason: restrictedAgentStopReason(activeRestrictedAgent),
+        status: `Auto-continue paused because the active agent switched to ${label}.`,
+        history: `Paused before auto-continue because the active session agent switched to ${label}.`,
       })
       return null
     }
@@ -5240,6 +5297,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         `Goal created with limits: ${goal.options.maxTurns} auto-continues, ${Math.round(goal.options.maxDurationMs / 1000)}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
       )
 
+      // A goal set while a planning-only agent is active is recorded but held,
+      // so the objective and its budget survive the mode switch. Without this
+      // the goal is created live and the routed command text tells the model to
+      // start working; the idle guard only catches it on the *next* idle.
+      const creationRestrictedAgent = restrictedAgentFor(sessionID)
+      if (creationRestrictedAgent) {
+        holdGoalForRestrictedAgent(goal, creationRestrictedAgent)
+      }
+
       // Replace the focused goal (cleanupGoal discards it); backgrounded goals
       // for this session are preserved. Use `/goal add` to keep the current
       // goal and add another. Clear any ordered-sequence flag so the new
@@ -5251,11 +5317,24 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       registerSessionGoal(goal)
       focusGoal(sessionID, goal)
       await persist(sessionID)
-      announceLifecycle(sessionID, replacedGoal ? "Goal replaced and active." : "Goal active.", {
-        goal,
-        transition: replacedGoal ? "replaced-active" : "active",
-        expectedState: "active",
-      })
+      const heldLabel = creationRestrictedAgent
+        ? isPlanAgent(creationRestrictedAgent)
+          ? "Plan"
+          : creationRestrictedAgent
+        : ""
+      announceLifecycle(
+        sessionID,
+        heldLabel
+          ? `Goal recorded but held while ${heldLabel} is active.`
+          : replacedGoal
+            ? "Goal replaced and active."
+            : "Goal active.",
+        {
+          goal,
+          transition: heldLabel ? "paused" : replacedGoal ? "replaced-active" : "active",
+          expectedState: heldLabel ? "paused" : "active",
+        },
+      )
       replaceCommandOutputText(
         output,
         [
@@ -5266,14 +5345,25 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 "",
               ]
             : []),
-          `New active goal: ${goal.condition}`,
+          heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
           goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
           goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
           goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
           "",
-          "Start working toward this goal now.",
-          "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
-          "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
+          // A held goal must not be told to start working. Command text reaches
+          // the model as a normal turn on current OpenCode builds, so this line
+          // would be the escape the plan guard exists to prevent.
+          ...(heldLabel
+            ? [
+                `The ${heldLabel} agent is planning-only, so this goal is not running.`,
+                "Do not begin work on it now. Continue planning only.",
+                `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
+              ]
+            : [
+                "Start working toward this goal now.",
+                "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
+                "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
+              ]),
           `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
           "",
           `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
@@ -5282,7 +5372,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         ]
           .filter((line) => line !== null)
           .join("\n"),
-        { preserveFiles: true, startsWork: true },
+        // A held goal is a control turn, not a work turn: `startsWork: false`
+        // routes it through the read-only command framing.
+        { preserveFiles: true, startsWork: !heldLabel },
       )
     },
 
@@ -6607,6 +6699,9 @@ export const testInternals = {
   isIdleEvent,
   isPluginCommandMessage,
   isPluginContinuationMessage,
+  isPlanAgent,
+  isRestrictedAgent,
+  normalizeRestrictedAgents,
   isPluginGeneratedMessage,
   legacyStateFilePaths,
   messageHasToolCall,

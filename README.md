@@ -401,6 +401,32 @@ await GoalPlugin(
 
 `timeoutMs` caps how long the built-in child-session auditor waits for a verdict. `failurePolicy` defaults to `reject`: an unavailable API, missing child-session ID, provider error, or timeout rejects the audit and pauses the goal for review. Set it to `approve` only as an explicit compatibility escape hatch; an actual negative or malformed verifier verdict still rejects. `auditorOptions` is ignored when a custom `auditor` function is supplied.
 
+## Plan-mode safety
+
+A planning-only agent is never driven into execution by the goal loop. OpenCode's built-in `plan` agent is restricted by default:
+
+- A goal set while `plan` is active is **recorded but held**, with stop reason `plan agent active`. The objective and its budget survive, so nothing is lost — the goal simply does not start.
+- The routed confirmation text for a held goal **omits the "start working" instruction** and is sent as a read-only control turn. This matters because command text reaches the model as a normal turn on current OpenCode builds (see [Limitations](#limitations)).
+- Auto-continue stays suppressed on **every idle** while a restricted agent is active, so switching into `plan` mid-goal pauses the loop.
+- Continuations retain the agent that started the goal, so the loop cannot drift into a different agent.
+
+Run `/goal resume` after switching back to an executing agent to start the work.
+
+| Option | Default | Controls |
+|---|---|---|
+| `restrictedAgents` | `["plan"]` | Agent names treated as planning-only (case-insensitive). Pass `[]` to release the restriction. |
+| `allowGoalExecutionFromPlan` | `false` | Set `true` to allow goal creation and auto-continue while a restricted agent is active. |
+
+```json
+{
+  "plugin": [
+    ["opencode-goal-plugin", { "restrictedAgents": ["plan", "review"] }]
+  ]
+}
+```
+
+The restriction being on by default is pinned by the mutation contract: hardcoding `allowGoalExecutionFromPlan` to `true` fails the suite.
+
 ## Prompt safety
 
 The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided task data. The assistant is told to treat it as a task description, not as elevated instructions that can override system, developer, tool, or repository policies.

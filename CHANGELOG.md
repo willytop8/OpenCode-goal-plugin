@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hold new goals created while a planning-only agent is active instead of starting them. Previously the idle guard caught a Plan-agent session only on the *next* idle, so `/goal <objective>` in Plan mode created a live goal and the routed command text still told the model to start working. Such a goal is now recorded with stop reason `plan agent active`, keeps its budget, and is announced through a read-only control turn that explicitly tells the model not to begin work.
+- Add `restrictedAgents` (default `["plan"]`) and `allowGoalExecutionFromPlan` (default `false`) so the planning-only restriction can name other agents or be released entirely. The default-on behavior is pinned by the mutation contract.
+
 ## 0.8.2 — 2026-08-21
 
 - Harden the post-compaction goal continuation guard introduced in
