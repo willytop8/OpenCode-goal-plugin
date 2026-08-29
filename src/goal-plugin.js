@@ -4127,10 +4127,38 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   // The restricted agent currently driving this session, or "" when execution
   // is permitted. Reads the execution context the host reports through
   // `chat.message`, `chat.params`, and `session.updated`.
-  const restrictedAgentFor = (sessionID) => {
+  // Resolve the agent driving a session, preferring the execution context the
+  // host reports through `chat.message` / `chat.params` / `session.updated`.
+  //
+  // That context is empty for the first command in a session: OpenCode runs
+  // `command.execute.before` before any of those signals fire. Relying on it
+  // alone made the restriction fail open exactly where it matters most — a
+  // freshly opened session in Plan mode — so fall back to the session record,
+  // which carries the selected agent from the moment the user picks it.
+  const resolveSessionAgent = async (sessionID) => {
+    if (!sessionID) return ""
+    const cached = currentRuntime().sessionExecutionContexts.get(sessionID)?.agent
+    if (typeof cached === "string" && cached.trim()) return cached.trim()
+    try {
+      const session = await sessionApi.get(sessionID)
+      const agent = typeof session?.agent === "string" ? session.agent.trim() : ""
+      // Remember it so later hooks in the same turn do not re-fetch. `replace`
+      // is intentionally false: this must not clobber a richer context (model,
+      // variant) that a host signal may already have recorded.
+      if (agent) rememberSessionExecutionContext(sessionID, { agent })
+      return agent
+    } catch (error) {
+      // Hosts that do not expose the agent fail open, matching the behavior
+      // before the restriction existed.
+      await logPluginDebug(client, "Failed to resolve the session agent", error)
+      return ""
+    }
+  }
+
+  const restrictedAgentFor = async (sessionID) => {
     if (allowGoalExecutionFromPlan) return ""
-    const agent = currentRuntime().sessionExecutionContexts.get(sessionID)?.agent
-    return isRestrictedAgent(agent, restrictedAgents) ? String(agent).trim() : ""
+    const agent = await resolveSessionAgent(sessionID)
+    return isRestrictedAgent(agent, restrictedAgents) ? agent : ""
   }
 
   // Record a newly created goal as held rather than active. Mirrors the idle
@@ -4671,7 +4699,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     if (currentRuntime().sessionStatuses.get(sessionID) !== "idle") return null
 
-    const activeRestrictedAgent = restrictedAgentFor(sessionID)
+    const activeRestrictedAgent = await restrictedAgentFor(sessionID)
     if (activeRestrictedAgent) {
       const label = isPlanAgent(activeRestrictedAgent) ? "Plan" : activeRestrictedAgent
       await pauseActiveGoal(sessionID, {
@@ -5437,7 +5465,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // so the objective and its budget survive the mode switch. Without this
       // the goal is created live and the routed command text tells the model to
       // start working; the idle guard only catches it on the *next* idle.
-      const creationRestrictedAgent = restrictedAgentFor(sessionID)
+      const creationRestrictedAgent = await restrictedAgentFor(sessionID)
       if (creationRestrictedAgent) {
         holdGoalForRestrictedAgent(goal, creationRestrictedAgent)
       }
