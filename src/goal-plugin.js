@@ -111,6 +111,11 @@ function createRuntimeState() {
     seenIdleEventIDs: new Set(),
     sessionStatuses: new Map(),
     sessionExecutionContexts: new Map(),
+    // Session-title indicator: the user's own title, captured before the plugin
+    // first overwrites it, and the last title the plugin wrote (so an unchanged
+    // render skips the API call).
+    sessionTitles: new Map(),
+    appliedTitles: new Map(),
     pendingCommandTurns: new Map(),
     activeCommandTurns: new Map(),
     commandOutputs: new WeakMap(),
@@ -420,6 +425,64 @@ function isRestrictedAgent(agent, restrictedAgents = DEFAULT_RESTRICTED_AGENTS) 
 
 function isPlanAgent(agent) {
   return isRestrictedAgent(agent, DEFAULT_RESTRICTED_AGENTS)
+}
+
+// Session-title status indicator. OpenCode renders the session title
+// persistently, so mirroring goal progress into it gives unattended runs a
+// continuous heartbeat without a TUI plugin entrypoint. Opt-in, because it
+// overwrites a user-visible field.
+const SESSION_TITLE_OBJECTIVE_LIMIT = 48
+const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔"]
+
+// The title sits in a narrow column, so every field is abbreviated hard.
+function formatCompactDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  if (totalMinutes < 60) return `${totalMinutes}m`
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return minutes ? `${hours}h${minutes}m` : `${hours}h`
+}
+
+function formatCompactTokens(tokens) {
+  const value = toNonNegativeInteger(tokens)
+  if (value < 1000) return String(value)
+  if (value < 1_000_000) {
+    const thousands = value / 1000
+    return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`
+  }
+  const millions = value / 1_000_000
+  return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}m`
+}
+
+// Blocked and paused are distinct to a watching human: one needs input, the
+// other just needs a resume.
+function goalStatusIcon(goal) {
+  if (goal.blockedReason) return "⛔"
+  if (goal.stopped) return "⏸"
+  return "▶"
+}
+
+// One-line goal status for the session title, e.g.
+// "▶ ship the release · 3/10 · 2m · 45k/200k".
+function buildSessionTitle(goal, now = Date.now()) {
+  const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt)
+  return [
+    `${goalStatusIcon(goal)} ${summarizeText(goal.condition, SESSION_TITLE_OBJECTIVE_LIMIT)}`,
+    `${goal.turnCount}/${goal.options.maxTurns}`,
+    formatCompactDuration(elapsedMs),
+    `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`,
+  ].join(" · ")
+}
+
+// Recognize a title this plugin wrote. The captured "original" is what
+// `/goal clear` restores, so capturing one of our own status lines would make
+// clear promote a stale status string to the permanent session title. That is
+// exactly the state a hard process kill leaves behind.
+function looksLikePluginSessionTitle(title) {
+  const text = typeof title === "string" ? title.trimStart() : ""
+  return SESSION_TITLE_ICONS.some((icon) => text.startsWith(`${icon} `))
 }
 
 // Stop reason for a goal held because a planning-only agent is active. The
@@ -949,6 +1012,8 @@ function clearRuntimeState() {
   runtime.seenIdleEventIDs.clear()
   runtime.sessionStatuses.clear()
   runtime.sessionExecutionContexts.clear()
+  runtime.sessionTitles.clear()
+  runtime.appliedTitles.clear()
   runtime.pendingCommandTurns.clear()
   runtime.activeCommandTurns.clear()
   runtime.ownedPluginMessages.clear()
@@ -2160,6 +2225,26 @@ async function logPluginError(client, message, error) {
 
 async function logPluginWarning(client, message) {
   return logPluginMessage(client, "warn", message)
+}
+
+// Cosmetic failures (session-title updates) log at debug and never fall back to
+// the console: a title that failed to render must not look like a goal fault.
+async function logPluginDebug(client, message, error) {
+  if (!client?.app?.log) return
+  try {
+    await client.app.log({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "debug",
+        message,
+        ...(error === undefined
+          ? {}
+          : { extra: { error: error?.message || error?.name || String(error) } }),
+      },
+    })
+  } catch {
+    // Diagnostics must never affect the goal loop.
+  }
 }
 
 function parseGoalArguments(args, defaults) {
@@ -3990,6 +4075,55 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   // agent. Defaults to false: unattended work must not escape Plan mode.
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
 
+  // Opt-in: mirrors live goal status into the OpenCode session title, which the
+  // TUI renders persistently. Off by default because it overwrites a
+  // user-visible field.
+  const sessionTitleStatus = pluginOptions.sessionTitleStatus === true
+
+  // Title updates are cosmetic: every path swallows errors after logging at
+  // debug level so a failure can never interrupt the goal loop.
+  const syncSessionTitle = async (sessionID) => {
+    if (!sessionTitleStatus || !sessionID) return
+    const goal = goalStates.get(sessionID)
+    if (!goal) return
+    const title = buildSessionTitle(goal)
+    if (currentRuntime().appliedTitles.get(sessionID) === title) return
+    try {
+      if (!currentRuntime().sessionTitles.has(sessionID)) {
+        const session = await sessionApi.get(sessionID)
+        const existing = typeof session?.title === "string" ? session.title : ""
+        // A status line left behind by a previous process is not the user's
+        // title; capture empty so clear leaves the host's title alone rather
+        // than restoring stale goal status.
+        currentRuntime().sessionTitles.set(
+          sessionID,
+          looksLikePluginSessionTitle(existing) ? "" : existing,
+        )
+      }
+      await sessionApi.update(sessionID, { title })
+      currentRuntime().appliedTitles.set(sessionID, title)
+    } catch (error) {
+      await logPluginDebug(client, "Failed to update session title", error)
+    }
+  }
+
+  const restoreSessionTitle = async (sessionID) => {
+    if (!sessionTitleStatus || !sessionID) return
+    const runtime = currentRuntime()
+    if (!runtime.sessionTitles.has(sessionID)) return
+    const original = runtime.sessionTitles.get(sessionID)
+    runtime.sessionTitles.delete(sessionID)
+    runtime.appliedTitles.delete(sessionID)
+    // Empty means there was nothing genuine to restore (no title, or the
+    // session only carried a status line from a previous process).
+    if (!original) return
+    try {
+      await sessionApi.update(sessionID, { title: original })
+    } catch (error) {
+      await logPluginDebug(client, "Failed to restore session title", error)
+    }
+  }
+
   // The restricted agent currently driving this session, or "" when execution
   // is permitted. Reads the execution context the host reports through
   // `chat.message`, `chat.params`, and `session.updated`.
@@ -4930,6 +5064,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             requireCurrent: false,
           })
         }
+        // Hand the session title back to the user now that no goal owns it.
+        if (clearStillCurrent) await restoreSessionTitle(sessionID)
         replaceCommandOutputText(
           output,
           !clearStillCurrent
@@ -6563,6 +6699,37 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
   // register_command toggle: when disabled, the plugin does not own
   // a slash command and only the event/transform/compaction hooks remain.
+  // Session-title indicator: rather than threading a sync call through every
+  // state-mutating site (a missed one shows the user a stale status), wrap the
+  // two hooks that gate all state change. The sync no-ops when the rendered
+  // title is unchanged, and runs in `finally` so the displayed status matches
+  // the state actually reached even if a hook throws.
+  if (sessionTitleStatus) {
+    for (const hookName of ["command.execute.before", "event"]) {
+      const original = hooks[hookName]
+      if (typeof original !== "function") continue
+      hooks[hookName] = async (...args) => {
+        try {
+          return await original(...args)
+        } finally {
+          let titleSessionID = ""
+          if (hookName === "event") {
+            // `message.updated` streams many times per assistant turn. Awaiting
+            // a title sync on each would put an API round-trip in the streaming
+            // path for a cosmetic update; idle, compaction, and interruption
+            // events already cover every state the indicator renders.
+            if (args[0]?.event?.type !== "message.updated") {
+              titleSessionID = getSessionID(args[0]?.event)
+            }
+          } else {
+            titleSessionID = args[0]?.sessionID
+          }
+          await syncSessionTitle(titleSessionID)
+        }
+      }
+    }
+  }
+
   if (!registerCommand) {
     delete hooks["command.execute.before"]
   }
@@ -6700,6 +6867,11 @@ export const testInternals = {
   isPluginCommandMessage,
   isPluginContinuationMessage,
   isPlanAgent,
+  buildSessionTitle,
+  formatCompactDuration,
+  formatCompactTokens,
+  goalStatusIcon,
+  looksLikePluginSessionTitle,
   isRestrictedAgent,
   normalizeRestrictedAgents,
   isPluginGeneratedMessage,

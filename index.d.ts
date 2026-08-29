@@ -312,6 +312,18 @@ export interface GoalPluginOptions {
   registerAgents?: boolean
 
   /**
+   * Mirror live goal status into the OpenCode session title, which the TUI
+   * renders persistently (e.g. `▶ ship the release · 3/10 · 2m · 45k/200k`),
+   * giving unattended runs a continuous heartbeat without a TUI plugin.
+   *
+   * The session's original title is captured before the first overwrite and
+   * restored by `/goal clear`. Title updates are cosmetic: a failure is logged
+   * at debug level and never interrupts the goal loop.
+   * @default false
+   */
+  sessionTitleStatus?: boolean
+
+  /**
    * Agent names treated as planning-only. A goal created while one of these
    * agents is active is recorded but held paused instead of starting, and
    * auto-continue stays suppressed while one is active. Matching is
