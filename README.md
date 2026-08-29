@@ -38,7 +38,7 @@ surface and versioning expectations.
 
 ### OpenCode version compatibility
 
-Tested against real OpenCode 1.17.15 processes with live provider credentials and no mocked plugin hooks. State, ledger entries, and workspace files were checked independently of terminal or model prose:
+Tested against real OpenCode 1.17.15 and 1.18.25 processes with live provider credentials and no mocked plugin hooks. State, ledger entries, and workspace files were checked independently of terminal or model prose:
 
 | OpenCode Version | Provider Tested | `/goal status` | Auto-continue | Evidence-gated completion | Historical custom-command presentation (v0.6.6) |
 |---|---|---|---|---|---|
@@ -46,6 +46,7 @@ Tested against real OpenCode 1.17.15 processes with live provider credentials an
 | 1.17.15 | opencode-go (`qwen3.7-plus`) | ✅ | ✅ | ✅ Self-corrected after one rejection (bare `[goal:complete]` with no evidence), then completed cleanly | ⚠️ Not displayed |
 | 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
 | 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
+| 1.18.25 | opencode (`nemotron-3.5-lightning-free`) | ✅ | ✅ Held correctly under the Plan agent (`stopped: true`, zero auto-continues) | ✅ Clean `[goal:evidence]` + `[goal:complete]` | ⚠️ Not displayed; command text routed to model |
 
 `/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
