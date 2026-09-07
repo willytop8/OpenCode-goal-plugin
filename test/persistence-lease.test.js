@@ -726,12 +726,17 @@ test("simultaneous stale observers cannot both acquire the replacement lease", a
   try {
     const first = persistenceLeaseInternals.acquirePersistenceLeaseWithHooks(state, {}, hooks)
     const second = persistenceLeaseInternals.acquirePersistenceLeaseWithHooks(state, {}, hooks)
-    await bothAtBefore
+    // Under load one acquirer can lose before it reaches a barrier (it
+    // re-inspects claims between attempts). Attach the settle handler first so
+    // that rejection is never reported as unhandled, and never wait at a
+    // barrier for an acquirer that has already settled.
+    const settled = Promise.allSettled([first, second])
+    await Promise.race([bothAtBefore, settled])
     releaseBefore()
-    await bothAtAfter
+    await Promise.race([bothAtAfter, settled])
     releaseAfter()
 
-    const results = await Promise.allSettled([first, second])
+    const results = await settled
     leases = results
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value)
