@@ -10322,3 +10322,29 @@ test("sessionTitleStatus never writes a completion line for a session this proce
   })
   assert.equal(updates.length, 0)
 })
+
+test("fenced code spans in the objective are literal text, not goal flags", () => {
+  const parsed = parseGoalArguments(
+    "run ```pytest --maxfail=1 --disable-warnings``` and fix every failure --max-turns 3",
+    normalizeOptions(),
+  )
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.condition, "run pytest --maxfail=1 --disable-warnings and fix every failure")
+  assert.equal(parsed.options.maxTurns, 3)
+
+  const multiline = parseGoalArguments("fix ```\nnpm test -- --watch=false\n``` please", normalizeOptions())
+  assert.deepEqual(multiline.errors, [])
+  assert.equal(multiline.condition, "fix npm test -- --watch=false please")
+
+  // A fence is never consumed as a flag value, for known or unknown flags.
+  const asValue = parseGoalArguments("ship --success ```--flag``` it", normalizeOptions())
+  assert.ok(asValue.errors.some((error) => error.startsWith("Missing value for --success")))
+  assert.equal(asValue.condition, "ship --flag it")
+  const unknown = parseGoalArguments("ship --bogus ```literal``` it", normalizeOptions())
+  assert.deepEqual(unknown.errors, ["Unsupported flag: --bogus"])
+  assert.equal(unknown.condition, "ship literal it")
+
+  // Without a fence the old behavior is unchanged.
+  const plain = parseGoalArguments("run pytest --maxfail=1", normalizeOptions())
+  assert.deepEqual(plain.errors, ["Unsupported flag: --maxfail"])
+})

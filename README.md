@@ -99,6 +99,14 @@ Add success criteria, constraints / non-goals, and a mode:
 
 Flags accept either `--flag value` or `--flag=value`. If a flag is unknown, missing a value, given a non-positive integer, or (for `--mode`) an unrecognized mode, the plugin rejects the command with a helpful error instead of silently folding the bad flag into the goal text.
 
+To include literal command-line options in an objective, wrap them in a Markdown fenced code span. Double-dash tokens inside the fence are objective text and are not parsed as goal flags:
+
+````text
+/goal run ```pytest --maxfail=1 --disable-warnings``` and fix every failure
+````
+
+Multiline fences work as well. The backticks are removed from the stored objective, and a fence is never consumed as a flag's value.
+
 Check status:
 
 ```

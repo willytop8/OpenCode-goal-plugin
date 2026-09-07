@@ -2298,29 +2298,35 @@ async function logPluginDebug(client, message, error) {
   }
 }
 
+// A fenced ```span``` in the arguments is objective text verbatim: double-dash
+// tokens inside it are never parsed as goal flags and it is never consumed as
+// a flag value, so a command line can be quoted inside an objective.
 function parseGoalArguments(args, defaults) {
-  const parts = args.match(/"[^"]*"|'[^']*'|\S+/g) || []
+  const parts = Array.from(
+    args.matchAll(/```([\s\S]*?)```|"[^"]*"|'[^']*'|\S+/g),
+    (match) => ({ value: match[1] ?? match[0], literal: match[1] !== undefined }),
+  )
   const condition = []
   const options = { ...defaults }
   const meta = { ...GOAL_META_DEFAULTS }
   const errors = []
+  const isFlagValue = (candidate) =>
+    candidate !== undefined && !candidate.literal && !candidate.value.startsWith("--")
 
   for (let i = 0; i < parts.length; i += 1) {
-    const part = parts[i]
+    const { value: part, literal } = parts[i]
 
-    if (part.startsWith("--")) {
+    if (!literal && part.startsWith("--")) {
       const [flagName, inlineValue] = part.split(/=(.*)/s, 2)
       const flagSpec = GOAL_FLAG_SPECS[flagName]
 
       if (!flagSpec) {
-        const next = parts[i + 1]
-        if (inlineValue === undefined && next !== undefined && !next.startsWith("--")) i += 1
+        if (inlineValue === undefined && isFlagValue(parts[i + 1])) i += 1
         errors.push(`Unsupported flag: ${flagName}`)
         continue
       }
 
-      const next = parts[i + 1]
-      const value = inlineValue ?? (next !== undefined && !next.startsWith("--") ? next : undefined)
+      const value = inlineValue ?? (isFlagValue(parts[i + 1]) ? parts[i + 1].value : undefined)
       if (inlineValue === undefined && value !== undefined) i += 1
 
       if (value === undefined) {
@@ -2372,7 +2378,7 @@ function parseGoalArguments(args, defaults) {
       continue
     }
 
-    condition.push(stripWrappingQuotes(part))
+    condition.push(literal ? part.trim() : stripWrappingQuotes(part))
   }
 
   const parsedCondition = condition.join(" ").trim()
