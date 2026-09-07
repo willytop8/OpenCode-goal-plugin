@@ -134,6 +134,17 @@ export interface GoalPluginOptions {
   maxTokens?: number
 
   /**
+   * Maximum cumulative API cost, in US dollars, a goal may incur before it is
+   * paused for exceeding limits. Uses the cost OpenCode reports on assistant
+   * messages, so enforcement depends on provider cost metadata and one
+   * response may overshoot the cap; an unknown cost never trips it.
+   * `/goal resume` opens a fresh budget window. Overridable per-goal with
+   * `--max-cost`. `0` disables the cap.
+   * @default 0
+   */
+  maxCostUsd?: number
+
+  /**
    * Minimum delay, in milliseconds, enforced between consecutive
    * auto-continue prompts. Overridable per-goal with `--cooldown-ms`.
    * @default 1500
@@ -308,6 +319,18 @@ export interface GoalPluginOptions {
    */
   registerTools?: boolean
 
+  /**
+   * How much control the agent-facing tools have over goals. `"full"` (the
+   * default) lets `goal_set`/`set_goal` replace an active goal, `update_goal`
+   * rewrite the objective, and `clear_goal` discard goals. `"status"` keeps
+   * agents to reporting: they may complete, block, pause, or resume a goal
+   * and create one when none is live, but only the user, through the slash
+   * command, can replace, edit, or clear a goal. Refusals are returned as tool
+   * results (an `agent_authority` failure envelope for `goal_set`).
+   * @default "full"
+   */
+  agentGoalAuthority?: "full" | "status"
+
   /** Register collision-safe native `goal` and `goal-verify` agents through OpenCode's config hook. */
   registerAgents?: boolean
 
@@ -317,8 +340,9 @@ export interface GoalPluginOptions {
    * giving unattended runs a continuous heartbeat without a TUI plugin.
    *
    * The session's original title is captured before the first overwrite and
-   * restored by `/goal clear`. Title updates are cosmetic: a failure is logged
-   * at debug level and never interrupts the goal loop.
+   * restored by `/goal clear`. A completed goal renders as `✅ … · N turns · …`
+   * until then. Title updates are cosmetic: a failure is logged at debug level
+   * and never interrupts the goal loop.
    * @default false
    */
   sessionTitleStatus?: boolean

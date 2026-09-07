@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-goal-plugin"],
+  "plugin": ["opencode-goal-plugin@0.10.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",

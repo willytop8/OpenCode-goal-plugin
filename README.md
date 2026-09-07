@@ -47,24 +47,23 @@ Tested against real OpenCode 1.17.15 and 1.18.25 processes with live provider cr
 | 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
 | 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
 | 1.18.25 | opencode (`nemotron-3.5-lightning-free`) | ✅ | ✅ Held correctly under the Plan agent (`stopped: true`, zero auto-continues) | ✅ Clean `[goal:evidence]` + `[goal:complete]` | ⚠️ Not displayed; command text routed to model |
+| 1.18.29 | deterministic localhost OpenAI-compatible fixture (no live provider) | ✅ Control turn routed; all 11 tools in every request | ✅ Idle continuation → completion; blocker paused with its reason | ✅ `[goal:evidence]` + `[goal:complete]` archived | ⚠️ Not displayed; command text routed to model |
 
 `/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
 **Note:** The table records the v0.6.6 live-provider matrix. In that release, OpenCode 1.17.15 retained the original command-parts array, so assigning a new `output.parts` array did not replace the raw command argument sent to the model. The current implementation mutates that retained array in place, making the plugin-generated command result the prompt for the turn. OpenCode custom commands still run through the model rather than rendering hook output directly, so the visible response may summarize or paraphrase the result (see [Limitations](#limitations)). Re-test against the exact OpenCode build and provider/backend stack you rely on for unattended work, and see [`docs/providers.md`](docs/providers.md) for the full historical model matrix.
 
+The 1.18.29 row comes from a deterministic-provider canary against a real `opencode serve` process, graded on persisted state. That canary also reproduced the two defects fixed in 0.10.0 (a first-command Plan goal not being held; a stale running title after completion) on 1.18.25 and 1.18.29 alike.
+
 Separately, the lifecycle-feedback implementation included in v0.7.0 passed a real OpenCode 1.18.11 host canary covering create, status, pause, resume, edit, and default lifecycle logging with a deterministic localhost provider. That canary validates host integration, not another live-provider compatibility row.
 
 ## Install
 
-```sh
-npm install opencode-goal-plugin
-```
-
-Add the plugin and command to your OpenCode config:
+OpenCode installs npm plugins itself from your config, so there is nothing to `npm install`. Add the plugin **with a pinned version** and the `goal` command to `opencode.json` (the user config at `~/.config/opencode/opencode.json`, or a project-local `opencode.json`):
 
 ```json
 {
-  "plugin": ["opencode-goal-plugin"],
+  "plugin": ["opencode-goal-plugin@0.10.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -74,6 +73,20 @@ Add the plugin and command to your OpenCode config:
   }
 }
 ```
+
+Or let the CLI add the plugin entry for you and then add the `command` block by hand:
+
+```sh
+opencode plugin opencode-goal-plugin@0.10.0 --global
+```
+
+Restart OpenCode after editing the config. The options form `["opencode-goal-plugin@0.10.0", { ... }]` (see [Options](#options)) pins the same way.
+
+### Upgrading
+
+**Pin the version.** OpenCode resolves an unpinned `"opencode-goal-plugin"` entry to `@latest` exactly once, installs it under its package cache (`~/.cache/opencode/packages/opencode-goal-plugin@latest/` by default; `opencode debug paths` prints the cache root), and never re-resolves `latest` while that directory exists. An unpinned entry therefore stays on whichever version was first installed, indefinitely, and new releases on npm are never picked up — a bug fixed months ago can still be running locally.
+
+To upgrade, bump the pin (for example to `opencode-goal-plugin@0.10.0`) and restart OpenCode; every pinned version gets its own cache directory. If you kept an unpinned entry, delete the `opencode-goal-plugin*` directories under the cache `packages/` folder and restart. `npx opencode-goal-plugin` runs the bundled verification script, which warns when the cached copy lags the package.
 
 ## Usage
 
@@ -86,7 +99,7 @@ Set a goal:
 Override limits for a single goal:
 
 ```
-/goal fix the failing tests --max-turns 20 --max-minutes 30 --max-tokens 400000
+/goal fix the failing tests --max-turns 20 --max-minutes 30 --max-tokens 400000 --max-cost 5
 ```
 
 Add success criteria, constraints / non-goals, and a mode:
@@ -98,6 +111,14 @@ Add success criteria, constraints / non-goals, and a mode:
 `--success` (alias `--success-criteria`) and `--constraints` (alias `--non-goals`) take quoted text and are injected alongside the objective so the assistant keeps them in view. `--mode` is `normal` (default) or `ordered`; `ordered` tells the assistant to preserve step order inside one objective. To queue distinct objectives that auto-promote one at a time, use `/goal sequence`. Multi-word values must be quoted.
 
 Flags accept either `--flag value` or `--flag=value`. If a flag is unknown, missing a value, given a non-positive integer, or (for `--mode`) an unrecognized mode, the plugin rejects the command with a helpful error instead of silently folding the bad flag into the goal text.
+
+To include literal command-line options in an objective, wrap them in a Markdown fenced code span. Double-dash tokens inside the fence are objective text and are not parsed as goal flags:
+
+````text
+/goal run ```pytest --maxfail=1 --disable-warnings``` and fix every failure
+````
+
+Multiline fences work as well. The backticks are removed from the stored objective, and a fence is never consumed as a flag's value.
 
 Check status:
 
@@ -231,6 +252,7 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 | Auto-continue turns | 10 |
 | Max duration | 15 minutes |
 | Context tokens | 200,000 |
+| API cost (USD) | off — set `maxCostUsd` or `--max-cost` |
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens on a stalled turn (after a 2-turn grace window) |
 | Budget wrap-up threshold | 80% of context token budget |
@@ -239,6 +261,8 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 **Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. The default 10 auto-continues is normally the binding brake before the 15-minute window; raise `--max-turns` and/or `--max-minutes` deliberately for longer work.
 
 **Token budget.** The plugin tracks the session's context window size (`input + output + reasoning` tokens on the latest message). This matches the token count that OpenCode displays, so the numbers should be consistent. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops. In high-context sessions (large codebases, long conversation history), the context can grow quickly — treat the budget as a safety brake.
+
+**Cost budget.** `maxCostUsd` (or `--max-cost 5` per goal) pauses the goal once the cumulative cost OpenCode reports for the session's assistant messages reaches the cap, with the same wrap-up prompt as the other limits; `/goal status` shows `Cost budget: $spent/$cap` and the continuation prompt carries `cost_remaining_usd`. Enforcement depends on the provider reporting cost — an unknown cost never trips the cap — and one response may overshoot it. `/goal resume` opens a fresh budget window.
 
 **No-progress heuristic.** A low-output turn does not pause immediately anymore. The plugin pauses only after `noProgressTurnsBeforePause` consecutive *stalled* low-output turns — repeated turns with very little output and no meaningful change in the latest assistant checkpoint.
 
@@ -328,6 +352,7 @@ Pass options when registering the plugin to change the defaults for all goals. T
 
 Additional plugin-level options:
 
+- `maxCostUsd` — cumulative OpenCode-reported API cost, in US dollars, before a goal pauses (default `0`, disabled). See the cost budget note under [Safety limits](#safety-limits).
 - `maxRecentMessages` — how many recent session messages to scan when looking for the latest assistant turn before auto-continuing. Higher values make long, tool-heavy sessions less likely to lose the most recent assistant response.
 - `noProgressTurnsBeforePause` — grace window for low-output stalls. The plugin pauses only after this many consecutive stalled low-output turns rather than on the first one.
 - `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`; set the plugin option to `0` for legitimate tool-free writing/research workflows.
@@ -337,11 +362,13 @@ Additional plugin-level options:
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
+- `agentGoalAuthority` — `"full"` (default) or `"status"`. In `"status"` mode the agent tools can report on a goal but cannot replace, edit, or clear one; see [Agent tools](#agent-tools).
 - `registerAgents` — whether the config hook adds native `goal` and `goal-verify` agents (default `true`). Existing agents with those names are preserved unchanged; the plugin never changes your default agent.
 - `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with a default-deny tool policy; only `read`, `glob`, and `grep` are allowed.
 - `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
 - `persistState` — whether to persist active goals and recent goal results to disk.
 - `stateFilePath` — root path for the persisted session-shard namespace. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default root is `<cwd>/.opencode/goals/state.json`; shards are written below `<stateFilePath>.sessions/` (see the persistence section above).
+- `ledgerFilePath` — override where the lifecycle ledger is written. By default each session shard keeps its ledger next to its state file as `<state.json>.ledger.jsonl`.
 - `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
@@ -357,7 +384,7 @@ Registered tools:
 - `goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, and `goal_complete` are the canonical narrow operations. They return compact versioned JSON envelopes so agents can branch reliably without parsing prose.
 - `get_goal`, `get_goal_history`, `set_goal`, `update_goal`, and `clear_goal` remain compatibility aliases with their existing text responses.
 
-`goal_set` and `set_goal` are explicitly constrained to user-requested goals. `goal_complete` accepts a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`, `failed`, or `not-run`), changed files, and known limitations. Failed checks and empty criterion evidence are rejected before archival; accepted claims are serialized deterministically for the configured completion auditor. The legacy `update_goal` tool retains its string `evidence` field for compatibility.
+`goal_set` and `set_goal` are explicitly constrained to user-requested goals by their descriptions. To enforce that in code, set `agentGoalAuthority: "status"`: agents may then complete, block, pause, or resume a goal and create one when none is live, but `goal_set`/`set_goal` refuse to replace an active goal, `update_goal` refuses objective changes, and `clear_goal` refuses to clear — only you, through `/goal`, `/goal add`, `/goal edit`, and `/goal clear`, can change what the goal *is*. The default `"full"` keeps the previous behavior, where a tool call can replace or rewrite the objective. `goal_complete` accepts a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`, `failed`, or `not-run`), changed files, and known limitations. Failed checks and empty criterion evidence are rejected before archival; accepted claims are serialized deterministically for the configured completion auditor. The legacy `update_goal` tool retains its string `evidence` field for compatibility.
 
 These operate on the same per-session multi-goal state as the command path: a tool-set goal persists, shows up in `/goal list`, and is driven by the idle auto-continue; completing a goal in an ordered sequence auto-promotes the next.
 
@@ -411,7 +438,7 @@ Unattended runs are easier to trust when you can see the goal is still alive. Se
 ▶ ship the release · 3/10 · 2m · 45k/200k
 ```
 
-Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on. When the goal completes, the title switches to `✅ ship the release · 3 turns · 2m · 45k` so a finished run is never mistaken for a running one; `/goal clear` restores your original title.
 
 ```json
 {
@@ -438,7 +465,9 @@ A planning-only agent is never driven into execution by the goal loop. OpenCode'
 - Auto-continue stays suppressed on **every idle** while a restricted agent is active, so switching into `plan` mid-goal pauses the loop.
 - Continuations retain the agent that started the goal, so the loop cannot drift into a different agent.
 
-The active agent is read from the execution context the host reports, falling back to the session record. That fallback matters: OpenCode runs `command.execute.before` before any `chat.message`/`chat.params` for the turn, so the context is empty for the first command in a session — the exact case a freshly opened Plan-mode session hits.
+The active agent is read from the execution context the host reports for its turns. OpenCode runs `command.execute.before` before any `chat.message`/`chat.params` for the turn, and its session record carries no agent, so for the first command in a session the agent is unknown at creation time. The plugin therefore re-checks when the routed turn reaches `chat.message`, which does carry the agent, and holds the goal there — rewriting the turn into a read-only control turn and blocking tools for it — before the model is told to start.
+
+**Command configuration matters.** OpenCode runs a custom command under the agent named in its config (`command.goal.agent`) and only falls back to the agent selected in the session when the command sets none. With the install snippet's `"agent": "build"`, the `/goal` turn itself always executes as `build`, so a hold can only come from a *previously* reported planning-only agent (the case verified in the TUI, where you switched to Plan and then typed `/goal`). To have Plan mode hold a goal even on a session's very first turn, omit `agent` from the `goal` command config so the command runs under the selected agent.
 
 **What this does and does not prevent.** The restriction stops the *goal loop*: a held goal sends zero auto-continues, so no unattended work happens. It cannot stop a model from acting on the single routed command turn, because OpenCode's `command.execute.before` does not fully intercept command text (see [Limitations](#limitations)). A held goal's routed text explicitly tells the model not to begin work and is sent as a read-only control turn, but a non-compliant model may still act on that one turn. Verified against OpenCode 1.18.25: a goal set under Plan records `stopped: true`, `stopReason: plan agent active`, and `turnCount: 0`.
 
@@ -503,6 +532,8 @@ Point OpenCode at the source file directly for local testing:
 ```
 
 Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode will attempt to load plugin-like files it finds there.
+
+A `file://` entry loads the source as-is, so the checkout needs its `node_modules` (`npm ci`) for the `zod` import to resolve; copying `src/goal-plugin.js` somewhere on its own will fail to load. Use the npm package for anything but development.
 
 ### Smoke-test checklist
 

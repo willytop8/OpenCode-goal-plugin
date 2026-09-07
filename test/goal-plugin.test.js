@@ -38,6 +38,7 @@ const {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildCompletedSessionTitle,
   formatCompactDuration,
   formatCompactTokens,
   goalStatusIcon,
@@ -65,6 +66,7 @@ const {
   sessionPathsFor,
   setLedgerSink,
   stopReason,
+  costCapFor,
   totalTokensForMessage,
   userInterventionDetected,
   xdgStateFilePath,
@@ -9878,7 +9880,7 @@ async function createTitleHooks(overrides = {}) {
   const client = {
     app: { log: async () => {} },
     session: {
-      messages: async () => ({ data: [message("still working")] }),
+      messages: overrides.messages || (async () => ({ data: [message("still working")] })),
       promptAsync: async () => ({}),
       abort: async () => ({}),
       get: overrides.get || (async () => ({ data: { title: "my original title" } })),
@@ -9945,6 +9947,14 @@ test("buildSessionTitle renders a compact one-line status", () => {
   const title = buildSessionTitle({ ...goal, condition: "x".repeat(200) }, now)
   assert.ok(title.includes("…"), "a long objective must be truncated")
   assert.ok(title.length < 100, `title should stay compact, got ${title.length}`)
+})
+
+test("buildCompletedSessionTitle renders the terminal state without limit halves", () => {
+  const now = Date.now()
+  const result = { condition: "ship the release", turnCount: 3, totalTokens: 45_000, startedAt: now - 120_000, finishedAt: now }
+  assert.equal(buildCompletedSessionTitle(result), "✅ ship the release · 3 turns · 2m · 45k")
+  assert.equal(buildCompletedSessionTitle({ ...result, turnCount: 1 }), "✅ ship the release · 1 turn · 2m · 45k")
+  assert.equal(looksLikePluginSessionTitle(buildCompletedSessionTitle(result)), true)
 })
 
 test("looksLikePluginSessionTitle recognizes titles this plugin wrote", () => {
@@ -10173,4 +10183,280 @@ test("a cached execution context is preferred over refetching the session", asyn
   )
   assert.equal(currentGoal("session-1").stopped, false, "the cached build context must win")
   assert.equal(getCalls, 0, "a known agent must not cost a session fetch")
+})
+
+async function routeFirstCommandTurn(hooks, sessionID, args, agent) {
+  const messageID = `msg-first-${sessionID}`
+  const output = { message: { id: messageID, role: "user", sessionID }, parts: [textPart(`/goal ${args}`)] }
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: args }, output)
+  const creationText = output.parts[0].text
+  output.parts = resolveRoutedParts(output.parts, sessionID, messageID)
+  await hooks["chat.message"]({ sessionID, messageID, agent }, output)
+  return { output, creationText }
+}
+
+test("a goal created by the first command of a Plan session is held once the routed turn reveals the agent", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  const sessionID = "session-plan-first"
+  const { output, creationText } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+
+  // At creation no agent was known: OpenCode's Session record carries none and
+  // no chat hook has run yet, so the goal started live.
+  assert.match(creationText, /Start working toward this goal now\./)
+
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.stopped, true, "the routed turn's agent must hold the goal")
+  assert.equal(goal.stopReason, "plan agent active")
+  assert.deepEqual(goal.history.map((entry) => entry.type), ["set", "paused"])
+
+  const text = output.parts[0].text
+  assert.match(text, /<goal_command_control>/, "the turn must be re-routed as a read-only control turn")
+  assert.match(text, /Goal recorded but held: ship it/)
+  assert.match(text, /Do not begin work on it now/)
+  assert.ok(!text.includes("Start working toward this goal now."), "the work instruction must be gone")
+
+  await assert.rejects(
+    hooks["tool.execute.before"]({ sessionID, tool: "bash" }),
+    /control command has already been handled/,
+    "tools are blocked for the held turn",
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+})
+
+test("a goal created by the first command under an executing agent stays live", async () => {
+  const sessionID = "session-build-first"
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1 },
+    messages: async () => ({
+      data: [message("still working", undefined, "msg-build-first", sessionID, `msg-first-${sessionID}`)],
+    }),
+  })
+  const { output } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "build")
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.match(output.parts[0].text, /Start working toward this goal now\./)
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+})
+
+test("allowGoalExecutionFromPlan keeps a first-command Plan goal live", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, allowGoalExecutionFromPlan: true } })
+  const sessionID = "session-plan-allowed"
+  const { output } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.match(output.parts[0].text, /Start working toward this goal now\./)
+})
+
+test("a completion marker on the held Plan turn does not complete the goal", async () => {
+  const sessionID = "session-plan-complete"
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1 },
+    messages: async () => ({
+      data: [
+        message("[goal:evidence] ran everything\n[goal:complete]", undefined, "msg-held-turn", sessionID, `msg-first-${sessionID}`),
+      ],
+    }),
+  })
+  await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-held-turn", role: "assistant", sessionID, tokens: { input: 1, output: 20, reasoning: 0 } },
+      },
+    },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  const goal = currentGoal(sessionID)
+  assert.ok(goal, "the held goal must still be live in memory, not archived")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "plan agent active")
+  assert.equal(calls.length, 0)
+})
+
+
+test("sessionTitleStatus shows a completed goal instead of a stale running line", async () => {
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({ data: [message("[goal:evidence] ran the suite\n[goal:complete]")] }),
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.match(updates.at(-1).body.title, /^▶ ship it · 0\/\d+ · /)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.ok(!currentGoal("session-1"), "the goal must have completed and been archived")
+  assert.match(updates.at(-1).body.title, /^✅ ship it · 0 turns · \d+s · \d+$/)
+
+  // A later read-only command re-renders the same line and skips the API call.
+  const renders = updates.length
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "status" },
+    { parts: [] },
+  )
+  assert.equal(updates.length, renders)
+  assert.match(updates.at(-1).body.title, /^✅ ship it/)
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "clear" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.title, "my original title")
+})
+
+test("sessionTitleStatus never writes a completion line for a session this process did not title", async () => {
+  // Restart: the archived result is visible but no title was applied by this process.
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({ data: [message("[goal:evidence] ran the suite\n[goal:complete]")] }),
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-untitled", status: { type: "idle" } } },
+  })
+  assert.equal(updates.length, 0)
+})
+
+test("fenced code spans in the objective are literal text, not goal flags", () => {
+  const parsed = parseGoalArguments(
+    "run ```pytest --maxfail=1 --disable-warnings``` and fix every failure --max-turns 3",
+    normalizeOptions(),
+  )
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.condition, "run pytest --maxfail=1 --disable-warnings and fix every failure")
+  assert.equal(parsed.options.maxTurns, 3)
+
+  const multiline = parseGoalArguments("fix ```\nnpm test -- --watch=false\n``` please", normalizeOptions())
+  assert.deepEqual(multiline.errors, [])
+  assert.equal(multiline.condition, "fix npm test -- --watch=false please")
+
+  // A fence is never consumed as a flag value, for known or unknown flags.
+  const asValue = parseGoalArguments("ship --success ```--flag``` it", normalizeOptions())
+  assert.ok(asValue.errors.some((error) => error.startsWith("Missing value for --success")))
+  assert.equal(asValue.condition, "ship --flag it")
+  const unknown = parseGoalArguments("ship --bogus ```literal``` it", normalizeOptions())
+  assert.deepEqual(unknown.errors, ["Unsupported flag: --bogus"])
+  assert.equal(unknown.condition, "ship literal it")
+
+  // Without a fence the old behavior is unchanged.
+  const plain = parseGoalArguments("run pytest --maxfail=1", normalizeOptions())
+  assert.deepEqual(plain.errors, ["Unsupported flag: --maxfail"])
+})
+
+test("--max-cost sets a per-goal cost cap and rejects non-positive or malformed values", () => {
+  const parsed = parseGoalArguments("ship it --max-cost 2.5", normalizeOptions())
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.options.maxCostUsd, 2.5)
+  assert.equal(parseGoalArguments("ship it --max-cost=$5", normalizeOptions()).options.maxCostUsd, 5)
+  for (const bad of ["0", "-1", "abc", "1e3"]) {
+    const rejected = parseGoalArguments(`ship it --max-cost ${bad}`, normalizeOptions())
+    assert.ok(rejected.errors.some((error) => error.startsWith("Invalid cost budget for --max-cost")), bad)
+  }
+  assert.equal(normalizeOptions().maxCostUsd, 0)
+  assert.equal(normalizeOptions({ maxCostUsd: -1 }).maxCostUsd, 0)
+  assert.equal(normalizeOptions({ maxCostUsd: "3" }).maxCostUsd, 3)
+})
+
+test("stopReason and costCapFor enforce the cost cap only when the provider reports cost", () => {
+  const base = { turnCount: 0, totalTokens: 0, startedAt: Date.now(), options: normalizeOptions({ maxCostUsd: 1 }) }
+  assert.equal(costCapFor({ ...base, options: normalizeOptions() }), null)
+  assert.equal(stopReason({ ...base, usage: { cost: 1.2, costKnown: true } }), "max cost reached ($1.00)")
+  assert.equal(stopReason({ ...base, usage: { cost: 0.4, costKnown: true } }), null)
+  assert.equal(stopReason({ ...base, usage: { cost: 0, costKnown: false } }), null)
+  const nearCap = costCapFor({ ...base, usage: { cost: 0.95, costKnown: true } })
+  assert.deepEqual({ ...nearCap, remaining: Number(nearCap.remaining.toFixed(6)) }, {
+    limit: 1,
+    spent: 0.95,
+    known: true,
+    remaining: 0.05,
+    reached: false,
+  })
+  assert.match(buildLimitWarning({ ...base, usage: { cost: 0.95, costKnown: true } }), /\$0\.05 of the \$1\.00 cost budget remaining/)
+})
+
+test("cost cap requests a final handoff and pauses the goal", async () => {
+  const sessionID = "session-cost"
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1, maxCostUsd: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "assistant-costly",
+          role: "assistant",
+          sessionID,
+          tokens: { input: 10, output: 5, reasoning: 0 },
+          cost: 1.5,
+        },
+      },
+    },
+  })
+  const goal = currentGoal(sessionID)
+  assert.match(formatStatus(goal, "goal"), /Cost budget: \$1\.5000\/\$1\.00/)
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].body.parts[0].text, /<budget_wrapup>/)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "max cost reached ($1.00)")
+})
+
+test("agent set_goal accepts and validates maxCostUsd", async () => {
+  const { handlers } = makeAgentHandlers()
+  assert.match(await handlers.setGoal("agent-cost-bad", { objective: "ship it", maxCostUsd: -2 }), /Invalid maxCostUsd/)
+  await handlers.setGoal("agent-cost", { objective: "ship it", maxCostUsd: 2 })
+  assert.equal(currentGoal("agent-cost").options.maxCostUsd, 2)
+})
+
+test("agentGoalAuthority: status keeps agent tools to reporting", async () => {
+  const { handlers } = makeAgentHandlers({ agentGoalAuthority: "status" })
+  const sid = "agent-authority"
+  // Creating a goal when none is live is allowed.
+  assert.match(await handlers.setGoal(sid, { objective: "ship it" }), /New active goal: ship it/)
+  // Replacing, editing, and clearing are not.
+  assert.match(await handlers.setGoal(sid, { objective: "do something else" }), /Agents cannot replace the active goal/)
+  assert.equal(currentGoal(sid).condition, "ship it")
+  assert.match(await handlers.updateGoal(sid, { objective: "rewritten" }), /Agents cannot change the goal objective/)
+  assert.equal(currentGoal(sid).condition, "ship it")
+  assert.match(await handlers.clearGoal(sid), /Agents cannot clear the goal/)
+  assert.ok(currentGoal(sid))
+  // Status reporting still works.
+  assert.match(await handlers.updateGoal(sid, { status: "paused" }), /paused/i)
+  assert.equal(currentGoal(sid).stopped, true)
+  assert.match(await handlers.updateGoal(sid, { status: "resumed" }), /resumed/i)
+  assert.equal(currentGoal(sid).stopped, false)
+})
+
+test("agentGoalAuthority defaults to full, preserving replacement", async () => {
+  const { handlers } = makeAgentHandlers()
+  const sid = "agent-authority-full"
+  await handlers.setGoal(sid, { objective: "first" })
+  assert.match(await handlers.setGoal(sid, { objective: "second" }), /New active goal: second/)
+  assert.equal(currentGoal(sid).condition, "second")
+  assert.match(await handlers.updateGoal(sid, { objective: "third" }), /Objective updated: third/)
+})
+
+test("canonical goal_set returns an agent_authority failure envelope under status authority", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, agentGoalAuthority: "status" } })
+  const sessionID = "canonical-authority"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+  const result = JSON.parse(await hooks.tool.goal_set.execute({ objective: "replace it" }, { sessionID }))
+  assert.equal(result.ok, false)
+  assert.equal(result.error, "agent_authority")
+  assert.equal(currentGoal(sessionID).condition, "ship it")
 })

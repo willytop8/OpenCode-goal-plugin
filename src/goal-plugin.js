@@ -73,6 +73,9 @@ const DEFAULT_OPTIONS = {
   maxTurns: 10,
   maxDurationMs: 15 * 60 * 1000,
   maxTokens: 200000,
+  // Cumulative OpenCode-reported API cost, in US dollars, before the goal
+  // pauses. 0 disables the cap; enforcement depends on provider cost metadata.
+  maxCostUsd: 0,
   minDelayMs: 1500,
   maxRecentMessages: 50,
   noProgressTokenThreshold: 50,
@@ -228,6 +231,8 @@ const GOAL_FLAG_SPECS = {
   // Inline budget shorthand for the context-token limit. Accepts a plain
   // integer or a k/m suffix (e.g. --budget 100k == --max-tokens 100000).
   "--budget": { type: "tokens", optionKey: "maxTokens" },
+  // Per-goal cost cap in US dollars (e.g. --max-cost 5 or --max-cost 2.50).
+  "--max-cost": { type: "usd", optionKey: "maxCostUsd" },
   "--success": { type: "string", target: "meta", metaKey: "successCriteria" },
   "--success-criteria": { type: "string", target: "meta", metaKey: "successCriteria" },
   "--constraints": { type: "string", target: "meta", metaKey: "constraints" },
@@ -301,6 +306,47 @@ function frameControlCommandText(text) {
     "</goal_command_instruction>",
     "</goal_command_control>",
   ].join("\n")
+}
+
+// Routed text for the turn that creates a goal. A held goal must not be told
+// to start working: command text reaches the model as a normal turn on current
+// OpenCode builds, so that line would be the escape the plan guard exists to
+// prevent.
+function buildGoalCommandNotice(goal, { heldLabel = "", replacedGoal = null, commandName = "goal" } = {}) {
+  return [
+    ...(replacedGoal
+      ? [
+          `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
+          `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
+          "",
+        ]
+      : []),
+    heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
+    goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
+    goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
+    goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
+    "",
+    ...(heldLabel
+      ? [
+          `The ${heldLabel} agent is planning-only, so this goal is not running.`,
+          "Do not begin work on it now. Continue planning only.",
+          `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
+        ]
+      : [
+          "Start working toward this goal now.",
+          "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
+          "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
+        ]),
+    `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
+    "",
+    `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
+      goal.options.maxDurationMs / 1000,
+    )}s, ${goal.options.maxTokens.toLocaleString()} context tokens${
+      goal.options.maxCostUsd > 0 ? `, $${goal.options.maxCostUsd.toFixed(2)} cost` : ""
+    }.`,
+  ]
+    .filter((line) => line !== null)
+    .join("\n")
 }
 
 // OpenCode retains its original command-parts array after invoking
@@ -432,7 +478,7 @@ function isPlanAgent(agent) {
 // continuous heartbeat without a TUI plugin entrypoint. Opt-in, because it
 // overwrites a user-visible field.
 const SESSION_TITLE_OBJECTIVE_LIMIT = 48
-const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔"]
+const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✅"]
 
 // The title sits in a narrow column, so every field is abbreviated hard.
 function formatCompactDuration(ms) {
@@ -473,6 +519,18 @@ function buildSessionTitle(goal, now = Date.now()) {
     `${goal.turnCount}/${goal.options.maxTurns}`,
     formatCompactDuration(elapsedMs),
     `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`,
+  ].join(" · ")
+}
+
+// Title for a goal that just completed. Archived results carry the counters
+// but not the option snapshot, so the "/limit" halves are dropped.
+function buildCompletedSessionTitle(result) {
+  const turns = toNonNegativeInteger(result.turnCount)
+  return [
+    `✅ ${summarizeText(result.condition, SESSION_TITLE_OBJECTIVE_LIMIT)}`,
+    `${turns} turn${turns === 1 ? "" : "s"}`,
+    formatCompactDuration(Math.max(0, result.finishedAt - result.startedAt)),
+    formatCompactTokens(result.totalTokens),
   ].join(" · ")
 }
 
@@ -817,6 +875,11 @@ function formatStatus(
     `Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`,
     `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
     formatUsage(goal.usage),
+    ...(costCapFor(goal)
+      ? [
+          `Cost budget: ${costCapFor(goal).known ? `$${costCapFor(goal).spent.toFixed(4)}` : "unknown"}/$${costCapFor(goal).limit.toFixed(2)}`,
+        ]
+      : []),
     `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`,
     `Last progress: ${lastProgress}`,
     `No-progress turns: ${goal.noProgressTurns}`,
@@ -881,7 +944,24 @@ function stopReason(goal) {
     return `max duration reached (${Math.round(goal.options.maxDurationMs / 1000)}s)`
   }
   if (goal.totalTokens >= goal.options.maxTokens) return `max context tokens reached (${goal.options.maxTokens.toLocaleString()})`
+  const costCap = costCapFor(goal)
+  if (costCap && costCap.reached) return `max cost reached ($${costCap.limit.toFixed(2)})`
   return null
+}
+
+// Cost cap state, or null when the cap is disabled. The cap can only be
+// enforced when the provider reports cost; an unknown cost never trips it.
+function costCapFor(goal) {
+  const limit = Number(goal?.options?.maxCostUsd)
+  if (!Number.isFinite(limit) || limit <= 0) return null
+  const usage = normalizeUsage(goal.usage)
+  return {
+    limit,
+    spent: usage.cost,
+    known: usage.costKnown,
+    remaining: Math.max(0, limit - usage.cost),
+    reached: usage.costKnown && usage.cost >= limit,
+  }
 }
 
 function sessionGoalMap(sessionID) {
@@ -1264,6 +1344,10 @@ function normalizeOptions(options = {}) {
     maxTurns: toPositiveInteger(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
+    maxCostUsd:
+      Number.isFinite(Number(options.maxCostUsd)) && Number(options.maxCostUsd) > 0
+        ? Number(options.maxCostUsd)
+        : DEFAULT_OPTIONS.maxCostUsd,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
     maxRecentMessages: toPositiveInteger(
       options.maxRecentMessages,
@@ -2247,29 +2331,35 @@ async function logPluginDebug(client, message, error) {
   }
 }
 
+// A fenced ```span``` in the arguments is objective text verbatim: double-dash
+// tokens inside it are never parsed as goal flags and it is never consumed as
+// a flag value, so a command line can be quoted inside an objective.
 function parseGoalArguments(args, defaults) {
-  const parts = args.match(/"[^"]*"|'[^']*'|\S+/g) || []
+  const parts = Array.from(
+    args.matchAll(/```([\s\S]*?)```|"[^"]*"|'[^']*'|\S+/g),
+    (match) => ({ value: match[1] ?? match[0], literal: match[1] !== undefined }),
+  )
   const condition = []
   const options = { ...defaults }
   const meta = { ...GOAL_META_DEFAULTS }
   const errors = []
+  const isFlagValue = (candidate) =>
+    candidate !== undefined && !candidate.literal && !candidate.value.startsWith("--")
 
   for (let i = 0; i < parts.length; i += 1) {
-    const part = parts[i]
+    const { value: part, literal } = parts[i]
 
-    if (part.startsWith("--")) {
+    if (!literal && part.startsWith("--")) {
       const [flagName, inlineValue] = part.split(/=(.*)/s, 2)
       const flagSpec = GOAL_FLAG_SPECS[flagName]
 
       if (!flagSpec) {
-        const next = parts[i + 1]
-        if (inlineValue === undefined && next !== undefined && !next.startsWith("--")) i += 1
+        if (inlineValue === undefined && isFlagValue(parts[i + 1])) i += 1
         errors.push(`Unsupported flag: ${flagName}`)
         continue
       }
 
-      const next = parts[i + 1]
-      const value = inlineValue ?? (next !== undefined && !next.startsWith("--") ? next : undefined)
+      const value = inlineValue ?? (isFlagValue(parts[i + 1]) ? parts[i + 1].value : undefined)
       if (inlineValue === undefined && value !== undefined) i += 1
 
       if (value === undefined) {
@@ -2288,6 +2378,16 @@ function parseGoalArguments(args, defaults) {
           continue
         }
         options[flagSpec.optionKey] = budget
+        continue
+      }
+
+      if (flagSpec.type === "usd") {
+        const cost = /^\$?\d+(?:\.\d+)?$/.test(rawValue.trim()) ? Number(rawValue.trim().replace(/^\$/, "")) : NaN
+        if (!Number.isFinite(cost) || cost <= 0) {
+          errors.push(`Invalid cost budget for ${flagName}: ${value} (use a positive number of US dollars)`)
+          continue
+        }
+        options[flagSpec.optionKey] = cost
         continue
       }
 
@@ -2321,7 +2421,7 @@ function parseGoalArguments(args, defaults) {
       continue
     }
 
-    condition.push(stripWrappingQuotes(part))
+    condition.push(literal ? part.trim() : stripWrappingQuotes(part))
   }
 
   const parsedCondition = condition.join(" ").trim()
@@ -2371,6 +2471,10 @@ function buildLimitWarning(goal) {
   }
   if (remainingTokens <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingTokens).toLocaleString()} context token(s) remaining`)
+  }
+  const costCap = costCapFor(goal)
+  if (costCap?.known && costCap.remaining <= costCap.limit * 0.1) {
+    warnings.push(`$${costCap.remaining.toFixed(2)} of the $${costCap.limit.toFixed(2)} cost budget remaining`)
   }
 
   return warnings.length ? ` Limits are near: ${warnings.join(", ")}.` : ""
@@ -2465,6 +2569,9 @@ function buildContinueMessage(
     "<progress_budget>",
     `turns_remaining: ${remainingTurns}`,
     `tokens_remaining: ${remainingTokens}`,
+    ...(costCapFor(goal)
+      ? [`cost_remaining_usd: ${costCapFor(goal).known ? costCapFor(goal).remaining.toFixed(2) : "unknown"}`]
+      : []),
     `elapsed_seconds: ${elapsedSeconds}`,
     "</progress_budget>",
   ]
@@ -2556,7 +2663,9 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.${
+      costCapFor(goal) ? ` Cost: ${costCapFor(goal).known ? `$${costCapFor(goal).spent.toFixed(2)}` : "unknown"}/$${costCapFor(goal).limit.toFixed(2)}.` : ""
+    }`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
@@ -3149,7 +3258,32 @@ function buildAgentToolHandlers({
   auditMessagesEnabled = false,
   announceLifecycle = () => {},
   commandName = "goal",
+  agentGoalAuthority = "full",
 }) {
+  // "status" authority: agents may report on a goal (complete, block, pause,
+  // resume) and create one when none is live, but only the user, through the
+  // slash command, may replace, edit, or clear a goal. Returns the refusal
+  // text, or null when the action is allowed.
+  function agentLockMessage(sessionID, action) {
+    if (agentGoalAuthority !== "status") return null
+    if (action === "replace" && !goalStates.has(sessionID) && listSessionGoals(sessionID).length === 0) {
+      return null
+    }
+    const verb =
+      action === "replace"
+        ? "replace the active goal"
+        : action === "edit"
+          ? "change the goal objective"
+          : "clear the goal"
+    const hint =
+      action === "replace"
+        ? `/${commandName} <objective>, /${commandName} add <objective>, or /${commandName} edit <objective>`
+        : action === "edit"
+          ? `/${commandName} edit <objective>`
+          : `/${commandName} clear`
+    return `Agents cannot ${verb} in this session (agentGoalAuthority: "status"). Ask the user to run ${hint}.`
+  }
+
   // Use persistTerminalState (which logs on failure) for terminal operations when
   // available; fall back to plain persist for callers that don't wire it up (e.g.
   // tests using buildAgentToolHandlers directly).
@@ -3189,6 +3323,8 @@ function buildAgentToolHandlers({
   async function setGoal(sessionID, args = {}) {
     const objective = typeof args.objective === "string" ? args.objective.trim() : ""
     if (!objective) return "No objective provided. Pass a non-empty `objective`."
+    const replaceLock = agentLockMessage(sessionID, "replace")
+    if (replaceLock) return replaceLock
     if (objective.length > MAX_GOAL_OBJECTIVE_LENGTH)
       return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
     for (const [field, value] of [["successCriteria", args.successCriteria], ["constraints", args.constraints]]) {
@@ -3204,6 +3340,8 @@ function buildAgentToolHandlers({
       return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
     if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
       return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
+    if (Number.isFinite(args.maxCostUsd) && args.maxCostUsd <= 0)
+      return `Invalid maxCostUsd: ${args.maxCostUsd} — must be a positive number of US dollars.`
     if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
       return `Invalid mode: ${args.mode} (expected ${[...GOAL_MODES].join(" or ")}).`
     const options = normalizeOptions({
@@ -3211,6 +3349,7 @@ function buildAgentToolHandlers({
       ...(Number.isFinite(args.maxTurns) ? { maxTurns: args.maxTurns } : {}),
       ...(Number.isFinite(args.maxTokens) ? { maxTokens: args.maxTokens } : {}),
       ...(Number.isFinite(args.maxDurationMs) ? { maxDurationMs: args.maxDurationMs } : {}),
+      ...(Number.isFinite(args.maxCostUsd) ? { maxCostUsd: args.maxCostUsd } : {}),
     })
     const meta = {
       successCriteria: typeof args.successCriteria === "string" ? args.successCriteria : "",
@@ -3248,6 +3387,10 @@ function buildAgentToolHandlers({
   async function updateGoal(sessionID, args = {}) {
     let goal = goalStates.get(sessionID)
     if (!goal) return "No active goal to update. Use set_goal first."
+    if (typeof args.objective === "string" && args.objective.trim()) {
+      const editLock = agentLockMessage(sessionID, "edit")
+      if (editLock) return editLock
+    }
 
     // Reject the combination of an objective update with status='complete': the
     // completion would be archived under a condition that was never executed,
@@ -3553,6 +3696,8 @@ function buildAgentToolHandlers({
   }
 
   async function clearGoal(sessionID) {
+    const clearLock = agentLockMessage(sessionID, "clear")
+    if (clearLock) return clearLock
     // Mirror `/goal clear`: drop the ordered flag, ALL backgrounded goals, and the
     // focused goal + result. Without sessionGoals.delete, background goals added via
     // `/goal add` survive clear and resurrect as the focused goal on restart.
@@ -3586,7 +3731,7 @@ function buildAgentToolHandlers({
       : "Goal cleared."
   }
 
-  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal }
+  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, agentLockMessage }
 }
 
 function agentToolSessionID(ctx) {
@@ -3696,6 +3841,8 @@ function buildAgentTools(
       if (typeof args.objective !== "string" || !args.objective.trim()) {
         return goalToolFailure("invalid_objective", "No objective provided. Pass a non-empty objective.")
       }
+      const locked = handlers.agentLockMessage?.(sessionID, "replace")
+      if (locked) return goalToolFailure("agent_authority", locked)
       return goalToolSuccess(await handlers.setGoal(sessionID, args))
     },
     update: async (sessionID, args) => {
@@ -3742,6 +3889,7 @@ function buildAgentTools(
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
+        maxCostUsd: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
         mode: schema.string().optional(),
@@ -3804,6 +3952,7 @@ function buildAgentTools(
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
+        maxCostUsd: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
         mode: schema.string().optional(),
@@ -4071,6 +4220,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   })
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
   const restrictedAgents = normalizeRestrictedAgents(pluginOptions.restrictedAgents)
+  const agentGoalAuthority = pluginOptions.agentGoalAuthority === "status" ? "status" : "full"
   // Opt-out for deployments that deliberately drive execution from a planning
   // agent. Defaults to false: unattended work must not escape Plan mode.
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
@@ -4085,8 +4235,18 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   const syncSessionTitle = async (sessionID) => {
     if (!sessionTitleStatus || !sessionID) return
     const goal = goalStates.get(sessionID)
-    if (!goal) return
-    const title = buildSessionTitle(goal)
+    let title
+    if (goal) {
+      title = buildSessionTitle(goal)
+    } else {
+      // No live goal. Completion archives the goal, so without this branch
+      // the last "running" line would stay on the session until /goal clear.
+      // Only rewrite a title this process already owns, and only for an
+      // achieved result; clear still restores the captured original.
+      const result = lastGoalResults.get(sessionID)
+      if (!currentRuntime().appliedTitles.has(sessionID) || result?.state !== "achieved") return
+      title = buildCompletedSessionTitle(result)
+    }
     if (currentRuntime().appliedTitles.get(sessionID) === title) return
     try {
       if (!currentRuntime().sessionTitles.has(sessionID)) {
@@ -4456,6 +4616,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     auditMessagesEnabled,
     announceLifecycle,
     commandName,
+    agentGoalAuthority,
   })
 
   const abortAcceptedContinuation = async (sessionID) => {
@@ -4928,6 +5089,36 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // the model as work input. OpenCode retains this exact array too, so
           // mutate it in place just as command.execute.before does.
           message.parts.splice(0, message.parts.length, commandPart)
+        }
+        // A goal created by the first command of a fresh session could not
+        // know the active agent at creation time (command.execute.before runs
+        // before any chat hook and the Session record carries no agent). The
+        // routed turn does carry it: re-evaluate the planning-only restriction
+        // and hold the goal before the model is told to start working.
+        if (commandTurn.startedGoal && commandTurn.attachmentError !== true) {
+          const startedGoal = goalStates.get(sessionID)
+          const startedByThisCommand =
+            Boolean(startedGoal) &&
+            !startedGoal.stopped &&
+            startedGoal.goalId === commandTurn.startedGoal.goalId &&
+            startedGoal.runId === commandTurn.startedGoal.runId
+          const lateRestrictedAgent = startedByThisCommand ? await restrictedAgentFor(sessionID) : ""
+          if (lateRestrictedAgent) {
+            const heldLabel = holdGoalForRestrictedAgent(startedGoal, lateRestrictedAgent)
+            await persist(sessionID)
+            announceLifecycle(sessionID, `Goal recorded but held while ${heldLabel} is active.`, {
+              goal: startedGoal,
+              transition: "paused",
+              expectedState: "paused",
+            })
+            const commandPart = pluginMarkedTextPart(message, "command")
+            const routedText = frameControlCommandText(
+              buildGoalCommandNotice(startedGoal, { heldLabel, commandName }),
+            )
+            commandPart.text = routedText
+            commandTurn.policy = "control"
+            commandTurn.textDigest = createHash("sha256").update(routedText).digest("hex")
+          }
         }
         runtime.activeCommandTurns.set(sessionID, {
           ...commandTurn,
@@ -5481,6 +5672,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       registerSessionGoal(goal)
       focusGoal(sessionID, goal)
       await persist(sessionID)
+      // The agent is often unknown here: OpenCode runs command.execute.before
+      // before any chat hook for the turn and its Session record carries no
+      // agent. Remember which goal this command started so chat.message, which
+      // does receive the agent, can still hold it (see that hook).
+      const creationCommandTurn = currentRuntime().commandOutputs.get(output)
+      if (creationCommandTurn && !creationRestrictedAgent) {
+        creationCommandTurn.startedGoal = { goalId: goal.goalId, runId: goal.runId }
+      }
       const heldLabel = creationRestrictedAgent
         ? isPlanAgent(creationRestrictedAgent)
           ? "Plan"
@@ -5499,47 +5698,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           expectedState: heldLabel ? "paused" : "active",
         },
       )
-      replaceCommandOutputText(
-        output,
-        [
-          ...(replacedGoal
-            ? [
-                `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
-                `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
-                "",
-              ]
-            : []),
-          heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
-          goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
-          goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
-          goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
-          "",
-          // A held goal must not be told to start working. Command text reaches
-          // the model as a normal turn on current OpenCode builds, so this line
-          // would be the escape the plan guard exists to prevent.
-          ...(heldLabel
-            ? [
-                `The ${heldLabel} agent is planning-only, so this goal is not running.`,
-                "Do not begin work on it now. Continue planning only.",
-                `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
-              ]
-            : [
-                "Start working toward this goal now.",
-                "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
-                "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
-              ]),
-          `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
-          "",
-          `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
-            goal.options.maxDurationMs / 1000,
-          )}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
-        ]
-          .filter((line) => line !== null)
-          .join("\n"),
+      replaceCommandOutputText(output, buildGoalCommandNotice(goal, { heldLabel, replacedGoal, commandName }), {
+        preserveFiles: true,
         // A held goal is a control turn, not a work turn: `startsWork: false`
         // routes it through the read-only command framing.
-        { preserveFiles: true, startsWork: !heldLabel },
-      )
+        startsWork: !heldLabel,
+      })
     },
 
     event: async ({ event }) => {
@@ -6896,6 +7060,7 @@ export const testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildCompletedSessionTitle,
   formatCompactDuration,
   formatCompactTokens,
   goalStatusIcon,
@@ -6921,5 +7086,6 @@ export const testInternals = {
   resolveStateFilePath,
   runtimeSessionDiagnostics,
   stopReason,
+  costCapFor,
   xdgStateFilePath,
 }
