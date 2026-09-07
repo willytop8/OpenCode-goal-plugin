@@ -73,6 +73,9 @@ const DEFAULT_OPTIONS = {
   maxTurns: 10,
   maxDurationMs: 15 * 60 * 1000,
   maxTokens: 200000,
+  // Cumulative OpenCode-reported API cost, in US dollars, before the goal
+  // pauses. 0 disables the cap; enforcement depends on provider cost metadata.
+  maxCostUsd: 0,
   minDelayMs: 1500,
   maxRecentMessages: 50,
   noProgressTokenThreshold: 50,
@@ -228,6 +231,8 @@ const GOAL_FLAG_SPECS = {
   // Inline budget shorthand for the context-token limit. Accepts a plain
   // integer or a k/m suffix (e.g. --budget 100k == --max-tokens 100000).
   "--budget": { type: "tokens", optionKey: "maxTokens" },
+  // Per-goal cost cap in US dollars (e.g. --max-cost 5 or --max-cost 2.50).
+  "--max-cost": { type: "usd", optionKey: "maxCostUsd" },
   "--success": { type: "string", target: "meta", metaKey: "successCriteria" },
   "--success-criteria": { type: "string", target: "meta", metaKey: "successCriteria" },
   "--constraints": { type: "string", target: "meta", metaKey: "constraints" },
@@ -336,7 +341,9 @@ function buildGoalCommandNotice(goal, { heldLabel = "", replacedGoal = null, com
     "",
     `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
       goal.options.maxDurationMs / 1000,
-    )}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
+    )}s, ${goal.options.maxTokens.toLocaleString()} context tokens${
+      goal.options.maxCostUsd > 0 ? `, $${goal.options.maxCostUsd.toFixed(2)} cost` : ""
+    }.`,
   ]
     .filter((line) => line !== null)
     .join("\n")
@@ -868,6 +875,11 @@ function formatStatus(
     `Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`,
     `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
     formatUsage(goal.usage),
+    ...(costCapFor(goal)
+      ? [
+          `Cost budget: ${costCapFor(goal).known ? `$${costCapFor(goal).spent.toFixed(4)}` : "unknown"}/$${costCapFor(goal).limit.toFixed(2)}`,
+        ]
+      : []),
     `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`,
     `Last progress: ${lastProgress}`,
     `No-progress turns: ${goal.noProgressTurns}`,
@@ -932,7 +944,24 @@ function stopReason(goal) {
     return `max duration reached (${Math.round(goal.options.maxDurationMs / 1000)}s)`
   }
   if (goal.totalTokens >= goal.options.maxTokens) return `max context tokens reached (${goal.options.maxTokens.toLocaleString()})`
+  const costCap = costCapFor(goal)
+  if (costCap && costCap.reached) return `max cost reached ($${costCap.limit.toFixed(2)})`
   return null
+}
+
+// Cost cap state, or null when the cap is disabled. The cap can only be
+// enforced when the provider reports cost; an unknown cost never trips it.
+function costCapFor(goal) {
+  const limit = Number(goal?.options?.maxCostUsd)
+  if (!Number.isFinite(limit) || limit <= 0) return null
+  const usage = normalizeUsage(goal.usage)
+  return {
+    limit,
+    spent: usage.cost,
+    known: usage.costKnown,
+    remaining: Math.max(0, limit - usage.cost),
+    reached: usage.costKnown && usage.cost >= limit,
+  }
 }
 
 function sessionGoalMap(sessionID) {
@@ -1315,6 +1344,10 @@ function normalizeOptions(options = {}) {
     maxTurns: toPositiveInteger(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
+    maxCostUsd:
+      Number.isFinite(Number(options.maxCostUsd)) && Number(options.maxCostUsd) > 0
+        ? Number(options.maxCostUsd)
+        : DEFAULT_OPTIONS.maxCostUsd,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
     maxRecentMessages: toPositiveInteger(
       options.maxRecentMessages,
@@ -2348,6 +2381,16 @@ function parseGoalArguments(args, defaults) {
         continue
       }
 
+      if (flagSpec.type === "usd") {
+        const cost = /^\$?\d+(?:\.\d+)?$/.test(rawValue.trim()) ? Number(rawValue.trim().replace(/^\$/, "")) : NaN
+        if (!Number.isFinite(cost) || cost <= 0) {
+          errors.push(`Invalid cost budget for ${flagName}: ${value} (use a positive number of US dollars)`)
+          continue
+        }
+        options[flagSpec.optionKey] = cost
+        continue
+      }
+
       if (flagSpec.type === "string") {
         const text = rawValue.trim()
         if (!text) {
@@ -2428,6 +2471,10 @@ function buildLimitWarning(goal) {
   }
   if (remainingTokens <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingTokens).toLocaleString()} context token(s) remaining`)
+  }
+  const costCap = costCapFor(goal)
+  if (costCap?.known && costCap.remaining <= costCap.limit * 0.1) {
+    warnings.push(`$${costCap.remaining.toFixed(2)} of the $${costCap.limit.toFixed(2)} cost budget remaining`)
   }
 
   return warnings.length ? ` Limits are near: ${warnings.join(", ")}.` : ""
@@ -2522,6 +2569,9 @@ function buildContinueMessage(
     "<progress_budget>",
     `turns_remaining: ${remainingTurns}`,
     `tokens_remaining: ${remainingTokens}`,
+    ...(costCapFor(goal)
+      ? [`cost_remaining_usd: ${costCapFor(goal).known ? costCapFor(goal).remaining.toFixed(2) : "unknown"}`]
+      : []),
     `elapsed_seconds: ${elapsedSeconds}`,
     "</progress_budget>",
   ]
@@ -2613,7 +2663,9 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.${
+      costCapFor(goal) ? ` Cost: ${costCapFor(goal).known ? `$${costCapFor(goal).spent.toFixed(2)}` : "unknown"}/$${costCapFor(goal).limit.toFixed(2)}.` : ""
+    }`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
@@ -3261,6 +3313,8 @@ function buildAgentToolHandlers({
       return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
     if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
       return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
+    if (Number.isFinite(args.maxCostUsd) && args.maxCostUsd <= 0)
+      return `Invalid maxCostUsd: ${args.maxCostUsd} — must be a positive number of US dollars.`
     if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
       return `Invalid mode: ${args.mode} (expected ${[...GOAL_MODES].join(" or ")}).`
     const options = normalizeOptions({
@@ -3268,6 +3322,7 @@ function buildAgentToolHandlers({
       ...(Number.isFinite(args.maxTurns) ? { maxTurns: args.maxTurns } : {}),
       ...(Number.isFinite(args.maxTokens) ? { maxTokens: args.maxTokens } : {}),
       ...(Number.isFinite(args.maxDurationMs) ? { maxDurationMs: args.maxDurationMs } : {}),
+      ...(Number.isFinite(args.maxCostUsd) ? { maxCostUsd: args.maxCostUsd } : {}),
     })
     const meta = {
       successCriteria: typeof args.successCriteria === "string" ? args.successCriteria : "",
@@ -3799,6 +3854,7 @@ function buildAgentTools(
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
+        maxCostUsd: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
         mode: schema.string().optional(),
@@ -3861,6 +3917,7 @@ function buildAgentTools(
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
+        maxCostUsd: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
         mode: schema.string().optional(),
@@ -6992,5 +7049,6 @@ export const testInternals = {
   resolveStateFilePath,
   runtimeSessionDiagnostics,
   stopReason,
+  costCapFor,
   xdgStateFilePath,
 }

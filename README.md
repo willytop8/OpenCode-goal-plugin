@@ -86,7 +86,7 @@ Set a goal:
 Override limits for a single goal:
 
 ```
-/goal fix the failing tests --max-turns 20 --max-minutes 30 --max-tokens 400000
+/goal fix the failing tests --max-turns 20 --max-minutes 30 --max-tokens 400000 --max-cost 5
 ```
 
 Add success criteria, constraints / non-goals, and a mode:
@@ -239,6 +239,7 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 | Auto-continue turns | 10 |
 | Max duration | 15 minutes |
 | Context tokens | 200,000 |
+| API cost (USD) | off — set `maxCostUsd` or `--max-cost` |
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens on a stalled turn (after a 2-turn grace window) |
 | Budget wrap-up threshold | 80% of context token budget |
@@ -247,6 +248,8 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 **Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. The default 10 auto-continues is normally the binding brake before the 15-minute window; raise `--max-turns` and/or `--max-minutes` deliberately for longer work.
 
 **Token budget.** The plugin tracks the session's context window size (`input + output + reasoning` tokens on the latest message). This matches the token count that OpenCode displays, so the numbers should be consistent. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops. In high-context sessions (large codebases, long conversation history), the context can grow quickly — treat the budget as a safety brake.
+
+**Cost budget.** `maxCostUsd` (or `--max-cost 5` per goal) pauses the goal once the cumulative cost OpenCode reports for the session's assistant messages reaches the cap, with the same wrap-up prompt as the other limits; `/goal status` shows `Cost budget: $spent/$cap` and the continuation prompt carries `cost_remaining_usd`. Enforcement depends on the provider reporting cost — an unknown cost never trips the cap — and one response may overshoot it. `/goal resume` opens a fresh budget window.
 
 **No-progress heuristic.** A low-output turn does not pause immediately anymore. The plugin pauses only after `noProgressTurnsBeforePause` consecutive *stalled* low-output turns — repeated turns with very little output and no meaningful change in the latest assistant checkpoint.
 
@@ -336,6 +339,7 @@ Pass options when registering the plugin to change the defaults for all goals. T
 
 Additional plugin-level options:
 
+- `maxCostUsd` — cumulative OpenCode-reported API cost, in US dollars, before a goal pauses (default `0`, disabled). See the cost budget note under [Safety limits](#safety-limits).
 - `maxRecentMessages` — how many recent session messages to scan when looking for the latest assistant turn before auto-continuing. Higher values make long, tool-heavy sessions less likely to lose the most recent assistant response.
 - `noProgressTurnsBeforePause` — grace window for low-output stalls. The plugin pauses only after this many consecutive stalled low-output turns rather than on the first one.
 - `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`; set the plugin option to `0` for legitimate tool-free writing/research workflows.

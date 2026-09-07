@@ -134,6 +134,17 @@ export interface GoalPluginOptions {
   maxTokens?: number
 
   /**
+   * Maximum cumulative API cost, in US dollars, a goal may incur before it is
+   * paused for exceeding limits. Uses the cost OpenCode reports on assistant
+   * messages, so enforcement depends on provider cost metadata and one
+   * response may overshoot the cap; an unknown cost never trips it.
+   * `/goal resume` opens a fresh budget window. Overridable per-goal with
+   * `--max-cost`. `0` disables the cap.
+   * @default 0
+   */
+  maxCostUsd?: number
+
+  /**
    * Minimum delay, in milliseconds, enforced between consecutive
    * auto-continue prompts. Overridable per-goal with `--cooldown-ms`.
    * @default 1500

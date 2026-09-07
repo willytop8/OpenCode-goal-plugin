@@ -66,6 +66,7 @@ const {
   sessionPathsFor,
   setLedgerSink,
   stopReason,
+  costCapFor,
   totalTokensForMessage,
   userInterventionDetected,
   xdgStateFilePath,
@@ -10347,4 +10348,74 @@ test("fenced code spans in the objective are literal text, not goal flags", () =
   // Without a fence the old behavior is unchanged.
   const plain = parseGoalArguments("run pytest --maxfail=1", normalizeOptions())
   assert.deepEqual(plain.errors, ["Unsupported flag: --maxfail"])
+})
+
+test("--max-cost sets a per-goal cost cap and rejects non-positive or malformed values", () => {
+  const parsed = parseGoalArguments("ship it --max-cost 2.5", normalizeOptions())
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.options.maxCostUsd, 2.5)
+  assert.equal(parseGoalArguments("ship it --max-cost=$5", normalizeOptions()).options.maxCostUsd, 5)
+  for (const bad of ["0", "-1", "abc", "1e3"]) {
+    const rejected = parseGoalArguments(`ship it --max-cost ${bad}`, normalizeOptions())
+    assert.ok(rejected.errors.some((error) => error.startsWith("Invalid cost budget for --max-cost")), bad)
+  }
+  assert.equal(normalizeOptions().maxCostUsd, 0)
+  assert.equal(normalizeOptions({ maxCostUsd: -1 }).maxCostUsd, 0)
+  assert.equal(normalizeOptions({ maxCostUsd: "3" }).maxCostUsd, 3)
+})
+
+test("stopReason and costCapFor enforce the cost cap only when the provider reports cost", () => {
+  const base = { turnCount: 0, totalTokens: 0, startedAt: Date.now(), options: normalizeOptions({ maxCostUsd: 1 }) }
+  assert.equal(costCapFor({ ...base, options: normalizeOptions() }), null)
+  assert.equal(stopReason({ ...base, usage: { cost: 1.2, costKnown: true } }), "max cost reached ($1.00)")
+  assert.equal(stopReason({ ...base, usage: { cost: 0.4, costKnown: true } }), null)
+  assert.equal(stopReason({ ...base, usage: { cost: 0, costKnown: false } }), null)
+  const nearCap = costCapFor({ ...base, usage: { cost: 0.95, costKnown: true } })
+  assert.deepEqual({ ...nearCap, remaining: Number(nearCap.remaining.toFixed(6)) }, {
+    limit: 1,
+    spent: 0.95,
+    known: true,
+    remaining: 0.05,
+    reached: false,
+  })
+  assert.match(buildLimitWarning({ ...base, usage: { cost: 0.95, costKnown: true } }), /\$0\.05 of the \$1\.00 cost budget remaining/)
+})
+
+test("cost cap requests a final handoff and pauses the goal", async () => {
+  const sessionID = "session-cost"
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1, maxCostUsd: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "assistant-costly",
+          role: "assistant",
+          sessionID,
+          tokens: { input: 10, output: 5, reasoning: 0 },
+          cost: 1.5,
+        },
+      },
+    },
+  })
+  const goal = currentGoal(sessionID)
+  assert.match(formatStatus(goal, "goal"), /Cost budget: \$1\.5000\/\$1\.00/)
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].body.parts[0].text, /<budget_wrapup>/)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "max cost reached ($1.00)")
+})
+
+test("agent set_goal accepts and validates maxCostUsd", async () => {
+  const { handlers } = makeAgentHandlers()
+  assert.match(await handlers.setGoal("agent-cost-bad", { objective: "ship it", maxCostUsd: -2 }), /Invalid maxCostUsd/)
+  await handlers.setGoal("agent-cost", { objective: "ship it", maxCostUsd: 2 })
+  assert.equal(currentGoal("agent-cost").options.maxCostUsd, 2)
 })
