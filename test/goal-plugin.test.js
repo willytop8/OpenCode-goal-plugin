@@ -38,6 +38,7 @@ const {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildCompletedSessionTitle,
   formatCompactDuration,
   formatCompactTokens,
   goalStatusIcon,
@@ -9878,7 +9879,7 @@ async function createTitleHooks(overrides = {}) {
   const client = {
     app: { log: async () => {} },
     session: {
-      messages: async () => ({ data: [message("still working")] }),
+      messages: overrides.messages || (async () => ({ data: [message("still working")] })),
       promptAsync: async () => ({}),
       abort: async () => ({}),
       get: overrides.get || (async () => ({ data: { title: "my original title" } })),
@@ -9945,6 +9946,14 @@ test("buildSessionTitle renders a compact one-line status", () => {
   const title = buildSessionTitle({ ...goal, condition: "x".repeat(200) }, now)
   assert.ok(title.includes("…"), "a long objective must be truncated")
   assert.ok(title.length < 100, `title should stay compact, got ${title.length}`)
+})
+
+test("buildCompletedSessionTitle renders the terminal state without limit halves", () => {
+  const now = Date.now()
+  const result = { condition: "ship the release", turnCount: 3, totalTokens: 45_000, startedAt: now - 120_000, finishedAt: now }
+  assert.equal(buildCompletedSessionTitle(result), "✅ ship the release · 3 turns · 2m · 45k")
+  assert.equal(buildCompletedSessionTitle({ ...result, turnCount: 1 }), "✅ ship the release · 1 turn · 2m · 45k")
+  assert.equal(looksLikePluginSessionTitle(buildCompletedSessionTitle(result)), true)
 })
 
 test("looksLikePluginSessionTitle recognizes titles this plugin wrote", () => {
@@ -10270,3 +10279,46 @@ test("a completion marker on the held Plan turn does not complete the goal", asy
   assert.equal(calls.length, 0)
 })
 
+
+test("sessionTitleStatus shows a completed goal instead of a stale running line", async () => {
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({ data: [message("[goal:evidence] ran the suite\n[goal:complete]")] }),
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.match(updates.at(-1).body.title, /^▶ ship it · 0\/\d+ · /)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.ok(!currentGoal("session-1"), "the goal must have completed and been archived")
+  assert.match(updates.at(-1).body.title, /^✅ ship it · 0 turns · \d+s · \d+$/)
+
+  // A later read-only command re-renders the same line and skips the API call.
+  const renders = updates.length
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "status" },
+    { parts: [] },
+  )
+  assert.equal(updates.length, renders)
+  assert.match(updates.at(-1).body.title, /^✅ ship it/)
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "clear" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.title, "my original title")
+})
+
+test("sessionTitleStatus never writes a completion line for a session this process did not title", async () => {
+  // Restart: the archived result is visible but no title was applied by this process.
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({ data: [message("[goal:evidence] ran the suite\n[goal:complete]")] }),
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-untitled", status: { type: "idle" } } },
+  })
+  assert.equal(updates.length, 0)
+})

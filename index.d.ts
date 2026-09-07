@@ -317,8 +317,9 @@ export interface GoalPluginOptions {
    * giving unattended runs a continuous heartbeat without a TUI plugin.
    *
    * The session's original title is captured before the first overwrite and
-   * restored by `/goal clear`. Title updates are cosmetic: a failure is logged
-   * at debug level and never interrupts the goal loop.
+   * restored by `/goal clear`. A completed goal renders as `✅ … · N turns · …`
+   * until then. Title updates are cosmetic: a failure is logged at debug level
+   * and never interrupts the goal loop.
    * @default false
    */
   sessionTitleStatus?: boolean

@@ -411,7 +411,7 @@ Unattended runs are easier to trust when you can see the goal is still alive. Se
 ▶ ship the release · 3/10 · 2m · 45k/200k
 ```
 
-Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on. When the goal completes, the title switches to `✅ ship the release · 3 turns · 2m · 45k` so a finished run is never mistaken for a running one; `/goal clear` restores your original title.
 
 ```json
 {

@@ -471,7 +471,7 @@ function isPlanAgent(agent) {
 // continuous heartbeat without a TUI plugin entrypoint. Opt-in, because it
 // overwrites a user-visible field.
 const SESSION_TITLE_OBJECTIVE_LIMIT = 48
-const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔"]
+const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✅"]
 
 // The title sits in a narrow column, so every field is abbreviated hard.
 function formatCompactDuration(ms) {
@@ -512,6 +512,18 @@ function buildSessionTitle(goal, now = Date.now()) {
     `${goal.turnCount}/${goal.options.maxTurns}`,
     formatCompactDuration(elapsedMs),
     `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`,
+  ].join(" · ")
+}
+
+// Title for a goal that just completed. Archived results carry the counters
+// but not the option snapshot, so the "/limit" halves are dropped.
+function buildCompletedSessionTitle(result) {
+  const turns = toNonNegativeInteger(result.turnCount)
+  return [
+    `✅ ${summarizeText(result.condition, SESSION_TITLE_OBJECTIVE_LIMIT)}`,
+    `${turns} turn${turns === 1 ? "" : "s"}`,
+    formatCompactDuration(Math.max(0, result.finishedAt - result.startedAt)),
+    formatCompactTokens(result.totalTokens),
   ].join(" · ")
 }
 
@@ -4124,8 +4136,18 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   const syncSessionTitle = async (sessionID) => {
     if (!sessionTitleStatus || !sessionID) return
     const goal = goalStates.get(sessionID)
-    if (!goal) return
-    const title = buildSessionTitle(goal)
+    let title
+    if (goal) {
+      title = buildSessionTitle(goal)
+    } else {
+      // No live goal. Completion archives the goal, so without this branch
+      // the last "running" line would stay on the session until /goal clear.
+      // Only rewrite a title this process already owns, and only for an
+      // achieved result; clear still restores the captured original.
+      const result = lastGoalResults.get(sessionID)
+      if (!currentRuntime().appliedTitles.has(sessionID) || result?.state !== "achieved") return
+      title = buildCompletedSessionTitle(result)
+    }
     if (currentRuntime().appliedTitles.get(sessionID) === title) return
     try {
       if (!currentRuntime().sessionTitles.has(sessionID)) {
@@ -6938,6 +6960,7 @@ export const testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildCompletedSessionTitle,
   formatCompactDuration,
   formatCompactTokens,
   goalStatusIcon,
