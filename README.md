@@ -47,24 +47,23 @@ Tested against real OpenCode 1.17.15 and 1.18.25 processes with live provider cr
 | 1.17.15 | opencode-go (`glm-5.2`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt | ⚠️ Not displayed |
 | 1.17.15 | deepseek (`deepseek-chat`) | ✅ | ✅ | ✅ Clean `[goal:evidence]` + `[goal:complete]` on the first attempt; also verified end-to-end via the [demo](demo/) — autonomously fixed a real bug and reported evidence-backed completion | ⚠️ Not displayed |
 | 1.18.25 | opencode (`nemotron-3.5-lightning-free`) | ✅ | ✅ Held correctly under the Plan agent (`stopped: true`, zero auto-continues) | ✅ Clean `[goal:evidence]` + `[goal:complete]` | ⚠️ Not displayed; command text routed to model |
+| 1.18.29 | deterministic localhost OpenAI-compatible fixture (no live provider) | ✅ Control turn routed; all 11 tools in every request | ✅ Idle continuation → completion; blocker paused with its reason | ✅ `[goal:evidence]` + `[goal:complete]` archived | ⚠️ Not displayed; command text routed to model |
 
 `/goal status` and auto-continue are graded on **state correctness** (verified directly against persisted state: correct limits, turn/stop accounting, completion state, and file effects), not on terminal rendering. The `deepseek-v4-flash-free` canary suite additionally covers pause/resume across processes, blocker/restart, hard-process recovery, real host compaction, and stale-history clear enforcement. See [`docs/providers.md`](docs/providers.md) for the complete lifecycle matrix and session evidence.
 
 **Note:** The table records the v0.6.6 live-provider matrix. In that release, OpenCode 1.17.15 retained the original command-parts array, so assigning a new `output.parts` array did not replace the raw command argument sent to the model. The current implementation mutates that retained array in place, making the plugin-generated command result the prompt for the turn. OpenCode custom commands still run through the model rather than rendering hook output directly, so the visible response may summarize or paraphrase the result (see [Limitations](#limitations)). Re-test against the exact OpenCode build and provider/backend stack you rely on for unattended work, and see [`docs/providers.md`](docs/providers.md) for the full historical model matrix.
 
+The 1.18.29 row comes from a deterministic-provider canary against a real `opencode serve` process, graded on persisted state. That canary also reproduced the two defects fixed in 0.10.0 (a first-command Plan goal not being held; a stale running title after completion) on 1.18.25 and 1.18.29 alike.
+
 Separately, the lifecycle-feedback implementation included in v0.7.0 passed a real OpenCode 1.18.11 host canary covering create, status, pause, resume, edit, and default lifecycle logging with a deterministic localhost provider. That canary validates host integration, not another live-provider compatibility row.
 
 ## Install
 
-```sh
-npm install opencode-goal-plugin
-```
-
-Add the plugin and command to your OpenCode config:
+OpenCode installs npm plugins itself from your config, so there is nothing to `npm install`. Add the plugin **with a pinned version** and the `goal` command to `opencode.json` (the user config at `~/.config/opencode/opencode.json`, or a project-local `opencode.json`):
 
 ```json
 {
-  "plugin": ["opencode-goal-plugin"],
+  "plugin": ["opencode-goal-plugin@0.10.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -74,6 +73,20 @@ Add the plugin and command to your OpenCode config:
   }
 }
 ```
+
+Or let the CLI add the plugin entry for you and then add the `command` block by hand:
+
+```sh
+opencode plugin opencode-goal-plugin@0.10.0 --global
+```
+
+Restart OpenCode after editing the config. The options form `["opencode-goal-plugin@0.10.0", { ... }]` (see [Options](#options)) pins the same way.
+
+### Upgrading
+
+**Pin the version.** OpenCode resolves an unpinned `"opencode-goal-plugin"` entry to `@latest` exactly once, installs it under its package cache (`~/.cache/opencode/packages/opencode-goal-plugin@latest/` by default; `opencode debug paths` prints the cache root), and never re-resolves `latest` while that directory exists. An unpinned entry therefore stays on whichever version was first installed, indefinitely, and new releases on npm are never picked up — a bug fixed months ago can still be running locally.
+
+To upgrade, bump the pin (for example to `opencode-goal-plugin@0.10.0`) and restart OpenCode; every pinned version gets its own cache directory. If you kept an unpinned entry, delete the `opencode-goal-plugin*` directories under the cache `packages/` folder and restart. `npx opencode-goal-plugin` runs the bundled verification script, which warns when the cached copy lags the package.
 
 ## Usage
 
@@ -355,6 +368,7 @@ Additional plugin-level options:
 - `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
 - `persistState` — whether to persist active goals and recent goal results to disk.
 - `stateFilePath` — root path for the persisted session-shard namespace. Overrides the default project-local path and the `OPENCODE_GOAL_STATE_PATH` env var. Useful if you want a fixed or ephemeral location. When unset, the default root is `<cwd>/.opencode/goals/state.json`; shards are written below `<stateFilePath>.sessions/` (see the persistence section above).
+- `ledgerFilePath` — override where the lifecycle ledger is written. By default each session shard keeps its ledger next to its state file as `<state.json>.ledger.jsonl`.
 - `ledgerMaxBytes` / `ledgerRetentionFiles` — bound the lifecycle ledger to 2 MiB per generation and three rotated generations by default. Set retention to `0` to discard the active ledger when it reaches the size ceiling.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
@@ -516,6 +530,8 @@ Point OpenCode at the source file directly for local testing:
 ```
 
 Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode will attempt to load plugin-like files it finds there.
+
+A `file://` entry loads the source as-is, so the checkout needs its `node_modules` (`npm ci`) for the `zod` import to resolve; copying `src/goal-plugin.js` somewhere on its own will fail to load. Use the npm package for anything but development.
 
 ### Smoke-test checklist
 

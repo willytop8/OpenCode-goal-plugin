@@ -5,6 +5,10 @@
 // as scripts/smoke-command-hook.mjs.
 
 import assert from "node:assert/strict"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { createRequire } from "node:module"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
 
 const REQUIRED_HOOKS = [
   "config",
@@ -34,12 +38,20 @@ const EXPECTED_TOOLS = [
 
 const results = []
 
+class VerificationWarning extends Error {}
+
 function check(name, fn) {
   return Promise.resolve()
     .then(fn)
     .then(() => {
       results.push({ name, ok: true })
       console.log(`  ✅ ${name}`)
+    })
+    .catch((error) => {
+      if (!(error instanceof VerificationWarning)) throw error
+      results.push({ name, ok: true, warning: error.message })
+      console.log(`  ⚠️  ${name}`)
+      console.log(`     ${error.message}`)
     })
     .catch((error) => {
       results.push({ name, ok: false, error })
@@ -164,6 +176,68 @@ await check("lifecycle transitions are visible without leaking objective text", 
   assert.ok(logCalls.every((entry) => !entry.body.message.includes("verify the installation")))
 })
 
+// OpenCode installs an unpinned plugin into its package cache once and never
+// re-resolves `latest` while that directory exists, so a user can run a stale
+// copy long after upgrading on npm. Warn (never fail) when the unpinned cache
+// entries lag the package this script came from.
+function installedPackageVersion() {
+  try {
+    let dir = dirname(createRequire(import.meta.url).resolve("opencode-goal-plugin"))
+    while (dir !== dirname(dir)) {
+      const pkg = join(dir, "package.json")
+      if (existsSync(pkg)) {
+        const json = JSON.parse(readFileSync(pkg, "utf8"))
+        if (json.name === "opencode-goal-plugin") return String(json.version || "")
+      }
+      dir = dirname(dir)
+    }
+  } catch {}
+  return ""
+}
+
+function versionBelow(a, b) {
+  const parse = (v) => String(v).split("-")[0].split(".").map((n) => Number(n) || 0)
+  const [x, y] = [parse(a), parse(b)]
+  for (let i = 0; i < 3; i += 1) {
+    if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0)
+  }
+  return false
+}
+
+await check("OpenCode's cached copy of the plugin is not older than this package", () => {
+  const packageVersion = installedPackageVersion()
+  if (!packageVersion) return
+  const cacheRoots = [
+    process.env.XDG_CACHE_HOME ? join(process.env.XDG_CACHE_HOME, "opencode") : null,
+    join(homedir(), ".cache", "opencode"),
+    process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "opencode") : null,
+  ].filter(Boolean)
+  const stale = []
+  for (const root of cacheRoots) {
+    const packages = join(root, "packages")
+    if (!existsSync(packages)) continue
+    for (const entry of readdirSync(packages)) {
+      // Only unpinned entries are affected; a pinned older version is a choice.
+      if (entry !== "opencode-goal-plugin" && entry !== "opencode-goal-plugin@latest") continue
+      const pkg = join(packages, entry, "node_modules", "opencode-goal-plugin", "package.json")
+      if (!existsSync(pkg)) continue
+      let cached = ""
+      try {
+        cached = String(JSON.parse(readFileSync(pkg, "utf8")).version || "")
+      } catch {
+        continue
+      }
+      if (cached && versionBelow(cached, packageVersion)) stale.push({ path: join(packages, entry), cached })
+    }
+  }
+  if (!stale.length) return
+  throw new VerificationWarning(
+    `OpenCode is running ${stale.map((s) => `${s.cached} from ${s.path}`).join(" and ")}, older than ${packageVersion}. ` +
+      `OpenCode never re-resolves an unpinned plugin: pin "opencode-goal-plugin@${packageVersion}" in opencode.json, ` +
+      "or delete that cache directory, then restart OpenCode.",
+  )
+})
+
 console.log()
 
 const failed = results.filter((r) => !r.ok)
@@ -172,4 +246,7 @@ if (failed.length > 0) {
   process.exit(1)
 }
 
-console.log(`All ${results.length} checks passed. opencode-goal-plugin is installed correctly.`)
+const warnings = results.filter((r) => r.warning).length
+console.log(
+  `All ${results.length} checks passed${warnings ? ` with ${warnings} warning(s)` : ""}. opencode-goal-plugin is installed correctly.`,
+)
