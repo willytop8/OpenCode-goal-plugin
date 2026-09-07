@@ -10174,3 +10174,99 @@ test("a cached execution context is preferred over refetching the session", asyn
   assert.equal(currentGoal("session-1").stopped, false, "the cached build context must win")
   assert.equal(getCalls, 0, "a known agent must not cost a session fetch")
 })
+
+async function routeFirstCommandTurn(hooks, sessionID, args, agent) {
+  const messageID = `msg-first-${sessionID}`
+  const output = { message: { id: messageID, role: "user", sessionID }, parts: [textPart(`/goal ${args}`)] }
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: args }, output)
+  const creationText = output.parts[0].text
+  output.parts = resolveRoutedParts(output.parts, sessionID, messageID)
+  await hooks["chat.message"]({ sessionID, messageID, agent }, output)
+  return { output, creationText }
+}
+
+test("a goal created by the first command of a Plan session is held once the routed turn reveals the agent", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  const sessionID = "session-plan-first"
+  const { output, creationText } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+
+  // At creation no agent was known: OpenCode's Session record carries none and
+  // no chat hook has run yet, so the goal started live.
+  assert.match(creationText, /Start working toward this goal now\./)
+
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.stopped, true, "the routed turn's agent must hold the goal")
+  assert.equal(goal.stopReason, "plan agent active")
+  assert.deepEqual(goal.history.map((entry) => entry.type), ["set", "paused"])
+
+  const text = output.parts[0].text
+  assert.match(text, /<goal_command_control>/, "the turn must be re-routed as a read-only control turn")
+  assert.match(text, /Goal recorded but held: ship it/)
+  assert.match(text, /Do not begin work on it now/)
+  assert.ok(!text.includes("Start working toward this goal now."), "the work instruction must be gone")
+
+  await assert.rejects(
+    hooks["tool.execute.before"]({ sessionID, tool: "bash" }),
+    /control command has already been handled/,
+    "tools are blocked for the held turn",
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+})
+
+test("a goal created by the first command under an executing agent stays live", async () => {
+  const sessionID = "session-build-first"
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1 },
+    messages: async () => ({
+      data: [message("still working", undefined, "msg-build-first", sessionID, `msg-first-${sessionID}`)],
+    }),
+  })
+  const { output } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "build")
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.match(output.parts[0].text, /Start working toward this goal now\./)
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+})
+
+test("allowGoalExecutionFromPlan keeps a first-command Plan goal live", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, allowGoalExecutionFromPlan: true } })
+  const sessionID = "session-plan-allowed"
+  const { output } = await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.match(output.parts[0].text, /Start working toward this goal now\./)
+})
+
+test("a completion marker on the held Plan turn does not complete the goal", async () => {
+  const sessionID = "session-plan-complete"
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1 },
+    messages: async () => ({
+      data: [
+        message("[goal:evidence] ran everything\n[goal:complete]", undefined, "msg-held-turn", sessionID, `msg-first-${sessionID}`),
+      ],
+    }),
+  })
+  await routeFirstCommandTurn(hooks, sessionID, "ship it", "plan")
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-held-turn", role: "assistant", sessionID, tokens: { input: 1, output: 20, reasoning: 0 } },
+      },
+    },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  const goal = currentGoal(sessionID)
+  assert.ok(goal, "the held goal must still be live in memory, not archived")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "plan agent active")
+  assert.equal(calls.length, 0)
+})
+

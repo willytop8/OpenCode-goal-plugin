@@ -93,6 +93,13 @@ const mutants = [
     test: "test/goal-plugin.test.js",
   },
   {
+    name: "a planning-only agent learned from the routed command turn still holds the new goal",
+    file: "src/goal-plugin.js",
+    from: "if (commandTurn.startedGoal && commandTurn.attachmentError !== true) {",
+    to: "if (false) {",
+    test: "test/goal-plugin.test.js",
+  },
+  {
     name: "completion evidence must be adjacent",
     file: "src/goal-plugin.js",
     from: "const previous = markerIndex - 1",

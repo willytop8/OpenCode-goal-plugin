@@ -303,6 +303,45 @@ function frameControlCommandText(text) {
   ].join("\n")
 }
 
+// Routed text for the turn that creates a goal. A held goal must not be told
+// to start working: command text reaches the model as a normal turn on current
+// OpenCode builds, so that line would be the escape the plan guard exists to
+// prevent.
+function buildGoalCommandNotice(goal, { heldLabel = "", replacedGoal = null, commandName = "goal" } = {}) {
+  return [
+    ...(replacedGoal
+      ? [
+          `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
+          `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
+          "",
+        ]
+      : []),
+    heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
+    goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
+    goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
+    goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
+    "",
+    ...(heldLabel
+      ? [
+          `The ${heldLabel} agent is planning-only, so this goal is not running.`,
+          "Do not begin work on it now. Continue planning only.",
+          `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
+        ]
+      : [
+          "Start working toward this goal now.",
+          "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
+          "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
+        ]),
+    `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
+    "",
+    `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
+      goal.options.maxDurationMs / 1000,
+    )}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
+  ]
+    .filter((line) => line !== null)
+    .join("\n")
+}
+
 // OpenCode retains its original command-parts array after invoking
 // command.execute.before. Reassigning output.parts therefore changes only the
 // temporary wrapper passed to the plugin, while the host still sends the raw
@@ -4929,6 +4968,36 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // mutate it in place just as command.execute.before does.
           message.parts.splice(0, message.parts.length, commandPart)
         }
+        // A goal created by the first command of a fresh session could not
+        // know the active agent at creation time (command.execute.before runs
+        // before any chat hook and the Session record carries no agent). The
+        // routed turn does carry it: re-evaluate the planning-only restriction
+        // and hold the goal before the model is told to start working.
+        if (commandTurn.startedGoal && commandTurn.attachmentError !== true) {
+          const startedGoal = goalStates.get(sessionID)
+          const startedByThisCommand =
+            Boolean(startedGoal) &&
+            !startedGoal.stopped &&
+            startedGoal.goalId === commandTurn.startedGoal.goalId &&
+            startedGoal.runId === commandTurn.startedGoal.runId
+          const lateRestrictedAgent = startedByThisCommand ? await restrictedAgentFor(sessionID) : ""
+          if (lateRestrictedAgent) {
+            const heldLabel = holdGoalForRestrictedAgent(startedGoal, lateRestrictedAgent)
+            await persist(sessionID)
+            announceLifecycle(sessionID, `Goal recorded but held while ${heldLabel} is active.`, {
+              goal: startedGoal,
+              transition: "paused",
+              expectedState: "paused",
+            })
+            const commandPart = pluginMarkedTextPart(message, "command")
+            const routedText = frameControlCommandText(
+              buildGoalCommandNotice(startedGoal, { heldLabel, commandName }),
+            )
+            commandPart.text = routedText
+            commandTurn.policy = "control"
+            commandTurn.textDigest = createHash("sha256").update(routedText).digest("hex")
+          }
+        }
         runtime.activeCommandTurns.set(sessionID, {
           ...commandTurn,
           messageID: currentMessageID,
@@ -5481,6 +5550,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       registerSessionGoal(goal)
       focusGoal(sessionID, goal)
       await persist(sessionID)
+      // The agent is often unknown here: OpenCode runs command.execute.before
+      // before any chat hook for the turn and its Session record carries no
+      // agent. Remember which goal this command started so chat.message, which
+      // does receive the agent, can still hold it (see that hook).
+      const creationCommandTurn = currentRuntime().commandOutputs.get(output)
+      if (creationCommandTurn && !creationRestrictedAgent) {
+        creationCommandTurn.startedGoal = { goalId: goal.goalId, runId: goal.runId }
+      }
       const heldLabel = creationRestrictedAgent
         ? isPlanAgent(creationRestrictedAgent)
           ? "Plan"
@@ -5499,47 +5576,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           expectedState: heldLabel ? "paused" : "active",
         },
       )
-      replaceCommandOutputText(
-        output,
-        [
-          ...(replacedGoal
-            ? [
-                `⚠️ Replacing active goal: "${replacedGoal.condition}"`,
-                `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
-                "",
-              ]
-            : []),
-          heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
-          goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
-          goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
-          goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
-          "",
-          // A held goal must not be told to start working. Command text reaches
-          // the model as a normal turn on current OpenCode builds, so this line
-          // would be the escape the plan guard exists to prevent.
-          ...(heldLabel
-            ? [
-                `The ${heldLabel} agent is planning-only, so this goal is not running.`,
-                "Do not begin work on it now. Continue planning only.",
-                `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
-              ]
-            : [
-                "Start working toward this goal now.",
-                "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
-                "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
-              ]),
-          `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
-          "",
-          `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
-            goal.options.maxDurationMs / 1000,
-          )}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
-        ]
-          .filter((line) => line !== null)
-          .join("\n"),
+      replaceCommandOutputText(output, buildGoalCommandNotice(goal, { heldLabel, replacedGoal, commandName }), {
+        preserveFiles: true,
         // A held goal is a control turn, not a work turn: `startsWork: false`
         // routes it through the read-only command framing.
-        { preserveFiles: true, startsWork: !heldLabel },
-      )
+        startsWork: !heldLabel,
+      })
     },
 
     event: async ({ event }) => {
