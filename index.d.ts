@@ -319,6 +319,18 @@ export interface GoalPluginOptions {
    */
   registerTools?: boolean
 
+  /**
+   * How much control the agent-facing tools have over goals. `"full"` (the
+   * default) lets `goal_set`/`set_goal` replace an active goal, `update_goal`
+   * rewrite the objective, and `clear_goal` discard goals. `"status"` keeps
+   * agents to reporting: they may complete, block, pause, or resume a goal
+   * and create one when none is live, but only the user, through the slash
+   * command, can replace, edit, or clear a goal. Refusals are returned as tool
+   * results (an `agent_authority` failure envelope for `goal_set`).
+   * @default "full"
+   */
+  agentGoalAuthority?: "full" | "status"
+
   /** Register collision-safe native `goal` and `goal-verify` agents through OpenCode's config hook. */
   registerAgents?: boolean
 

@@ -10419,3 +10419,44 @@ test("agent set_goal accepts and validates maxCostUsd", async () => {
   await handlers.setGoal("agent-cost", { objective: "ship it", maxCostUsd: 2 })
   assert.equal(currentGoal("agent-cost").options.maxCostUsd, 2)
 })
+
+test("agentGoalAuthority: status keeps agent tools to reporting", async () => {
+  const { handlers } = makeAgentHandlers({ agentGoalAuthority: "status" })
+  const sid = "agent-authority"
+  // Creating a goal when none is live is allowed.
+  assert.match(await handlers.setGoal(sid, { objective: "ship it" }), /New active goal: ship it/)
+  // Replacing, editing, and clearing are not.
+  assert.match(await handlers.setGoal(sid, { objective: "do something else" }), /Agents cannot replace the active goal/)
+  assert.equal(currentGoal(sid).condition, "ship it")
+  assert.match(await handlers.updateGoal(sid, { objective: "rewritten" }), /Agents cannot change the goal objective/)
+  assert.equal(currentGoal(sid).condition, "ship it")
+  assert.match(await handlers.clearGoal(sid), /Agents cannot clear the goal/)
+  assert.ok(currentGoal(sid))
+  // Status reporting still works.
+  assert.match(await handlers.updateGoal(sid, { status: "paused" }), /paused/i)
+  assert.equal(currentGoal(sid).stopped, true)
+  assert.match(await handlers.updateGoal(sid, { status: "resumed" }), /resumed/i)
+  assert.equal(currentGoal(sid).stopped, false)
+})
+
+test("agentGoalAuthority defaults to full, preserving replacement", async () => {
+  const { handlers } = makeAgentHandlers()
+  const sid = "agent-authority-full"
+  await handlers.setGoal(sid, { objective: "first" })
+  assert.match(await handlers.setGoal(sid, { objective: "second" }), /New active goal: second/)
+  assert.equal(currentGoal(sid).condition, "second")
+  assert.match(await handlers.updateGoal(sid, { objective: "third" }), /Objective updated: third/)
+})
+
+test("canonical goal_set returns an agent_authority failure envelope under status authority", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, agentGoalAuthority: "status" } })
+  const sessionID = "canonical-authority"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+  const result = JSON.parse(await hooks.tool.goal_set.execute({ objective: "replace it" }, { sessionID }))
+  assert.equal(result.ok, false)
+  assert.equal(result.error, "agent_authority")
+  assert.equal(currentGoal(sessionID).condition, "ship it")
+})

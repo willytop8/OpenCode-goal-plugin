@@ -3258,7 +3258,32 @@ function buildAgentToolHandlers({
   auditMessagesEnabled = false,
   announceLifecycle = () => {},
   commandName = "goal",
+  agentGoalAuthority = "full",
 }) {
+  // "status" authority: agents may report on a goal (complete, block, pause,
+  // resume) and create one when none is live, but only the user, through the
+  // slash command, may replace, edit, or clear a goal. Returns the refusal
+  // text, or null when the action is allowed.
+  function agentLockMessage(sessionID, action) {
+    if (agentGoalAuthority !== "status") return null
+    if (action === "replace" && !goalStates.has(sessionID) && listSessionGoals(sessionID).length === 0) {
+      return null
+    }
+    const verb =
+      action === "replace"
+        ? "replace the active goal"
+        : action === "edit"
+          ? "change the goal objective"
+          : "clear the goal"
+    const hint =
+      action === "replace"
+        ? `/${commandName} <objective>, /${commandName} add <objective>, or /${commandName} edit <objective>`
+        : action === "edit"
+          ? `/${commandName} edit <objective>`
+          : `/${commandName} clear`
+    return `Agents cannot ${verb} in this session (agentGoalAuthority: "status"). Ask the user to run ${hint}.`
+  }
+
   // Use persistTerminalState (which logs on failure) for terminal operations when
   // available; fall back to plain persist for callers that don't wire it up (e.g.
   // tests using buildAgentToolHandlers directly).
@@ -3298,6 +3323,8 @@ function buildAgentToolHandlers({
   async function setGoal(sessionID, args = {}) {
     const objective = typeof args.objective === "string" ? args.objective.trim() : ""
     if (!objective) return "No objective provided. Pass a non-empty `objective`."
+    const replaceLock = agentLockMessage(sessionID, "replace")
+    if (replaceLock) return replaceLock
     if (objective.length > MAX_GOAL_OBJECTIVE_LENGTH)
       return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
     for (const [field, value] of [["successCriteria", args.successCriteria], ["constraints", args.constraints]]) {
@@ -3360,6 +3387,10 @@ function buildAgentToolHandlers({
   async function updateGoal(sessionID, args = {}) {
     let goal = goalStates.get(sessionID)
     if (!goal) return "No active goal to update. Use set_goal first."
+    if (typeof args.objective === "string" && args.objective.trim()) {
+      const editLock = agentLockMessage(sessionID, "edit")
+      if (editLock) return editLock
+    }
 
     // Reject the combination of an objective update with status='complete': the
     // completion would be archived under a condition that was never executed,
@@ -3665,6 +3696,8 @@ function buildAgentToolHandlers({
   }
 
   async function clearGoal(sessionID) {
+    const clearLock = agentLockMessage(sessionID, "clear")
+    if (clearLock) return clearLock
     // Mirror `/goal clear`: drop the ordered flag, ALL backgrounded goals, and the
     // focused goal + result. Without sessionGoals.delete, background goals added via
     // `/goal add` survive clear and resurrect as the focused goal on restart.
@@ -3698,7 +3731,7 @@ function buildAgentToolHandlers({
       : "Goal cleared."
   }
 
-  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal }
+  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, agentLockMessage }
 }
 
 function agentToolSessionID(ctx) {
@@ -3808,6 +3841,8 @@ function buildAgentTools(
       if (typeof args.objective !== "string" || !args.objective.trim()) {
         return goalToolFailure("invalid_objective", "No objective provided. Pass a non-empty objective.")
       }
+      const locked = handlers.agentLockMessage?.(sessionID, "replace")
+      if (locked) return goalToolFailure("agent_authority", locked)
       return goalToolSuccess(await handlers.setGoal(sessionID, args))
     },
     update: async (sessionID, args) => {
@@ -4185,6 +4220,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   })
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions)
   const restrictedAgents = normalizeRestrictedAgents(pluginOptions.restrictedAgents)
+  const agentGoalAuthority = pluginOptions.agentGoalAuthority === "status" ? "status" : "full"
   // Opt-out for deployments that deliberately drive execution from a planning
   // agent. Defaults to false: unattended work must not escape Plan mode.
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
@@ -4580,6 +4616,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     auditMessagesEnabled,
     announceLifecycle,
     commandName,
+    agentGoalAuthority,
   })
 
   const abortAcceptedContinuation = async (sessionID) => {
