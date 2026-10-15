@@ -97,8 +97,17 @@ try {
   } else {
   assert.ok(verifier, JSON.stringify(observed))
   assert.ok(!verifier.tools.includes("goal_complete"))
-  const retained = await client.session.get({ sessionID: verifier.sessionID }); assert.equal((retained.data || retained).title, "goal completion audit")
-  results.push({ completion: "approved by owned verifier", verifierAgent: verifier.agent, childCleanup: "host plugin API has no remove operation; child retained", verifierTools: verifier.tools })
+  // OpenCode 2.0.26 added session.remove to the plugin API, so the verifier
+  // child is deleted after the verdict; earlier hosts retain it.
+  let childCleanup
+  try {
+    const retained = await client.session.get({ sessionID: verifier.sessionID }); assert.equal((retained.data || retained).title, "goal completion audit")
+    childCleanup = "host plugin API has no remove operation; child retained"
+  } catch (error) {
+    if (error?._tag !== "SessionNotFoundError") throw error
+    childCleanup = "verifier child removed after verdict"
+  }
+  results.push({ completion: "approved by owned verifier", verifierAgent: verifier.agent, childCleanup, verifierTools: verifier.tools })
   const live = await client.session.create({ location, agent: "build" })
   await client.session.command({ sessionID: live.id, name: "goal", text: "reload preserved objective" })
   await client.session.wait({ sessionID: live.id })

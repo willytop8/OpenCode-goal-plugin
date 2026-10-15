@@ -4179,6 +4179,10 @@ function createChildSessionAuditor(
         const messages = await sessionApi.messages(childID, { limit: 10 })
         verdictText = getText(findLatestAssistantMessage(messages)?.parts)
       }
+      if (!verdictText && response?.error) {
+        // Report why the auditor could not run instead of a missing verdict.
+        return operationalFailure(`auditor prompt failed: ${response.error.message || response.error}`)
+      }
       return parseAuditVerdict(verdictText)
     }
 

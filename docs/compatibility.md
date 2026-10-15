@@ -120,6 +120,8 @@ Independent macOS acceptance against 2.0.16 uses a local deterministic provider:
 
 The plugin context on 2.0.16 does not expose session removal, so its audit children remain retained by the host. If a host exposes `session.remove`, the adapter maps it to the core's cleanup contract. Claims about child deletion are limited to that conditional adapter test.
 
+On 2.0.26 the same acceptance script passes in both modes. That host exposes `session.remove`, so the verifier child is deleted after its verdict. It also appends its own `browser` deny rule to every agent; the verifier ownership check accepts host-added deny rules (which can only narrow access) but still rejects any changed, missing, reordered or widening rule.
+
 ### Hook mapping
 
 The isolated live acceptance command requires a pinned host runtime installed outside your real OpenCode config:

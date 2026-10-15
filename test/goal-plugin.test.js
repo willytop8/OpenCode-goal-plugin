@@ -7792,6 +7792,26 @@ test("createChildSessionAuditor parses verdicts and fails closed without the API
   assert.match(noApi.reason, /API unavailable.*rejected by default/)
 })
 
+test("createChildSessionAuditor reports a failed prompt instead of a missing verdict", async () => {
+  const context = { goal: { condition: "x" }, sessionID: "s", latestText: "done" }
+  const failing = (messages) => ({
+    session: {
+      create: async () => ({ id: "child-1", parentID: "s" }),
+      prompt: async () => ({ error: { name: "Error", message: "verifier ownership was not confirmed" } }),
+      messages: async () => messages,
+    },
+  })
+  const failed = await createChildSessionAuditor(failing([]))(context)
+  assert.equal(failed.approved, false)
+  assert.match(failed.reason, /auditor prompt failed: verifier ownership was not confirmed; rejected by default/)
+
+  // A verdict that still reached the transcript wins over the prompt error.
+  const recovered = await createChildSessionAuditor(failing([
+    { info: { role: "assistant" }, parts: [textPart("verified\n[audit:approved]")] },
+  ]))(context)
+  assert.deepEqual(recovered, { approved: true, reason: "" })
+})
+
 test("createChildSessionAuditor requires an explicit policy to approve operational failures", async () => {
   const context = { goal: { condition: "x" }, sessionID: "s", latestText: "done" }
   const noApi = await createChildSessionAuditor({}, { failurePolicy: "approve" })(context)

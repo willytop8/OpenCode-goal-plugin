@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix completion audits always failing on OpenCode 2.0.26. That host appends a `browser` deny rule to every agent, and the verifier ownership check compared permissions by exact JSON, so it rejected the plugin's own `goal-verify` agent and every completion was rejected. The check now accepts extra host-added deny rules, which only narrow access, and still rejects any changed, missing, reordered, allow or ask rule. Verified against live 2.0.16 and 2.0.26 hosts, including the foreign-verifier rejection mode.
+- When the auditor's prompt fails and no verdict reached the transcript, report `auditor prompt failed: <reason>` instead of the misleading "no single clear final-line verdict".
+
 ## 0.11.0 — 2026-09-30
 
 - Normalize directory separators with a linear scan, preventing adversarial location strings from causing regular-expression backtracking.

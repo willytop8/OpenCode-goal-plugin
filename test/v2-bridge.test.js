@@ -552,6 +552,36 @@ test("failed required agent switches never submit a prompt", async () => {
   assert.equal(calls.length, 0)
 })
 
+test("V2 verifier ownership tolerates host-added deny rules but nothing that widens access", async () => {
+  const { ctx, calls } = fakeClientHost()
+  const owned = translateV1Agent("goal-verify", applyNativeGoalConfig({}).agent["goal-verify"])
+  let actual
+  ctx.agent = { get: async () => actual }
+  const client = createV2Client(ctx, createHostState(), { completionAudit: true }).session
+  const input = { sessionID: "child", agent: "goal-verify", parts: [{ type: "text", text: "audit" }] }
+  const hostDeny = { action: "browser", resource: "*", effect: "deny" }
+  const [first, ...rest] = owned.permissions
+
+  // OpenCode 2.0.26 appends a `browser` deny to every agent.
+  for (const permissions of [[...owned.permissions, hostDeny], [first, hostDeny, ...rest]]) {
+    actual = { ...owned, permissions }
+    assert.equal((await client.prompt(input)).error, undefined, JSON.stringify(permissions.at(-1)))
+  }
+  const accepted = calls.filter(call => call.name === "prompt").length
+  assert.equal(accepted, 2)
+
+  for (const permissions of [
+    [...owned.permissions, { action: "browser", resource: "*", effect: "allow" }],
+    [...owned.permissions, { action: "edit", resource: "*", effect: "ask" }],
+    owned.permissions.slice(1),
+    [...rest, first],
+  ]) {
+    actual = { ...owned, permissions }
+    assert.match((await client.prompt(input)).error.message, /ownership or permissions/)
+  }
+  assert.equal(calls.filter(call => call.name === "prompt").length, accepted)
+})
+
 test("V2 verifier ownership is checked before each prompt, including permission changes", async () => {
   const { ctx, calls } = fakeClientHost()
   const native = applyNativeGoalConfig({}).agent["goal-verify"]

@@ -416,13 +416,29 @@ export function toV1Event(event, host = createHostState()) {
  * V2 session client
  * ------------------------------------------------------------------ */
 
+// The host may add its own rules to every agent (OpenCode 2.0.26 appends a
+// `browser` deny). Accept the owned rules in order with extra rules mixed in
+// only when every extra rule is a deny: a deny can never widen access under
+// either first- or last-match evaluation, while any extra allow or ask can.
+function permissionsOnlyNarrow(actual, expected) {
+  if (!Array.isArray(actual) || !Array.isArray(expected)) return false
+  const same = (a, b) =>
+    isPlainObject(a) && a.action === b.action && a.resource === b.resource && a.effect === b.effect
+  let next = 0
+  for (const rule of actual) {
+    if (next < expected.length && same(rule, expected[next])) next += 1
+    else if (rule?.effect !== "deny") return false
+  }
+  return next === expected.length
+}
+
 async function assertVerifierOwnership(ctx, name) {
   if (typeof ctx.agent?.get !== "function") throw new Error("verifier agent lookup unavailable")
   const actual = unwrap(await ctx.agent.get({ agentID: name }))
   const config = applyNativeGoalConfig({}, { verifierAgentName: name, goalAgentName: name === "goal" ? "goal-work" : "goal" })
   const expected = translateV1Agent(name, config.agent[name])
   if (!actual || actual.system !== expected.system ||
-      JSON.stringify(actual.permissions) !== JSON.stringify(expected.permissions)) {
+      !permissionsOnlyNarrow(actual.permissions, expected.permissions)) {
     throw new Error(`completionAudit cannot safely use agent ${JSON.stringify(name)}; verifier ownership or permissions were not confirmed`)
   }
 }
