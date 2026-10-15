@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Never send a liveness signal to the host's own process when checking a persistence lease owner. On Windows, runtimes that emulate POSIX signals may treat `kill(pid, 0)` as a real termination, which matches reports of the OpenCode service dying silently with the plugin installed (#81).
+- On OpenCode 2, tear down everything a partially failed `setup` already started (event subscription, timers, hook registrations, and the goal core with its persistence lease) instead of leaking it on every location boot.
+- On Windows, treat `/` and `\` as the same separator when matching a location, so a reload with a differently spelled path retires the previous instance instead of running beside it.
+
 ## 0.11.0 — 2026-09-30
 
 - Normalize directory separators with a linear scan, preventing adversarial location strings from causing regular-expression backtracking.

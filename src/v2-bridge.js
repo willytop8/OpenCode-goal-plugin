@@ -100,7 +100,9 @@ function normalizeDirectory(value) {
   let end = directory.length
   while (end > 0 && (directory[end - 1] === "/" || directory[end - 1] === "\\")) end--
   const trimmed = directory.slice(0, end)
-  return process.platform === "win32" ? trimmed.toLowerCase() : trimmed
+  // Windows accepts either separator, so one location can arrive spelled both
+  // ways. Unify them so reloads retire the previous same-location instance.
+  return process.platform === "win32" ? trimmed.replaceAll("/", "\\").toLowerCase() : trimmed
 }
 
 function sessionIDOf(input) {
@@ -656,16 +658,58 @@ export function normalizeCommandName(value) {
  * @param {(context: {client: unknown, directory?: string}, options: object) => Promise<object>} goalPluginFactory
  */
 export function createV2Setup(goalPluginFactory) {
+  // Everything setup starts is tracked here so a setup that fails partway can
+  // still be torn down. Without that, a rejected setup leaked its event
+  // subscription, timers, hook registrations and persistence lease on every
+  // host location boot (issue #81).
+  const disposeInstance = (instance) => instance.disposePromise ||= (async () => {
+    const { host, timers, controller, registrations } = instance
+    host.disposed = true
+    for (const timer of timers) clearTimeout(timer)
+    timers.clear()
+    controller.abort()
+    for (const registration of [...registrations].reverse()) {
+      try {
+        await registration?.dispose?.()
+      } catch {
+        // Disposal is best-effort; registrations are also disposed on unload.
+      }
+    }
+    try {
+      await instance.hooks?.dispose?.()
+    } catch (error) {
+      logError("OpenCode 2 dispose hook failed", error?.stack || error?.message || error)
+    }
+  })()
+
   const setupInstance = async function setup(ctx) {
-    const host = createHostState()
+    const instance = {
+      host: createHostState(),
+      registrations: [],
+      timers: new Set(),
+      controller: new AbortController(),
+      hooks: null,
+      disposePromise: null,
+    }
+    try {
+      await wireInstance(ctx, instance)
+    } catch (error) {
+      await disposeInstance(instance)
+      throw error
+    }
+    return () => disposeInstance(instance)
+  }
+
+  async function wireInstance(ctx, instance) {
+    const { host, registrations, timers, controller } = instance
     const directory = ctx?.location?.directory || process.cwd()
     // V2's session API only speaks the flat argument shape; the compatibility
     // adapter probes the legacy generated-client shape otherwise.
     const options = { ...(isPlainObject(ctx?.options) ? ctx.options : {}), sdkShape: "flat" }
     const client = createV2Client(ctx, host, options)
     const hooks = await goalPluginFactory({ client, directory }, options)
+    instance.hooks = hooks
 
-    const registrations = []
     const track = async (registration) => {
       registrations.push(registration)
       return registration
@@ -942,7 +986,6 @@ export function createV2Setup(goalPluginFactory) {
 
     /* ---------------- event stream ---------------- */
 
-    const controller = new AbortController()
     const consumeEvents = async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -976,7 +1019,6 @@ export function createV2Setup(goalPluginFactory) {
 
     /* ---------------- deferred host-activation work ---------------- */
 
-    const timers = new Set()
     const later = (fn, delay) => {
       const timer = setTimeout(() => {
         timers.delete(timer)
@@ -1064,25 +1106,6 @@ export function createV2Setup(goalPluginFactory) {
 
     /* ---------------- cleanup ---------------- */
 
-    let disposePromise
-    return () => disposePromise ||= (async () => {
-      host.disposed = true
-      for (const timer of timers) clearTimeout(timer)
-      timers.clear()
-      controller.abort()
-      for (const registration of [...registrations].reverse()) {
-        try {
-          await registration.dispose()
-        } catch {
-          // Disposal is best-effort; registrations are also disposed on unload.
-        }
-      }
-      try {
-        await hooks.dispose()
-      } catch (error) {
-        hookError("dispose", error)
-      }
-    })()
   }
   return async function setup(ctx) {
     // Host reloads can omit cleanup. Retire the old same-location instance

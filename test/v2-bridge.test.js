@@ -616,6 +616,35 @@ test("same-location setup retires the previous instance instead of stealing a li
   assert.equal(disposals, 2)
 })
 
+test("a setup that fails partway disposes everything it already started", async () => {
+  let disposals = 0
+  const factory = async () => ({ config: async () => {}, dispose: async () => { disposals++ }, "command.execute.before": async () => {} })
+  const { ctx, registrations } = createFakeCtx({ pluginOptions: { registerAgents: false } })
+  ctx.session.hook = async () => ({ dispose: async () => { registrations.push("session:prompt") } })
+  ctx.command.transform = async () => { throw new Error("host rejected command") }
+  await assert.rejects(createV2Setup(factory)(ctx), /host rejected command/)
+  assert.equal(disposals, 1, "the core (and its persistence lease) is released")
+  assert.ok(registrations.includes("session:prompt"), "hook registrations are released")
+
+  // The failed attempt must not block the next boot of the same location.
+  const retry = createFakeCtx({ pluginOptions: { registerAgents: false } }).ctx
+  const cleanup = await createV2Setup(factory)(retry)
+  assert.equal(disposals, 1)
+  await cleanup()
+  assert.equal(disposals, 2)
+})
+
+test("on Windows, either separator spelling names the same location", () => {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")
+  Object.defineProperty(process, "platform", { ...original, value: "win32" })
+  try {
+    const event = { type: "session.execution.succeeded", data: { sessionID: "s1" }, location: { directory: "C:/Proj/App/" } }
+    assert.equal(eventBelongsToLocation(event, "c:\\proj\\app"), true)
+  } finally {
+    Object.defineProperty(process, "platform", original)
+  }
+})
+
 test("setup registers every V2 surface the goal workflow needs", async () => {
   const { ctx, registered } = createFakeCtx()
   const cleanup = await createV2Setup(GoalPlugin)(ctx)

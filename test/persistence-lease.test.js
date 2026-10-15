@@ -135,6 +135,20 @@ async function acquireVersion1Lease(
   throw new Error("version-1 lease exhausted")
 }
 
+test("the host's own pid is alive without being signalled", () => {
+  const original = process.kill
+  const signalled = []
+  process.kill = (pid, signal) => { signalled.push([pid, signal]); return true }
+  try {
+    assert.equal(persistenceLeaseInternals.processIsAlive(process.pid), true)
+    assert.deepEqual(signalled, [], "signal 0 may terminate the caller on Windows runtimes (#81)")
+    persistenceLeaseInternals.processIsAlive(process.pid + 1)
+    assert.equal(signalled.length, 1, "other pids still get the liveness probe")
+  } finally {
+    process.kill = original
+  }
+})
+
 test("persistence lease rejects a concurrent owner and releases by token", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-lease-"))
   const state = join(dir, "state.json")
